@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+claude-plan-execute — Automated plan-review-implement workflow for Claude Code.
+
+For each task in a tasks file:
+  1. Plan    — Claude produces a detailed implementation plan.
+  2. Review  — A second Claude reviews the plan. If rejected, a third revises it. Loop until approved.
+  3. Implement — Claude implements the approved plan and commits.
+
+Usage:
+    claude-plan-execute                              # Run all tasks
+    claude-plan-execute --task 3                     # Run specific task
+    claude-plan-execute --task 3 --skip-to implement # Resume from implementation
+    claude-plan-execute --list                       # Show tasks and status
+    claude-plan-execute --dry-run                    # Print prompts, don't execute
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from collections import deque
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print("Error: PyYAML is required. Install with: pip install pyyaml", file=sys.stderr)
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Defaults (overridden by file defaults, per-task overrides, then CLI flags)
+# ---------------------------------------------------------------------------
+
+HARDCODED_DEFAULTS = {
+    "model": "opus",
+    "effort": "max",
+    "max_review_rounds": 3,
+    "plan_timeout_minutes": 20,
+    "review_timeout_minutes": 15,
+    "implement_timeout_minutes": 60,
+    "implement_max_turns": 200,
+    "test_command": "pytest",
+    "plans_dir": "plans",
+}
+
+TASK_FILE_SEARCH = ["tasks.yaml", "docs/tasks.yaml"]
+
+STATUSES = ("pending", "planning", "reviewing", "revising", "approved", "implementing", "done")
+
+# ---------------------------------------------------------------------------
+# Color helpers
+# ---------------------------------------------------------------------------
+
+_use_color = True
+
+
+def color(text: str, code: str) -> str:
+    if _use_color and sys.stdout.isatty():
+        return f"\033[{code}m{text}\033[0m"
+    return text
+
+
+def green(t: str) -> str: return color(t, "32")
+def yellow(t: str) -> str: return color(t, "33")
+def red(t: str) -> str: return color(t, "31")
+def bold(t: str) -> str: return color(t, "1")
+def dim(t: str) -> str: return color(t, "2")
+
+
+def status_color(status: str) -> str:
+    if status == "done":
+        return green(status)
+    if status == "pending":
+        return dim(status)
+    if status in ("planning", "reviewing", "revising", "implementing", "approved"):
+        return yellow(status)
+    return status
+
+# ---------------------------------------------------------------------------
+# State management (atomic writes)
+# ---------------------------------------------------------------------------
+
+
+class State:
+    """Persistent state tracker with atomic writes."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data: dict = {"tasks": {}}
+        if path.exists():
+            with open(path) as f:
+                self.data = json.load(f)
+
+    def get(self, task_id: int | str) -> dict:
+        key = str(task_id)
+        if key not in self.data["tasks"]:
+            self.data["tasks"][key] = {"status": "pending"}
+        return self.data["tasks"][key]
+
+    def set_status(self, task_id: int | str, status: str, **extra):
+        entry = self.get(task_id)
+        entry["status"] = status
+        entry.update(extra)
+        self.save()
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.data, f, indent=2)
+            os.rename(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def reset(self, task_id: int | str | None = None):
+        if task_id is not None:
+            self.data["tasks"][str(task_id)] = {"status": "pending"}
+        else:
+            for k in self.data["tasks"]:
+                self.data["tasks"][k] = {"status": "pending"}
+        self.save()
+
+# ---------------------------------------------------------------------------
+# Settings resolution: CLI > per-task > file defaults > hardcoded
+# ---------------------------------------------------------------------------
+
+
+def resolve(key: str, task: dict, file_defaults: dict, cli_overrides: dict) -> object:
+    if key in cli_overrides and cli_overrides[key] is not None:
+        return cli_overrides[key]
+    if key in task and task[key] is not None:
+        return task[key]
+    if key in file_defaults and file_defaults[key] is not None:
+        return file_defaults[key]
+    return HARDCODED_DEFAULTS.get(key)
+
+# ---------------------------------------------------------------------------
+# Dependency validation (topological sort + cycle detection)
+# ---------------------------------------------------------------------------
+
+
+def validate_dependencies(tasks: list[dict]) -> list[dict]:
+    """Topological sort. Raises on cycles or missing IDs."""
+    ids = {t["id"] for t in tasks}
+    graph: dict[int, list[int]] = {t["id"]: t.get("depends_on", []) for t in tasks}
+    by_id = {t["id"]: t for t in tasks}
+
+    for tid, deps in graph.items():
+        for d in deps:
+            if d not in ids:
+                print(red(f"Error: Task {tid} depends on non-existent task {d}"), file=sys.stderr)
+                sys.exit(1)
+
+    # Kahn's algorithm
+    in_degree = {tid: len(deps) for tid, deps in graph.items()}
+    reverse: dict[int, list[int]] = {tid: [] for tid in ids}
+    for tid, deps in graph.items():
+        for d in deps:
+            reverse[d].append(tid)
+
+    queue = deque(tid for tid, deg in in_degree.items() if deg == 0)
+    order = []
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for neighbor in reverse[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if len(order) != len(ids):
+        remaining = ids - set(order)
+        print(red(f"Error: Circular dependency detected involving tasks: {remaining}"), file=sys.stderr)
+        sys.exit(1)
+
+    return [by_id[tid] for tid in order]
+
+# ---------------------------------------------------------------------------
+# Claude CLI invocation
+# ---------------------------------------------------------------------------
+
+
+_active_child: subprocess.Popen | None = None
+
+
+def _kill_child():
+    """Kill the active claude child process and all its descendants."""
+    global _active_child
+    if _active_child and _active_child.poll() is None:
+        pid = _active_child.pid
+        # First, try SIGTERM on the child directly
+        try:
+            _active_child.terminate()
+        except OSError:
+            pass
+        try:
+            _active_child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Force kill
+            try:
+                _active_child.kill()
+            except OSError:
+                pass
+        # Also kill any orphaned descendants via pkill (belt and suspenders)
+        try:
+            subprocess.run(
+                ["pkill", "-TERM", "-P", str(pid)],
+                capture_output=True, timeout=3,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    _active_child = None
+
+
+def run_claude(
+    prompt: str,
+    *,
+    model: str,
+    effort: str,
+    max_turns: int,
+    timeout_minutes: int,
+    skip_permissions: bool,
+    verbose: bool,
+) -> tuple[int, str]:
+    """Invoke claude CLI. Returns (return_code, stdout_text)."""
+    global _active_child
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--output-format", "json",
+        "--model", model,
+        "--effort", effort,
+        "--max-turns", str(max_turns),
+    ]
+    if skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
+    if verbose:
+        cmd.append("--verbose")
+
+    print(dim(f"  claude --model {model} --effort {effort} --max-turns {max_turns} "
+              f"(timeout {timeout_minutes}m, {len(prompt)} char prompt)"))
+
+    start = time.time()
+    try:
+        # Do NOT use setsid here — we want claude children in our process group
+        # so that killing our group (from the server) kills everything.
+        # For direct CLI usage, the SIGINT handler calls _kill_child explicitly.
+        _active_child = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = _active_child.communicate(timeout=timeout_minutes * 60)
+        returncode = _active_child.returncode
+    except subprocess.TimeoutExpired:
+        print(red(f"  TIMEOUT after {timeout_minutes} minutes"))
+        _kill_child()
+        return 1, ""
+    finally:
+        _active_child = None
+
+    elapsed = time.time() - start
+    print(dim(f"  Completed in {elapsed:.0f}s (exit {returncode})"))
+
+    if returncode != 0 and stderr:
+        print(yellow(f"  stderr: {stderr[:300]}"))
+
+    # Extract text from JSON output
+    try:
+        output = json.loads(stdout)
+        if isinstance(output, dict) and "result" in output:
+            return returncode, output["result"]
+    except (json.JSONDecodeError, KeyError):
+        pass
+    return returncode, stdout
+
+# ---------------------------------------------------------------------------
+# Prompt builders (fully generic — no project-specific content)
+# ---------------------------------------------------------------------------
+
+
+def build_plan_prompt(task: dict, plan_path: str) -> str:
+    files_section = ""
+    key_files = task.get("key_files", [])
+    if key_files:
+        files_list = "\n".join(f"  - {f}" for f in key_files)
+        files_section = (
+            f"\nKey files to START with (non-exhaustive — explore the codebase "
+            f"for additional relevant files):\n{files_list}\n"
+        )
+
+    return (
+        f"You are planning the implementation of a task in this codebase.\n"
+        f"Read all relevant files before producing your plan.\n\n"
+        f"TASK {task['id']}: {task['title']}\n\n"
+        f"DESCRIPTION:\n{task['description']}\n"
+        f"{files_section}\n"
+        f"INSTRUCTIONS:\n"
+        f"1. Explore the codebase thoroughly. Read the listed files and any others you discover.\n"
+        f"2. Produce a DETAILED implementation plan covering:\n"
+        f"   - Exact files to create or modify\n"
+        f"   - For each file: what changes, in what order\n"
+        f"   - New models, functions, or classes to create\n"
+        f"   - Tests to write or update\n"
+        f"   - Dependencies between changes (what must happen first)\n"
+        f"   - Potential risks or edge cases\n"
+        f"3. The plan must be specific enough that another developer could implement it without questions.\n"
+        f"4. Write your plan to {plan_path}\n\n"
+        f"Do NOT implement anything yet. Only produce the plan.\n"
+    )
+
+
+def build_review_prompt(task: dict, plan_path: str, review_path: str,
+                        prev_feedback: str = "") -> str:
+    feedback_section = ""
+    if prev_feedback:
+        feedback_section = (
+            f"\nThe plan was revised based on previous feedback. "
+            f"Check whether the issues are resolved.\n"
+        )
+
+    return (
+        f"You are reviewing an implementation plan.\n"
+        f"Your job is to find problems, gaps, and risks BEFORE implementation.\n\n"
+        f"TASK {task['id']}: {task['title']}\n\n"
+        f"TASK DESCRIPTION:\n{task['description']}\n\n"
+        f"Read the plan at: {plan_path}\n"
+        f"Read any files the plan references to verify accuracy against the actual codebase.\n"
+        f"{feedback_section}\n"
+        f"REVIEW CRITERIA:\n"
+        f"1. COMPLETENESS — Does the plan cover everything in the task description?\n"
+        f"2. ACCURACY — Are file paths, function names, and structures correct? Verify against code.\n"
+        f"3. CONSISTENCY — Does the plan conflict with existing code?\n"
+        f"4. RISKS — Edge cases, breaking changes, migration issues?\n"
+        f"5. TESTS — Adequate test coverage?\n"
+        f"6. ORDER — Dependencies correctly ordered?\n\n"
+        f"Write your review to {review_path} with:\n\n"
+        f"## Verdict: APPROVED or NEEDS_REVISION\n\n"
+        f"## Issues (if NEEDS_REVISION)\n"
+        f"- What's wrong / Where in the plan / How to fix it\n\n"
+        f"## Comments (optional)\n\n"
+        f"Block on correctness, completeness, and risk — not style. "
+        f"If safe to implement, approve it.\n"
+    )
+
+
+def build_revise_prompt(task: dict, plan_path: str, review_path: str) -> str:
+    return (
+        f"You are revising an implementation plan based on reviewer feedback.\n\n"
+        f"TASK {task['id']}: {task['title']}\n\n"
+        f"Read the current plan at: {plan_path}\n"
+        f"Read the review feedback at: {review_path}\n\n"
+        f"Address ALL issues raised in the review. Update the plan file in place.\n\n"
+        f"Do NOT implement anything. Only revise the plan.\n"
+    )
+
+
+def build_implement_prompt(task: dict, plan_path: str, test_command: str,
+                           commit_message: str) -> str:
+    return (
+        f"You are implementing a validated plan.\n"
+        f"The plan has been reviewed and approved. Follow it precisely.\n\n"
+        f"TASK {task['id']}: {task['title']}\n\n"
+        f"Read the validated plan at: {plan_path}\n\n"
+        f"INSTRUCTIONS:\n"
+        f"1. Read the plan completely before starting.\n"
+        f"2. Implement every item in the plan, in order.\n"
+        f"3. Run tests: {test_command}\n"
+        f"4. Fix any test failures before proceeding.\n"
+        f"5. Commit with message:\n"
+        f"   {commit_message}\n\n"
+        f"Do not skip any part of the plan. Do not add unplanned features.\n"
+    )
+
+# ---------------------------------------------------------------------------
+# Review verdict parsing
+# ---------------------------------------------------------------------------
+
+
+def check_verdict(review_path: Path) -> tuple[bool, str]:
+    """Parse review file for APPROVED/NEEDS_REVISION verdict."""
+    if not review_path.exists():
+        return False, "Review file not found"
+    content = review_path.read_text()
+    lower = content.lower()
+    approved = "verdict: approved" in lower or "verdict:approved" in lower
+    return approved, content
+
+# ---------------------------------------------------------------------------
+# Task execution
+# ---------------------------------------------------------------------------
+
+
+# Global for SIGINT handler
+_current_state: State | None = None
+_current_task_id: int | str = 0
+_current_phase: str = "plan"
+
+
+def execute_task(
+    task: dict,
+    state: State,
+    file_defaults: dict,
+    cli: dict,
+    skip_to: str | None = None,
+    dry_run: bool = False,
+):
+    global _current_state, _current_task_id, _current_phase
+    _current_state = state
+    _current_task_id = task["id"]
+
+    tid = task["id"]
+    plans_dir = Path(resolve("plans_dir", task, file_defaults, cli))
+    task_dir = plans_dir / f"task-{tid}"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = task_dir / "plan.md"
+
+    model = resolve("model", task, file_defaults, cli)
+    effort = resolve("effort", task, file_defaults, cli)
+    max_review_rounds = int(resolve("max_review_rounds", task, file_defaults, cli))
+    plan_timeout = int(resolve("plan_timeout_minutes", task, file_defaults, cli))
+    review_timeout = int(resolve("review_timeout_minutes", task, file_defaults, cli))
+    impl_timeout = int(resolve("implement_timeout_minutes", task, file_defaults, cli))
+    impl_turns = int(resolve("implement_max_turns", task, file_defaults, cli))
+    test_command = resolve("test_command", task, file_defaults, cli)
+    skip_perms = cli.get("skip_permissions", False)
+    verbose = cli.get("verbose", False)
+
+    commit_msg = task.get("commit_message", f"task-{tid}: {task['title']}")
+
+    print(f"\n{bold('=' * 60)}")
+    print(bold(f"TASK {tid}: {task['title']}"))
+    print(bold("=" * 60))
+
+    run_kwargs = dict(model=model, effort=effort, skip_permissions=skip_perms, verbose=verbose)
+
+    # --- PHASE 1: PLAN ---
+    if skip_to not in ("review", "implement"):
+        _current_phase = "plan"
+        print(f"\n{bold('--- Phase 1: Planning ---')}")
+        state.set_status(tid, "planning", plan_path=str(plan_path))
+
+        prompt = build_plan_prompt(task, str(plan_path))
+        if dry_run:
+            print(dim(f"  [DRY RUN] {len(prompt)} char prompt"))
+            print(prompt[:800])
+            return
+
+        code, _ = run_claude(prompt, max_turns=50, timeout_minutes=plan_timeout, **run_kwargs)
+        if not plan_path.exists():
+            print(red(f"  Plan file not created at {plan_path}"))
+            save_error_output(task_dir, code, _)
+            return
+
+    # --- PHASE 2: REVIEW LOOP ---
+    if skip_to != "implement":
+        _current_phase = "review"
+        print(f"\n{bold('--- Phase 2: Review Loop ---')}")
+        prev_feedback = ""
+
+        for round_num in range(1, max_review_rounds + 1):
+            review_path = task_dir / f"review-{round_num}.md"
+            print(f"\n  {bold(f'Review round {round_num}/{max_review_rounds}')}")
+
+            state.set_status(tid, "reviewing", review_round=round_num)
+            prompt = build_review_prompt(task, str(plan_path), str(review_path), prev_feedback)
+            if dry_run:
+                print(dim(f"  [DRY RUN] Review prompt: {len(prompt)} chars"))
+                return
+
+            run_claude(prompt, max_turns=30, timeout_minutes=review_timeout, **run_kwargs)
+
+            approved, feedback = check_verdict(review_path)
+            if approved:
+                print(green(f"  APPROVED at round {round_num}"))
+                state.set_status(tid, "approved")
+                break
+            else:
+                print(yellow(f"  NEEDS REVISION"))
+                prev_feedback = feedback
+
+                # Revise
+                state.set_status(tid, "revising", review_round=round_num)
+                revise_prompt = build_revise_prompt(task, str(plan_path), str(review_path))
+                run_claude(revise_prompt, max_turns=30, timeout_minutes=review_timeout, **run_kwargs)
+        else:
+            print(yellow(f"  Max review rounds reached. Proceeding with current plan."))
+            state.set_status(tid, "approved")
+
+    # --- PHASE 3: IMPLEMENT ---
+    _current_phase = "implement"
+    print(f"\n{bold('--- Phase 3: Implementation ---')}")
+    state.set_status(tid, "implementing")
+
+    prompt = build_implement_prompt(task, str(plan_path), test_command, commit_msg)
+    if dry_run:
+        print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
+        return
+
+    run_claude(prompt, max_turns=impl_turns, timeout_minutes=impl_timeout, **run_kwargs)
+    state.set_status(tid, "done")
+    print(green(f"\n  Task {tid} complete."))
+
+
+def save_error_output(task_dir: Path, code: int, output: str):
+    err_path = task_dir / "error-output.txt"
+    err_path.write_text(f"Exit code: {code}\n\n{output}")
+    print(yellow(f"  Raw output saved to {err_path}"))
+
+# ---------------------------------------------------------------------------
+# SIGINT handler
+# ---------------------------------------------------------------------------
+
+
+def handle_sigint(signum, frame):
+    _kill_child()  # Kill any running claude process and its children
+    if _current_state:
+        _current_state.save()
+    print(f"\n{yellow('Interrupted.')} Resume with:")
+    print(f"  claude-plan-execute --task {_current_task_id} --skip-to {_current_phase}")
+    sys.exit(130)
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def find_tasks_file() -> Path | None:
+    for candidate in TASK_FILE_SEARCH:
+        p = Path(candidate)
+        if p.exists():
+            return p
+    return None
+
+
+def load_tasks_file(path: Path) -> tuple[dict, list[dict]]:
+    """Load and validate the tasks file. Returns (defaults, tasks)."""
+    with open(path) as f:
+        if path.suffix == ".json":
+            data = json.load(f)
+        else:
+            data = yaml.safe_load(f)
+
+    if not isinstance(data, dict) or "tasks" not in data:
+        print(red(f"Error: {path} must contain a 'tasks' key"), file=sys.stderr)
+        sys.exit(1)
+
+    version = data.get("version")
+    if version is None:
+        print(yellow(f"Warning: {path} has no 'version' field. Assuming version 1."))
+
+    file_defaults = data.get("defaults", {})
+    tasks = data["tasks"]
+
+    if not isinstance(tasks, list) or not tasks:
+        print(red(f"Error: 'tasks' must be a non-empty list"), file=sys.stderr)
+        sys.exit(1)
+
+    for t in tasks:
+        for required in ("id", "title", "description"):
+            if required not in t:
+                print(red(f"Error: Task missing required field '{required}': {t}"), file=sys.stderr)
+                sys.exit(1)
+
+    return file_defaults, tasks
+
+
+def main():
+    global _use_color
+
+    parser = argparse.ArgumentParser(
+        prog="claude-plan-execute",
+        description="Automated plan-review-implement workflow for Claude Code.",
+    )
+    parser.add_argument("--tasks", type=str, help="Path to tasks file (default: auto-detect)")
+    parser.add_argument("--dir", type=str, help="Working directory (default: cwd)")
+    parser.add_argument("--task", type=int, help="Run a specific task by ID")
+    parser.add_argument("--skip-to", choices=["plan", "review", "implement"],
+                        help="Skip to a specific phase")
+    parser.add_argument("--dry-run", action="store_true", help="Print prompts without executing")
+    parser.add_argument("--list", action="store_true", help="List all tasks with status")
+    parser.add_argument("--status", action="store_true", help="Show detailed execution state")
+    parser.add_argument("--reset", nargs="?", const="all", metavar="TASK_ID",
+                        help="Reset state for a task (or all tasks if no ID given)")
+    parser.add_argument("--model", type=str, help="Override model for all tasks")
+    parser.add_argument("--effort", type=str, choices=["low", "medium", "high", "max"],
+                        help="Override effort for all tasks")
+    parser.add_argument("--skip-permissions", action="store_true",
+                        help="Pass --dangerously-skip-permissions to claude")
+    parser.add_argument("--verbose", action="store_true", help="Pass --verbose to claude")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    args = parser.parse_args()
+
+    if args.no_color:
+        _use_color = False
+
+    # Change working directory
+    if args.dir:
+        os.chdir(args.dir)
+
+    # Check claude is available
+    if not shutil.which("claude"):
+        print(red("Error: 'claude' not found on PATH"), file=sys.stderr)
+        sys.exit(1)
+
+    # Find and load tasks file
+    tasks_path = Path(args.tasks) if args.tasks else find_tasks_file()
+    if not tasks_path or not tasks_path.exists():
+        print(red(f"Error: No tasks file found. Create tasks.yaml or use --tasks"), file=sys.stderr)
+        sys.exit(1)
+
+    file_defaults, tasks = load_tasks_file(tasks_path)
+
+    # Resolve plans_dir
+    cli_overrides = {
+        "model": args.model,
+        "effort": args.effort,
+        "skip_permissions": args.skip_permissions,
+        "verbose": args.verbose,
+    }
+    plans_dir = Path(resolve("plans_dir", {}, file_defaults, cli_overrides))
+    state = State(plans_dir / "state.json")
+
+    # Handle --reset
+    if args.reset is not None:
+        if args.reset == "all":
+            state.reset()
+            print(green("All tasks reset to pending."))
+        else:
+            state.reset(int(args.reset))
+            print(green(f"Task {args.reset} reset to pending."))
+        return
+
+    # Handle --list
+    if args.list:
+        print(bold(f"\nTasks from {tasks_path}:\n"))
+        for t in tasks:
+            s = state.get(t["id"])["status"]
+            deps = t.get("depends_on", [])
+            dep_str = f" (depends on: {deps})" if deps else ""
+            print(f"  {bold(str(t['id']).rjust(3))}. [{status_color(s)}] {t['title']}{dim(dep_str)}")
+        print()
+        return
+
+    # Handle --status
+    if args.status:
+        print(bold(f"\nExecution state ({plans_dir / 'state.json'}):\n"))
+        for t in tasks:
+            entry = state.get(t["id"])
+            s = entry["status"]
+            extra = ""
+            if "review_round" in entry:
+                extra += f", review round {entry['review_round']}"
+            if "plan_path" in entry:
+                extra += f", plan: {entry['plan_path']}"
+            print(f"  Task {bold(str(t['id']).rjust(3))}: [{status_color(s)}]{dim(extra)}")
+        print()
+        return
+
+    # Validate dependencies and get execution order
+    ordered_tasks = validate_dependencies(tasks)
+
+    # Install SIGINT handler
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    # Select tasks to run
+    if args.task:
+        task = next((t for t in tasks if t["id"] == args.task), None)
+        if not task:
+            print(red(f"Error: Task {args.task} not found"), file=sys.stderr)
+            sys.exit(1)
+
+        # Check dependencies
+        deps = task.get("depends_on", [])
+        unmet = [d for d in deps if state.get(d)["status"] != "done"]
+        if unmet:
+            print(red(f"Error: Task {args.task} has unmet dependencies: {unmet}"), file=sys.stderr)
+            print(f"Run those tasks first, or use --reset to clear state.")
+            sys.exit(1)
+
+        execute_task(task, state, file_defaults, cli_overrides,
+                     skip_to=args.skip_to, dry_run=args.dry_run)
+    else:
+        for task in ordered_tasks:
+            s = state.get(task["id"])["status"]
+            if s == "done":
+                print(dim(f"\n  Skipping task {task['id']} (done)"))
+                continue
+            execute_task(task, state, file_defaults, cli_overrides, dry_run=args.dry_run)
+
+    print(f"\n{bold('=' * 60)}")
+    print(bold("ALL TASKS COMPLETE"))
+    print(bold("=" * 60))
+
+
+if __name__ == "__main__":
+    main()
