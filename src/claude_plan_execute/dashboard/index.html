@@ -835,6 +835,76 @@ body::before {
   transition: opacity 0.15s;
 }
 [data-tooltip]:hover::after { opacity: 1; }
+
+/* Allow the expanded body to scroll when the resolved-config <details>
+   opens. Without this override, the existing max-height: 600px +
+   overflow: hidden clips long audit tables. */
+.task-card.expanded .task-body {
+  overflow-y: auto;
+}
+
+/* Resolved config block */
+.resolved-config-block {
+  margin: 12px 0 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.resolved-config-block summary {
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-tertiary);
+  padding: 4px 0;
+  list-style: none;
+}
+.resolved-config-block summary::-webkit-details-marker { display: none; }
+.resolved-config-block summary::before {
+  content: "›";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s;
+  color: var(--text-tertiary);
+}
+.resolved-config-block[open] summary::before { transform: rotate(90deg); }
+
+.resolved-config-content {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.rcfg-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.rcfg-table th,
+.rcfg-table td {
+  padding: 4px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: top;
+}
+.rcfg-table th {
+  font-weight: 500;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.rcfg-table td:first-child { color: var(--text-secondary); }
+.rcfg-table td:nth-child(2) { color: var(--text-primary); }
+.rcfg-table td:nth-child(3) { color: var(--text-tertiary); }
+
+/* Provenance colour-coding */
+.from-cli            { color: var(--accent-blue) !important; }
+.from-task           { color: var(--accent-green) !important; }
+.from-task-class     { color: var(--accent-violet) !important; }
+.from-phase          { color: var(--accent-amber) !important; }
+.from-project        { color: var(--text-secondary) !important; }
+.from-hardcoded      { color: var(--text-tertiary) !important; }
+.from-unset          { color: var(--accent-red) !important; font-style: italic; }
 </style>
 </head>
 <body>
@@ -1075,6 +1145,10 @@ function renderTasks() {
             ${ts.review_round ? `<span class="task-meta-item"><strong>review round:</strong> ${ts.review_round}</span>` : ''}
             ${ts.plan_path ? `<span class="task-meta-item"><strong>plan:</strong> ${esc(ts.plan_path)}</span>` : ''}
           </div>
+          <details class="resolved-config-block" data-task-id="${task.id}">
+            <summary>Resolved config</summary>
+            <div class="resolved-config-content"><em>Click to load…</em></div>
+          </details>
           <div class="task-actions">
             ${status !== 'done' ? `
               <button class="btn btn-sm btn-primary" onclick="runTask(${task.id})">
@@ -1091,6 +1165,12 @@ function renderTasks() {
       </div>
     `;
     list.appendChild(card);
+  });
+
+  list.querySelectorAll('.resolved-config-block').forEach(el => {
+    el.addEventListener('toggle', () => {
+      if (el.open) loadResolvedConfig(el);
+    });
   });
 
   updateStats();
@@ -1170,6 +1250,38 @@ function updateUI() {
 function toggleTask(id) {
   const card = document.querySelector(`.task-card[data-id="${id}"]`);
   if (card) card.classList.toggle('expanded');
+}
+
+async function loadResolvedConfig(detailsEl) {
+  const taskId = detailsEl.dataset.taskId;
+  const content = detailsEl.querySelector('.resolved-config-content');
+  if (content.dataset.loaded === '1') return;
+  content.innerHTML = '<em>Loading…</em>';
+  const data = await api(`/api/resolved-config/${encodeURIComponent(taskId)}`);
+  if (!data || data.error) {
+    content.innerHTML = '<em>Not yet generated. Run the task to produce it.</em>';
+    return;
+  }
+  let rows = '';
+  for (const [key, info] of Object.entries(data)) {
+    const fromLabel = String(info.from || 'unset');
+    const rawKind = fromLabel.split(':')[0];
+    const fromKind = (rawKind === 'project_defaults' ? 'project' : rawKind).replace(/_/g, '-');
+    const valueText = (info.value === null || info.value === undefined)
+      ? '<em>null</em>'
+      : esc(typeof info.value === 'string' ? info.value : JSON.stringify(info.value));
+    rows += `<tr>
+      <td>${esc(key)}</td>
+      <td>${valueText}</td>
+      <td class="from-${fromKind}">${esc(fromLabel)}</td>
+    </tr>`;
+  }
+  content.innerHTML = `
+    <table class="rcfg-table">
+      <thead><tr><th>key</th><th>value</th><th>from</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  content.dataset.loaded = '1';
 }
 
 async function runAll() {

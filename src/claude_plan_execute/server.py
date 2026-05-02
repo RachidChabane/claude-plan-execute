@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -40,6 +42,11 @@ from claude_plan_execute.state import State
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DASHBOARD_PATH = PACKAGE_DIR / "dashboard" / "index.html"
+
+# Whitelist for task_id path segments. Matches int task ids (digits) and
+# slug-like string ids (letters/digits/dash/underscore). Blocks `..`, `/`,
+# `.`, spaces, and anything else that could escape the plans_dir tree.
+_SAFE_TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def _resolve_cpe_script() -> str | None:
@@ -133,6 +140,36 @@ async def get_tasks():
 @app.get("/api/state")
 async def get_state():
     return JSONResponse(load_state())
+
+
+@app.get("/api/resolved-config/{task_id}")
+async def get_resolved_config(task_id: str):
+    """Return the resolved-config.json audit artifact for a task.
+
+    Path: {work_dir}/{plans_dir}/task-{task_id}/resolved-config.json.
+
+    Returns 200 + JSON body when the file exists and parses; 400 when
+    `task_id` fails the safe-segment regex (defends against `..`); 404
+    when the artifact has not yet been generated; 500 if the on-disk
+    file is unreadable or malformed (defensive).
+    """
+    if not _SAFE_TASK_ID_RE.fullmatch(task_id):
+        return JSONResponse({"error": "Invalid task id"}, status_code=400)
+
+    defaults = load_tasks().get("defaults", {})
+    plans_dir = defaults.get("plans_dir", "plans")
+    cfg_path = work_dir / plans_dir / f"task-{task_id}" / "resolved-config.json"
+
+    if not cfg_path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    try:
+        with open(cfg_path) as f:
+            return JSONResponse(json.load(f))
+    except (json.JSONDecodeError, OSError) as exc:
+        return JSONResponse(
+            {"error": f"Could not read artifact: {exc}"}, status_code=500
+        )
 
 
 @app.get("/api/config")

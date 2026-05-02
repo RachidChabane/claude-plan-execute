@@ -1,12 +1,13 @@
 """Per-task plan / review / implement orchestrator."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
-from claude_plan_execute.config import resolve
+from claude_plan_execute.config import resolve_task_config
 from claude_plan_execute.prompts import (
     build_implement_prompt,
     build_plan_prompt,
@@ -49,37 +50,52 @@ def execute_task(
 
     # Build per-task layer dicts. Empty when None (v1 path) or unmatched.
     phase_dict: dict = {}
-    if phases_by_id:
-        phase_id = task.get("phase")
-        if phase_id and phase_id in phases_by_id:
-            phase_dict = dict(phases_by_id[phase_id].get("defaults") or {})
+    phase_id = task.get("phase")
+    if phases_by_id and phase_id and phase_id in phases_by_id:
+        phase_dict = dict(phases_by_id[phase_id].get("defaults") or {})
 
     task_class_dict: dict = {}
-    if task_class_models:
-        class_name = task.get("task_class") or phase_dict.get("task_class")
-        if class_name and class_name in task_class_models:
-            task_class_dict = dict(task_class_models[class_name])
+    # Effective class name follows phase-inheritance: task wins over phase.
+    # Same chain task 4's runner uses; the audit must use this exact name
+    # so provenance labels read `task_class:<name>` correctly. (Plan §D5.)
+    task_class_name = task.get("task_class") or phase_dict.get("task_class")
+    if task_class_models and task_class_name and task_class_name in task_class_models:
+        task_class_dict = dict(task_class_models[task_class_name])
 
-    def R(key: str) -> object:
-        return resolve(
-            key, task, file_defaults, cli,
-            phase=phase_dict, task_class=task_class_dict,
-        )
+    # Resolve every audit-relevant knob in a single call. This dict is the
+    # source of truth for both the on-disk audit artifact and the runtime
+    # values used below. (Plan §D4.)
+    resolved = resolve_task_config(
+        task, file_defaults, cli,
+        phase=phase_dict, task_class=task_class_dict,
+        phase_id=phase_id, task_class_name=task_class_name,
+    )
 
     tid = task["id"]
-    plans_dir = Path(R("plans_dir"))
+    plans_dir = Path(resolved["plans_dir"]["value"])
     task_dir = plans_dir / f"task-{tid}"
     task_dir.mkdir(parents=True, exist_ok=True)
+
+    # Audit artifact — written before any phase. (Plan §D6.)
+    resolved_config_path = task_dir / "resolved-config.json"
+    resolved_config_path.write_text(
+        json.dumps(resolved, indent=2, sort_keys=False) + "\n"
+    )
+    # Track the path on the per-task state entry so the dashboard can find it.
+    entry = state.get(tid)
+    entry["resolved_config_path"] = str(resolved_config_path)
+    state.save()
+
     plan_path = task_dir / "plan.md"
 
-    model = R("model")
-    effort = R("effort")
-    max_review_rounds = int(R("max_review_rounds"))
-    plan_timeout = int(R("plan_timeout_minutes"))
-    review_timeout = int(R("review_timeout_minutes"))
-    impl_timeout = int(R("implement_timeout_minutes"))
-    impl_turns = int(R("implement_max_turns"))
-    test_command = R("test_command")
+    model = resolved["model"]["value"]
+    effort = resolved["effort"]["value"]
+    max_review_rounds = int(resolved["max_review_rounds"]["value"])
+    plan_timeout = int(resolved["plan_timeout_minutes"]["value"])
+    review_timeout = int(resolved["review_timeout_minutes"]["value"])
+    impl_timeout = int(resolved["implement_timeout_minutes"]["value"])
+    impl_turns = int(resolved["implement_max_turns"]["value"])
+    test_command = resolved["test_command"]["value"]
     skip_perms = cli.get("skip_permissions", False)
     verbose = cli.get("verbose", False)
 

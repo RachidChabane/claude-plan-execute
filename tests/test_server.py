@@ -253,6 +253,105 @@ def test_get_state_falls_back_to_default_plans_dir_when_no_defaults_block(
 
 
 # ---------------------------------------------------------------------------
+# C2. /api/resolved-config (task 5)
+# ---------------------------------------------------------------------------
+
+
+def _write_resolved_config(work_dir: Path, task_id, body: dict | None = None,
+                            plans_dir: str = "plans"):
+    body = body or {"model": {"value": "opus", "from": "task"}}
+    d = work_dir / plans_dir / f"task-{task_id}"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "resolved-config.json"
+    p.write_text(_json.dumps(body))
+    return p
+
+
+def test_get_resolved_config_returns_json_when_file_exists(client, tmp_path):
+    _write_tasks_yaml(tmp_path)
+    _write_resolved_config(tmp_path, 1)
+    r = client.get("/api/resolved-config/1")
+    assert r.status_code == 200
+    assert r.json() == {"model": {"value": "opus", "from": "task"}}
+
+
+def test_get_resolved_config_returns_404_when_file_missing(client, tmp_path):
+    _write_tasks_yaml(tmp_path)
+    r = client.get("/api/resolved-config/999")
+    assert r.status_code == 404
+
+
+def test_get_resolved_config_uses_resolved_plans_dir_from_defaults(client, tmp_path):
+    _write_tasks_yaml(tmp_path, """\
+version: 1
+defaults:
+  plans_dir: custom-plans
+tasks:
+  - id: 1
+    title: T
+    description: D
+""")
+    _write_resolved_config(
+        tmp_path, 1,
+        body={"model": {"value": "haiku", "from": "task"}},
+        plans_dir="custom-plans",
+    )
+    r = client.get("/api/resolved-config/1")
+    assert r.status_code == 200
+    assert r.json()["model"]["value"] == "haiku"
+
+
+def test_get_resolved_config_falls_back_to_default_plans_dir_when_no_defaults_block(
+    client, tmp_path,
+):
+    (tmp_path / "tasks.yaml").write_text(
+        "version: 1\ntasks: [{id: 1, title: T, description: D}]\n"
+    )
+    _write_resolved_config(tmp_path, 1)
+    r = client.get("/api/resolved-config/1")
+    assert r.status_code == 200
+
+
+def test_get_resolved_config_handles_string_task_id(client, tmp_path):
+    _write_tasks_yaml(tmp_path)
+    _write_resolved_config(tmp_path, "abc-feature")
+    r = client.get("/api/resolved-config/abc-feature")
+    assert r.status_code == 200
+
+
+def test_get_resolved_config_rejects_dot_dot_path_traversal(client, tmp_path):
+    _write_tasks_yaml(tmp_path)
+    # `..` is rejected at one of two layers: the test client normalises
+    # the URL and hits no route (404), or a raw client preserves it and
+    # the safe-id regex blocks it (400). Either way, no traversal occurs.
+    r = client.get("/api/resolved-config/..")
+    assert r.status_code in (400, 404)
+
+
+def test_get_resolved_config_rejects_url_encoded_path_traversal(client, tmp_path):
+    """%2F decodes to '/' but FastAPI path params already block it; the safe-id
+    regex is the second line of defence on whatever does pass through."""
+    _write_tasks_yaml(tmp_path)
+    r = client.get("/api/resolved-config/.%2E")
+    assert r.status_code in (400, 404)
+
+
+def test_get_resolved_config_rejects_task_id_with_space(client, tmp_path):
+    _write_tasks_yaml(tmp_path)
+    r = client.get("/api/resolved-config/foo%20bar")
+    assert r.status_code == 400
+
+
+def test_get_resolved_config_returns_500_when_file_is_malformed_json(client, tmp_path):
+    _write_tasks_yaml(tmp_path)
+    d = tmp_path / "plans" / "task-1"
+    d.mkdir(parents=True)
+    (d / "resolved-config.json").write_text("not valid json {{{")
+    r = client.get("/api/resolved-config/1")
+    assert r.status_code == 500
+
+
+# ---------------------------------------------------------------------------
 # D. /api/config
 # ---------------------------------------------------------------------------
 

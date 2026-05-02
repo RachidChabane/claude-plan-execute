@@ -1,6 +1,7 @@
 """Tests for prompts, claude subprocess wrapper, and runner orchestrator."""
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -790,3 +791,200 @@ def test_save_error_output_overwrites_existing_file(tmp_path):
     assert "OLD" not in body
     assert "Exit code: 2" in body
     assert "NEW" in body
+
+
+# ---------------------------------------------------------------------------
+# H. resolved-config.json audit artifact (task 5)
+# ---------------------------------------------------------------------------
+
+
+def _read_resolved_config(plans_dir: Path, tid: int | str) -> dict:
+    p = plans_dir / f"task-{tid}" / "resolved-config.json"
+    return json.loads(p.read_text())
+
+
+def test_execute_task_writes_resolved_config_json_to_task_dir(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=42), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    assert (tmp_path / "task-42" / "resolved-config.json").exists()
+
+
+def test_execute_task_resolved_config_contains_all_audit_keys(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    from claude_plan_execute.config import KEYS_TO_AUDIT
+    assert set(cfg.keys()) == set(KEYS_TO_AUDIT)
+
+
+def test_execute_task_resolved_config_provenance_for_task_override(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, model="haiku"), state,
+        file_defaults={"plans_dir": str(tmp_path), "model": "opus"},
+        cli={}, dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["model"] == {"value": "haiku", "from": "task"}
+
+
+def test_execute_task_resolved_config_provenance_for_cli_override(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, model="haiku"), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={"model": "sonnet"}, dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["model"] == {"value": "sonnet", "from": "cli"}
+
+
+def test_execute_task_resolved_config_provenance_for_phase_inheritance(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="foundation"), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+        phases_by_id={
+            "foundation": {"id": "foundation", "defaults": {"model": "phase-val"}},
+        },
+        dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["model"] == {"value": "phase-val", "from": "phase:foundation"}
+
+
+def test_execute_task_resolved_config_provenance_for_task_class_inherited_from_phase(
+    monkeypatch, tmp_path,
+):
+    """Plan §D5: when class is inherited from phase, the audit label still
+    carries the class name (not bare 'task_class')."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="foundation"), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+        phases_by_id={
+            "foundation": {"id": "foundation", "defaults": {"task_class": "schema"}},
+        },
+        task_class_models={"schema": {"model": "schema-model"}},
+        dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["model"] == {"value": "schema-model", "from": "task_class:schema"}
+
+
+def test_execute_task_resolved_config_provenance_for_explicit_task_class(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="polish"), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+        task_class_models={"polish": {"effort": "medium"}},
+        dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["effort"] == {"value": "medium", "from": "task_class:polish"}
+
+
+def test_execute_task_records_resolved_config_path_on_state(monkeypatch, tmp_path):
+    """Plan §D6: dashboard reads ts.resolved_config_path to know whether
+    the artifact exists."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=7), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    entry = state.get(7)
+    assert entry["resolved_config_path"] == str(tmp_path / "task-7" / "resolved-config.json")
+
+
+def test_execute_task_resolved_config_path_persists_to_state_json(monkeypatch, tmp_path):
+    """The path field must survive a state round-trip via state.save()."""
+    _no_run_claude_called(monkeypatch)
+    state_path = tmp_path / "state.json"
+    state = State(state_path)
+    execute_task(
+        _make_task(id=7), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    on_disk = json.loads(state_path.read_text())
+    assert on_disk["tasks"]["7"]["resolved_config_path"].endswith("task-7/resolved-config.json")
+
+
+def test_execute_task_resolved_config_overwritten_on_rerun_with_different_cli(
+    monkeypatch, tmp_path,
+):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={"model": "opus"}, dry_run=True,
+    )
+    first = _read_resolved_config(tmp_path, 1)
+    assert first["model"]["value"] == "opus"
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={"model": "sonnet"}, dry_run=True,
+    )
+    second = _read_resolved_config(tmp_path, 1)
+    assert second["model"]["value"] == "sonnet"
+    assert second["model"]["from"] == "cli"
+
+
+def test_execute_task_resolved_config_written_in_dry_run(monkeypatch, tmp_path):
+    """Plan §D6: dry-run writes the artifact so users can audit without running."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    assert (tmp_path / "task-1" / "resolved-config.json").exists()
+
+
+def test_execute_task_resolved_config_written_when_skip_to_implement(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement", dry_run=True,
+    )
+    assert (tmp_path / "task-1" / "resolved-config.json").exists()
+
+
+def test_execute_task_resolved_config_json_is_valid_json(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    raw = (tmp_path / "task-1" / "resolved-config.json").read_text()
+    # Round-trip: parse then compare to the in-memory shape we expect.
+    parsed = json.loads(raw)
+    assert "model" in parsed and "value" in parsed["model"] and "from" in parsed["model"]
