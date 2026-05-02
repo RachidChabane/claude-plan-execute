@@ -10,7 +10,10 @@ from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
 from claude_plan_execute.gates import Gate, default_registry, run_gates
-from claude_plan_execute.gates.builtin import make_tests_gate
+from claude_plan_execute.gates.builtin import (
+    make_lint_gate,
+    make_tests_gate,
+)
 from claude_plan_execute.loader import (
     load_decisions_index,
     load_persona_fragment,
@@ -112,6 +115,7 @@ def execute_task(
     impl_timeout = int(resolved["implement_timeout_minutes"]["value"])
     impl_turns = int(resolved["implement_max_turns"]["value"])
     test_command = resolved["test_command"]["value"]
+    lint_command = resolved["lint_command"]["value"]
     on_max_review_rounds = resolved["on_max_review_rounds"]["value"]
     skip_perms = cli.get("skip_permissions", False)
     verbose = cli.get("verbose", False)
@@ -315,19 +319,29 @@ def execute_task(
         registry = default_registry()
         resolved_gates: list[tuple[str, Gate]] = []
         unknown_gates: list[str] = []
+        unconfigured_lint = False
         for name in gate_names:
             if name == "tests":
                 resolved_gates.append((name, make_tests_gate(test_command)))
+            elif name == "lint":
+                if lint_command is None:
+                    unconfigured_lint = True
+                else:
+                    resolved_gates.append((name, make_lint_gate(lint_command)))
             else:
                 g = registry.get(name)
                 if g is None:
                     unknown_gates.append(name)
                 else:
                     resolved_gates.append((name, g))
+        if unconfigured_lint:
+            print(yellow(
+                "  Skipping gate 'lint': no defaults.lint_command configured."
+            ))
         if unknown_gates:
             print(yellow(
                 f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
-                f"(not registered; tasks 13–17 add built-ins)"
+                f"(not registered; tasks 14–17 add built-ins)"
             ))
         if resolved_gates:
             print(f"\n{bold('--- Phase 4: Gates ---')}")

@@ -93,3 +93,98 @@ def test_make_tests_gate_does_NOT_register_on_default_registry():
     make_tests_gate("rspec")
     after = set(default_registry().names())
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# D. make_lint_gate basic shape (task 13)
+# ---------------------------------------------------------------------------
+
+from claude_plan_execute.gates.builtin import make_lint_gate
+
+
+def test_make_lint_gate_returns_a_Gate():
+    g = make_lint_gate("ruff check")
+    assert isinstance(g, Gate)
+
+
+def test_make_lint_gate_kind_is_shell():
+    """Pin §D4: lint gate is a shell gate (not agent)."""
+    assert make_lint_gate("ruff check").kind == "shell"
+
+
+# ---------------------------------------------------------------------------
+# E. bash -c shell-escape-hatch wrapping (mirrors §B for tests)
+# ---------------------------------------------------------------------------
+
+def test_make_lint_gate_command_uses_bash_minus_c():
+    """Pin §D4: command is wrapped in ('bash', '-c', lint_command) to
+    preserve shell semantics (pipelines, &&, env vars)."""
+    g = make_lint_gate("ruff check")
+    assert g.command == ("bash", "-c", "ruff check")
+
+
+def test_make_lint_gate_preserves_pipeline_command_verbatim():
+    """Pin §D4: shell pipelines like 'npm run lint && npm run typecheck'
+    must NOT be pre-split (shlex.split would be a silent regression)."""
+    cmd = "npm run lint && npm run typecheck"
+    g = make_lint_gate(cmd)
+    assert g.command == ("bash", "-c", cmd)
+
+
+def test_make_lint_gate_preserves_multi_line_command_verbatim():
+    """Pin §D4: a YAML multi-line lint_command becomes 'cmd1\\ncmd2\\n'
+    after PyYAML parsing; the factory must hand bash the verbatim
+    string (bash treats newlines as command separators)."""
+    cmd = "ruff check\nmypy src/\n"
+    g = make_lint_gate(cmd)
+    assert g.command == ("bash", "-c", cmd)
+
+
+def test_make_lint_gate_handles_empty_string_command():
+    """Pin §D5: an empty lint_command produces a no-op gate
+    (`bash -c ''` exits 0). The factory itself does no validation;
+    the runner's None-vs-'' discriminator (§D2) decides whether to
+    call the factory at all."""
+    g = make_lint_gate("")
+    assert g.command == ("bash", "-c", "")
+
+
+# ---------------------------------------------------------------------------
+# F. Default knobs (pin §D4) — mirror §C for tests
+# ---------------------------------------------------------------------------
+
+def test_make_lint_gate_default_timeout_is_10_minutes():
+    assert make_lint_gate("ruff check").timeout_minutes == 10
+
+
+def test_make_lint_gate_default_parallel_safe_is_true():
+    assert make_lint_gate("ruff check").parallel_safe is True
+
+
+def test_make_lint_gate_default_on_failure_is_block():
+    assert make_lint_gate("ruff check").on_failure == "block"
+
+
+def test_make_lint_gate_default_when_is_always():
+    assert make_lint_gate("ruff check").when == ("always",)
+
+
+def test_make_lint_gate_returns_a_frozen_Gate():
+    """Pin: the returned Gate inherits the dataclass frozen semantics
+    (Gate is frozen by task 11 §D1). A caller that tries to mutate
+    the result raises."""
+    import pytest
+    g = make_lint_gate("ruff check")
+    with pytest.raises(Exception):
+        g.timeout_minutes = 99
+
+
+def test_make_lint_gate_does_NOT_register_on_default_registry():
+    """Pin §D1: the factory does NOT touch default_registry. Calling
+    it has no observable side effect on the singleton's name list."""
+    from claude_plan_execute.gates import default_registry
+    before = set(default_registry().names())
+    make_lint_gate("ruff check")
+    make_lint_gate("eslint .")
+    after = set(default_registry().names())
+    assert before == after

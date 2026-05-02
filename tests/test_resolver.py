@@ -385,6 +385,7 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "model",
         "effort",
         "test_command",
+        "lint_command",
         "plans_dir",
         "max_review_rounds",
         "plan_timeout_minutes",
@@ -467,3 +468,55 @@ def test_resolve_task_config_on_max_review_rounds_cli_wins():
         cli_overrides={"on_max_review_rounds": "fail"},
     )
     assert out["on_max_review_rounds"] == {"value": "fail", "from": "cli"}
+
+
+# ---------------------------------------------------------------------------
+# J. lint_command resolver (task 13)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_lint_command_returns_None_when_no_layer_set():
+    """Pin task 13 §D2 / §D6: HARDCODED_DEFAULTS does NOT include
+    lint_command, so the resolver returns None when no layer sets
+    it. The runner's None-vs-'' discriminator (§D2) treats this
+    as 'unconfigured'."""
+    out = resolve("lint_command", task={}, file_defaults={}, cli_overrides={})
+    assert out is None
+
+
+def test_resolve_lint_command_picks_project_layer():
+    """Project-defaults set → resolver returns it with from='project_defaults'."""
+    out = resolve_task_config(
+        task={}, file_defaults={"lint_command": "ruff check"}, cli_overrides={},
+    )
+    assert out["lint_command"] == {
+        "value": "ruff check", "from": "project_defaults",
+    }
+
+
+def test_resolve_lint_command_task_wins_over_project():
+    """Per-task lint_command override wins over project default."""
+    out = resolve_task_config(
+        task={"lint_command": "eslint ."},
+        file_defaults={"lint_command": "ruff check"},
+        cli_overrides={},
+    )
+    assert out["lint_command"] == {"value": "eslint .", "from": "task"}
+
+
+def test_resolve_lint_command_unset_renders_unset_provenance():
+    """When no layer sets lint_command, the audit dict shows
+    {'value': None, 'from': 'unset'} — surfacing the misconfiguration
+    to anyone reading resolved-config.json."""
+    out = resolve_task_config(task={}, file_defaults={}, cli_overrides={})
+    assert out["lint_command"] == {"value": None, "from": "unset"}
+
+
+def test_resolve_lint_command_explicit_empty_string_preserved():
+    """Pin §D2: an explicit empty string is distinct from None.
+    The resolver returns ('', 'project_defaults'); the runner's
+    discriminator passes it to the factory unchanged."""
+    out = resolve_task_config(
+        task={}, file_defaults={"lint_command": ""}, cli_overrides={},
+    )
+    assert out["lint_command"] == {"value": "", "from": "project_defaults"}

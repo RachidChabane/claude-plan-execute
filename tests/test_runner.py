@@ -2726,12 +2726,14 @@ def test_execute_task_tests_gate_skipped_when_implementer_timed_out(
     assert state.get(1)["block_reason"] == "implementer_timeout"
 
 
-def test_execute_task_tests_gate_runs_alongside_unknown_lint(
+def test_execute_task_tests_gate_runs_alongside_unconfigured_lint(
     monkeypatch, tmp_path, capsys,
 ):
-    """Integration with task 11: 'tests' resolves via the runner's
-    special-case; 'lint' (not yet registered) warns and skips. Both
-    coexist without the runner crashing."""
+    """Integration with task 13: 'tests' resolves via the runner's
+    special-case; 'lint' warns and skips because lint_command is
+    unconfigured (None). Both coexist without the runner crashing.
+    Renamed from `..._unknown_lint` after task 13 — the lint name
+    is now known, but its command is None."""
     _patch_run_claude_simulating_success(monkeypatch)
     invoked: list[list[str]] = []
 
@@ -2755,15 +2757,16 @@ def test_execute_task_tests_gate_runs_alongside_unknown_lint(
             "plans_dir": str(tmp_path),
             "gates": ["tests", "lint"],     # mirrors the repo's tasks.yaml
             "test_command": "pytest",
+            # No lint_command — lint should warn and skip.
         },
         cli={}, skip_to="implement",
     )
     out = capsys.readouterr().out
     # tests gate ran:
     assert invoked == [["bash", "-c", "pytest"]]
-    # lint warned (still unknown until task 13):
-    assert "Unknown gate(s) skipped: lint" in out
-    # task reaches done because lint warning is non-blocking:
+    # lint warned (lint_command is unconfigured):
+    assert "Skipping gate 'lint': no defaults.lint_command configured." in out
+    # task reaches done because the unconfigured-lint warning is non-blocking:
     assert state.get(1)["status"] == "done"
 
 
@@ -2838,3 +2841,405 @@ def test_execute_task_tests_gate_does_NOT_pass_test_command_to_implement_prompt(
     assert args[2] == "test-commit-msg"            # commit_msg
     # And test_command is not anywhere in the kwargs:
     assert "test_command" not in captured["kwargs"]
+
+
+# ---------------------------------------------------------------------------
+# P. `lint` built-in gate integration (task 13)
+# ---------------------------------------------------------------------------
+
+# These tests do NOT use the _clean_default_registry fixture. The runner's
+# special-case for `lint` (task 13 §D3) constructs the Gate via
+# make_lint_gate(lint_command) WITHOUT consulting default_registry —
+# the fixture's emptiness is irrelevant for the `lint` path. (See §D13.)
+
+
+def test_execute_task_lint_gate_runs_resolved_lint_command(monkeypatch, tmp_path):
+    """Pin §D2 / §D3: when 'lint' is in the gate list and lint_command
+    is set, the runner constructs the Gate with command=('bash', '-c',
+    lint_command) using the resolved value from the resolver chain."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint"],
+            "lint_command": "ruff check",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", "ruff check"]]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_lint_gate_uses_per_task_lint_command(monkeypatch, tmp_path):
+    """Pin §D6: per-task lint_command override is what the gate runs."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, lint_command="eslint --max-warnings 0 ."), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint"],
+            "lint_command": "ruff check",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", "eslint --max-warnings 0 ."]]
+
+
+def test_execute_task_lint_gate_failure_blocks_and_records(monkeypatch, tmp_path):
+    """Pin §D10 / task 11 §D12: a failing lint gate blocks the task
+    with block_reason='gate_failed' and records a FailureRecord."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 1
+        p.stdout = "src/foo.py:42: E501 line too long\n"
+        p.stderr = "1 error\n"
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint"],
+            "lint_command": "ruff check",
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    assert len(entry["attempts"]) == 1
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"
+    assert rec["phase"] == "gate"
+    assert "src/foo.py:42: E501" in rec["verbatim"]
+    assert "gate:lint" in rec["artifacts"]
+
+
+def test_execute_task_lint_gate_writes_output_file(monkeypatch, tmp_path):
+    """Pin task 11 §D8: the gate's output is captured to
+    plans/task-{id}/gates/lint.txt."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "LINT_OUTPUT_MARKER\n"
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint"],
+            "lint_command": "ruff check",
+        },
+        cli={}, skip_to="implement",
+    )
+    out_file = tmp_path / "task-1" / "gates" / "lint.txt"
+    assert out_file.is_file()
+    assert "LINT_OUTPUT_MARKER" in out_file.read_text()
+
+
+def test_execute_task_lint_unconfigured_warns_and_skips(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D2: lint_command is None (no layer set it) → runner prints
+    the unconfigured-lint warning and does NOT add the gate to the
+    resolved list. The task still reaches done."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint"],
+            # NO lint_command — None across the chain.
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Skipping gate 'lint': no defaults.lint_command configured." in out
+    assert invoked == []                          # gate never built
+    assert state.get(1)["status"] == "done"
+    # No FailureRecord written for the warn-skip path:
+    assert state.get(1)["attempts"] == []
+
+
+def test_execute_task_lint_explicit_empty_command_runs_noop(
+    monkeypatch, tmp_path,
+):
+    """Pin §D2 / §D5: an explicit defaults.lint_command: '' (empty
+    string) is a valid 'no-op' choice — the factory builds the Gate
+    and `bash -c ''` exits 0. Distinguishes from the None case
+    (which warns and skips)."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint"],
+            "lint_command": "",                   # explicit empty string
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", ""]]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_lint_unconfigured_warning_does_not_double_print(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D2: the warning fires once even if `lint` is listed
+    multiple times (e.g., gates: [lint, lint])."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint", "lint"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert out.count("Skipping gate 'lint':") == 1
+
+
+def test_execute_task_lint_name_does_NOT_warn_as_unknown(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D3: the runner's special-case prevents 'lint' from being
+    reported as an unknown-gate name. Pre-task-13 the empty-registry
+    path warned for 'lint'; task 13 makes the unknown-gate warning
+    silent for the literal name 'lint'."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint"],
+            "lint_command": "ruff check",
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s) skipped" not in out
+
+
+def test_execute_task_lint_gate_skipped_when_implementer_timed_out(
+    monkeypatch, tmp_path,
+):
+    """Pin task 11 §D12 carry-forward: implementer_timeout returns
+    BEFORE the gate run, so the lint gate does not fire."""
+    invoked = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd)
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_timeout(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["lint"],
+            "lint_command": "ruff check",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == []
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["block_reason"] == "implementer_timeout"
+
+
+def test_execute_task_lint_runs_alongside_tests_in_parallel(
+    monkeypatch, tmp_path,
+):
+    """Pin §D10: both `tests` and `lint` are parallel_safe → they end up
+    in the parallel pool. We can't test concurrency deterministically
+    in unit tests, but we can verify both subprocess.run invocations
+    happen and both gate output files are written."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "ok\n"
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests", "lint"],
+            "test_command": "pytest -q",
+            "lint_command": "ruff check",
+        },
+        cli={}, skip_to="implement",
+    )
+    cmds = sorted(c[2] for c in invoked)
+    assert cmds == ["pytest -q", "ruff check"]
+    assert (tmp_path / "task-1" / "gates" / "tests.txt").is_file()
+    assert (tmp_path / "task-1" / "gates" / "lint.txt").is_file()
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_lint_phase_extra_appended(monkeypatch, tmp_path):
+    """Pin task 11 §D12 + §D3: a phase's gates_extra='lint' is
+    appended to project gates and resolves through the same
+    special-case dispatch."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": [],
+            "lint_command": "ruff check",
+        },
+        cli={},
+        phases_by_id={"ui": {"id": "ui", "defaults": {"gates_extra": ["lint"]}}},
+        skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", "ruff check"]]
+    assert state.get(1)["status"] == "done"

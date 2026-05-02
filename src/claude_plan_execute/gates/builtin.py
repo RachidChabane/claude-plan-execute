@@ -1,15 +1,15 @@
 """Built-in gate factories for gates that need per-task config.
 
-Currently exports `make_tests_gate(test_command)` for the `tests`
-built-in (relocated from the implement prompt — see task 12 plan).
-The factory pattern is the v1-canonical way to build a Gate whose
-config is per-task; built-ins WITHOUT per-task config (e.g., a future
-`security-auditor` agent gate) register on `default_registry()` at
-module-import time as task 11's plan intended.
+Exports `make_tests_gate(test_command)` and
+`make_lint_gate(lint_command)`. The factory pattern is the
+v1-canonical way to build a Gate whose config is per-task; built-ins
+WITHOUT per-task config (e.g., a future `security-auditor` agent
+gate) register on `default_registry()` at module-import time.
 
-Task 13 lands `make_lint_gate(lint_command)` here. When a second
-factory exists, generalizing into a name → factory map is the natural
-next refactor; v1 keeps things simple with explicit imports.
+Generalizing into a name → factory map is deferred until a third
+factory exists; with two, an explicit `if name == "tests": ... elif
+name == "lint": ...` chain in the runner is simpler and clearer than
+a dict-driven dispatch.
 """
 from __future__ import annotations
 
@@ -37,4 +37,31 @@ def make_tests_gate(test_command: str) -> Gate:
     )
 
 
-__all__ = ["make_tests_gate"]
+def make_lint_gate(lint_command: str) -> Gate:
+    """Construct the `lint` Gate from a resolved lint_command string.
+
+    Wraps the command in `("bash", "-c", lint_command)` to preserve
+    shell semantics (pipelines, `&&`, env-var substitution) so a
+    project's `lint_command: "npm run lint && npm run typecheck"`
+    works without the runner pre-splitting. The runner calls this
+    factory inside `execute_task` (task 13 §D3) when it sees the
+    name "lint" in the configured gate-name list AND the resolved
+    lint_command is non-None; the Gate is NOT pre-registered on
+    `default_registry()` because the command is per-task.
+
+    An explicit empty string produces a no-op gate (`bash -c ''`
+    exits 0). The runner reserves None for the "unconfigured"
+    state and skips with a warning instead of calling this
+    factory; see §D2.
+    """
+    return Gate(
+        kind="shell",
+        command=("bash", "-c", lint_command),
+        timeout_minutes=10,
+        parallel_safe=True,
+        on_failure="block",
+        when=("always",),
+    )
+
+
+__all__ = ["make_lint_gate", "make_tests_gate"]

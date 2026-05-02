@@ -568,3 +568,53 @@ def test_format_validation_error_includes_file_path():
     except PydValidationError as exc:
         out = format_validation_error(exc, Path("/tmp/example.yaml"))
         assert "/tmp/example.yaml" in out
+
+
+# --- H. lint_command field (task 13) ---------------------------------------
+
+def test_defaults_accepts_lint_command(tmp_path):
+    """Task 13 §D7: Defaults gains lint_command field."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  lint_command: ruff check\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.lint_command == "ruff check"
+
+
+def test_task_accepts_per_task_lint_command(tmp_path):
+    """Task 13 §D7: Task gains per-task lint_command override."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - id: 1\n"
+        "    title: T\n"
+        "    description: D\n"
+        "    lint_command: eslint .\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.tasks[0].lint_command == "eslint ."
+
+
+def test_typo_lint_cmd_suggests_lint_command(tmp_path, capsys):
+    """Task 13 §D7: extra='forbid' + difflib suggests 'lint_command'
+    when the user types 'lint_cmd' (close-match cutoff is 0.6)."""
+    import pytest
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  lint_cmd: ruff check\n"     # typo
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lint_cmd" in err
+    assert "Did you mean 'lint_command'?" in err
