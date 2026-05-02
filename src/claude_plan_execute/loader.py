@@ -134,3 +134,35 @@ def effective_defaults(tasks_file: TasksFile) -> dict:
             out["on_max_review_rounds"] = "auto_approve"
 
     return out
+
+
+def load_persona_fragment(path: Path | str | None) -> str:
+    """Read a persona markdown fragment.
+
+    Returns the file's UTF-8 contents when the path is set, the file
+    exists, is a regular file, and has at most 800 lines. Returns
+    "" silently when the path is None/empty, the file is missing, or
+    the path is a directory. Returns "" with a stdout warning when
+    the file is over 800 lines (long personas dilute every prompt;
+    the cap is protective). Per-fragment cap, not aggregate — the
+    caller may compose multiple fragments via prompts.build_persona_section.
+
+    Path resolution is CWD-relative when `path` is a relative string;
+    absolute paths and Path objects pass through unchanged. (See plan
+    §D8.)
+    """
+    if not path:
+        return ""
+    p = Path(path) if not isinstance(path, Path) else path
+    if not p.exists() or not p.is_file():
+        return ""
+    text = p.read_text(encoding="utf-8")
+    line_count = len(text.splitlines())
+    if line_count > 800:
+        print(yellow(
+            f"Warning: persona file {p} has {line_count} lines (>800); "
+            f"skipping. Long personas dilute every prompt — split into "
+            f"'phases[].defaults.persona_extra' overlays or trim."
+        ))
+        return ""
+    return text

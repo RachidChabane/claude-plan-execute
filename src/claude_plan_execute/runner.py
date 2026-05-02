@@ -8,8 +8,10 @@ from pathlib import Path
 from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
+from claude_plan_execute.loader import load_persona_fragment
 from claude_plan_execute.prompts import (
     build_implement_prompt,
+    build_persona_section,
     build_plan_prompt,
     build_review_prompt,
     build_revise_prompt,
@@ -100,6 +102,18 @@ def execute_task(
     skip_perms = cli.get("skip_permissions", False)
     verbose = cli.get("verbose", False)
 
+    # Persona prompt fragment (task 7).
+    # Read once per execute_task; reused across plan/review/revise/implement
+    # prompts. (Plan §D3.) The path comes from the resolver chain
+    # (HARDCODED_DEFAULTS["persona_file"] = "docs/persona.md" if unset);
+    # persona_extra is per-phase, read directly from the phase's loose
+    # dict (Plan §D5).
+    persona_path = resolved["persona_file"]["value"]
+    persona_extra_path = phase_dict.get("persona_extra")
+    persona_text = load_persona_fragment(persona_path)
+    extra_text = load_persona_fragment(persona_extra_path)
+    persona_section = build_persona_section(persona_text, extra_text)
+
     commit_msg = task.get("commit_message", f"task-{tid}: {task['title']}")
 
     print(f"\n{bold('=' * 60)}")
@@ -114,7 +128,7 @@ def execute_task(
         print(f"\n{bold('--- Phase 1: Planning ---')}")
         state.set_status(tid, "planning", plan_path=str(plan_path))
 
-        prompt = build_plan_prompt(task, str(plan_path))
+        prompt = build_plan_prompt(task, str(plan_path), persona=persona_section)
         if dry_run:
             print(dim(f"  [DRY RUN] {len(prompt)} char prompt"))
             print(prompt[:800])
@@ -137,7 +151,10 @@ def execute_task(
             print(f"\n  {bold(f'Review round {round_num}/{max_review_rounds}')}")
 
             state.set_status(tid, "reviewing", review_round=round_num)
-            prompt = build_review_prompt(task, str(plan_path), str(review_path), prev_feedback)
+            prompt = build_review_prompt(
+                task, str(plan_path), str(review_path),
+                prev_feedback, persona=persona_section,
+            )
             if dry_run:
                 print(dim(f"  [DRY RUN] Review prompt: {len(prompt)} chars"))
                 return
@@ -155,7 +172,10 @@ def execute_task(
 
                 # Revise
                 state.set_status(tid, "revising", review_round=round_num)
-                revise_prompt = build_revise_prompt(task, str(plan_path), str(review_path))
+                revise_prompt = build_revise_prompt(
+                    task, str(plan_path), str(review_path),
+                    persona=persona_section,
+                )
                 run_claude(revise_prompt, max_turns=60, timeout_minutes=review_timeout, **run_kwargs)
         else:
             if on_max_review_rounds == "fail":
@@ -180,7 +200,10 @@ def execute_task(
     print(f"\n{bold('--- Phase 3: Implementation ---')}")
     state.set_status(tid, "implementing")
 
-    prompt = build_implement_prompt(task, str(plan_path), test_command, commit_msg)
+    prompt = build_implement_prompt(
+        task, str(plan_path), test_command, commit_msg,
+        persona=persona_section,
+    )
     if dry_run:
         print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
         return

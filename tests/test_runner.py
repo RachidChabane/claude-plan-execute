@@ -1161,3 +1161,122 @@ def test_execute_task_resolved_config_includes_on_max_review_rounds_for_v2_defau
     )
     cfg = _read_resolved_config(tmp_path, 1)
     assert cfg["on_max_review_rounds"] == {"value": "fail", "from": "hardcoded"}
+
+
+# ---------------------------------------------------------------------------
+# J. Persona injection (task 7)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_task_loads_persona_from_resolved_persona_file_into_plan_prompt(
+    monkeypatch, tmp_path,
+):
+    """Task 7: runner reads persona_file from the resolved dict, loads it,
+    and passes the persona section to build_plan_prompt. Pin the wiring;
+    the loader internals are tested in test_prompts.py."""
+    # Capture the prompt that build_plan_prompt produces so we can assert
+    # the persona was prepended.
+    captured: dict = {}
+
+    real_build_plan = runner.build_plan_prompt
+
+    def spy_build_plan(*args, **kwargs):
+        captured["persona"] = kwargs.get("persona", "")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_build_plan)
+    _no_run_claude_called(monkeypatch)
+
+    persona_file = tmp_path / "p.md"
+    persona_file.write_text("# Persona\nMy project rules.")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "persona_file": str(persona_file),
+        },
+        cli={}, dry_run=True,
+    )
+
+    assert "## Project conventions" in captured["persona"]
+    assert "My project rules." in captured["persona"]
+
+
+def test_execute_task_passes_empty_persona_when_persona_file_missing(
+    monkeypatch, tmp_path,
+):
+    """Pin: when persona_file resolves to a missing path, the runner still
+    runs cleanly (silent fallback) and the prompt builder gets persona=''.
+
+    Note: we pin `persona_file` explicitly to a tmp_path-owned filename
+    that we never create, rather than relying on the hardcoded fallback
+    `docs/persona.md` being absent from the project root. The hardcoded
+    fallback resolves CWD-relative (plan §D8); pytest typically runs from
+    the project root, so the moment a human authors `docs/persona.md` (an
+    expected outcome, see §R1), a test that depended on its absence would
+    flip from passing to failing. This pin makes the test independent of
+    project filesystem state.
+    """
+    captured: dict = {}
+    real_build_plan = runner.build_plan_prompt
+
+    def spy_build_plan(*args, **kwargs):
+        captured["persona"] = kwargs.get("persona", "")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_build_plan)
+    _no_run_claude_called(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            # Pin to a tmp_path-owned filename we never create, so the
+            # missing-file path is independent of project filesystem state.
+            "persona_file": str(tmp_path / "definitely_missing.md"),
+        },
+        cli={}, dry_run=True,
+    )
+    assert captured["persona"] == ""
+
+
+def test_execute_task_appends_persona_extra_from_phase(monkeypatch, tmp_path):
+    """Pin: when the task's phase has persona_extra in defaults, the runner
+    loads that overlay and appends it after the global persona."""
+    captured: dict = {}
+    real_build_plan = runner.build_plan_prompt
+
+    def spy_build_plan(*args, **kwargs):
+        captured["persona"] = kwargs.get("persona", "")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_build_plan)
+    _no_run_claude_called(monkeypatch)
+
+    persona_file = tmp_path / "global.md"
+    persona_file.write_text("GLOBAL_MARKER")
+    extra_file = tmp_path / "phase-ui.md"
+    extra_file.write_text("EXTRA_MARKER")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "persona_file": str(persona_file),
+        },
+        cli={},
+        phases_by_id={
+            "ui": {"id": "ui", "defaults": {"persona_extra": str(extra_file)}},
+        },
+        dry_run=True,
+    )
+
+    assert "GLOBAL_MARKER" in captured["persona"]
+    assert "EXTRA_MARKER" in captured["persona"]
+    g_idx = captured["persona"].index("GLOBAL_MARKER")
+    e_idx = captured["persona"].index("EXTRA_MARKER")
+    assert g_idx < e_idx

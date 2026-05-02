@@ -6,7 +6,37 @@ string sent to the `claude` CLI as the `-p` argument.
 from __future__ import annotations
 
 
-def build_plan_prompt(task: dict, plan_path: str) -> str:
+def build_persona_section(persona: str, persona_extra: str = "") -> str:
+    """Compose the project-conventions block for a prompt.
+
+    Returns "" when both inputs are empty (or whitespace-only). When
+    either input is non-empty, returns a block of the form:
+
+        ## Project conventions
+
+        <global persona body>
+
+        <persona_extra body>
+
+    Trailing newlines are normalized so the caller can do
+    `persona_section + body` without a separator. The global persona
+    precedes the per-phase overlay. (See plan §D2 for composition
+    order; future tasks 8 and 10 prepend their own blocks.)
+    """
+    g = persona.strip()
+    e = persona_extra.strip()
+    if not g and not e:
+        return ""
+    body_parts: list[str] = []
+    if g:
+        body_parts.append(g)
+    if e:
+        body_parts.append(e)
+    body = "\n\n".join(body_parts)
+    return f"## Project conventions\n\n{body}\n\n"
+
+
+def build_plan_prompt(task: dict, plan_path: str, *, persona: str = "") -> str:
     files_section = ""
     key_files = task.get("key_files", [])
     if key_files:
@@ -16,7 +46,7 @@ def build_plan_prompt(task: dict, plan_path: str) -> str:
             f"for additional relevant files):\n{files_list}\n"
         )
 
-    return (
+    return persona + (
         f"You are planning the implementation of a task in this codebase.\n"
         f"Read all relevant files before producing your plan.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"
@@ -38,7 +68,7 @@ def build_plan_prompt(task: dict, plan_path: str) -> str:
 
 
 def build_review_prompt(task: dict, plan_path: str, review_path: str,
-                        prev_feedback: str = "") -> str:
+                        prev_feedback: str = "", *, persona: str = "") -> str:
     feedback_section = ""
     if prev_feedback:
         feedback_section = (
@@ -46,7 +76,7 @@ def build_review_prompt(task: dict, plan_path: str, review_path: str,
             f"Check whether the issues are resolved.\n"
         )
 
-    return (
+    return persona + (
         f"You are reviewing an implementation plan.\n"
         f"Your job is to find problems, gaps, and risks BEFORE implementation.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"
@@ -71,8 +101,9 @@ def build_review_prompt(task: dict, plan_path: str, review_path: str,
     )
 
 
-def build_revise_prompt(task: dict, plan_path: str, review_path: str) -> str:
-    return (
+def build_revise_prompt(task: dict, plan_path: str, review_path: str,
+                        *, persona: str = "") -> str:
+    return persona + (
         f"You are revising an implementation plan based on reviewer feedback.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"
         f"Read the current plan at: {plan_path}\n"
@@ -83,8 +114,8 @@ def build_revise_prompt(task: dict, plan_path: str, review_path: str) -> str:
 
 
 def build_implement_prompt(task: dict, plan_path: str, test_command: str,
-                           commit_message: str) -> str:
-    return (
+                           commit_message: str, *, persona: str = "") -> str:
+    return persona + (
         f"You are implementing a validated plan.\n"
         f"The plan has been reviewed and approved. Follow it precisely.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"
