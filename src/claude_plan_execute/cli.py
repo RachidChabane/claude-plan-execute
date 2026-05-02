@@ -12,7 +12,11 @@ from claude_plan_execute import colors
 from claude_plan_execute.colors import bold, dim, green, red, status_color
 from claude_plan_execute.config import resolve
 from claude_plan_execute.deps import validate_dependencies
-from claude_plan_execute.loader import find_tasks_file, load_tasks_file
+from claude_plan_execute.loader import (
+    effective_defaults,
+    find_tasks_file,
+    load_tasks_file,
+)
 from claude_plan_execute.runner import execute_task, handle_sigint
 from claude_plan_execute.state import State
 
@@ -59,7 +63,16 @@ def main():
         print(red(f"Error: No tasks file found. Create tasks.yaml or use --tasks"), file=sys.stderr)
         sys.exit(1)
 
-    file_defaults, tasks = load_tasks_file(tasks_path)
+    tasks_file_obj = load_tasks_file(tasks_path)
+    file_defaults = effective_defaults(tasks_file_obj)
+    tasks: list[dict] = [t.model_dump(exclude_none=True) for t in tasks_file_obj.tasks]
+    phases_by_id: dict[str, dict] = {
+        p.id: p.model_dump(exclude_none=True) for p in tasks_file_obj.phases
+    }
+    task_class_models: dict[str, dict] = {
+        name: cfg.model_dump(exclude_none=True)
+        for name, cfg in (tasks_file_obj.defaults.task_class_models or {}).items()
+    }
 
     # Resolve plans_dir
     cli_overrides = {
@@ -128,15 +141,25 @@ def main():
             print(f"Run those tasks first, or use --reset to clear state.")
             sys.exit(1)
 
-        execute_task(task, state, file_defaults, cli_overrides,
-                     skip_to=args.skip_to, dry_run=args.dry_run)
+        execute_task(
+            task, state, file_defaults, cli_overrides,
+            phases_by_id=phases_by_id,
+            task_class_models=task_class_models,
+            skip_to=args.skip_to,
+            dry_run=args.dry_run,
+        )
     else:
         for task in ordered_tasks:
             s = state.get(task["id"])["status"]
             if s == "done":
                 print(dim(f"\n  Skipping task {task['id']} (done)"))
                 continue
-            execute_task(task, state, file_defaults, cli_overrides, dry_run=args.dry_run)
+            execute_task(
+                task, state, file_defaults, cli_overrides,
+                phases_by_id=phases_by_id,
+                task_class_models=task_class_models,
+                dry_run=args.dry_run,
+            )
 
     print(f"\n{bold('=' * 60)}")
     print(bold("ALL TASKS COMPLETE"))

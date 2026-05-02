@@ -80,3 +80,109 @@ def test_all_hardcoded_keys_resolvable():
     # Smoke test: every documented hardcoded default is reachable.
     for key in HARDCODED_DEFAULTS:
         assert resolve(key, {}, {}, {}) == HARDCODED_DEFAULTS[key]
+
+
+# ---------------------------------------------------------------------------
+# Five-tier order coverage (task 4): cli > task > task_class > phase >
+# project > hardcoded.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_wins_over_task_and_phase_and_class():
+    out = resolve(
+        "model",
+        task={"model": "task"},
+        file_defaults={"model": "file"},
+        cli_overrides={"model": "cli"},
+        phase={"model": "phase"},
+        task_class={"model": "class"},
+    )
+    assert out == "cli"
+
+
+def test_task_wins_over_class_and_phase_and_project():
+    out = resolve(
+        "model",
+        task={"model": "task"},
+        file_defaults={"model": "file"},
+        cli_overrides={},
+        phase={"model": "phase"},
+        task_class={"model": "class"},
+    )
+    assert out == "task"
+
+
+def test_class_wins_over_phase_and_project():
+    out = resolve(
+        "model",
+        task={},
+        file_defaults={"model": "file"},
+        cli_overrides={},
+        phase={"model": "phase"},
+        task_class={"model": "class"},
+    )
+    assert out == "class"
+
+
+def test_phase_wins_over_project():
+    out = resolve(
+        "model",
+        task={},
+        file_defaults={"model": "file"},
+        cli_overrides={},
+        phase={"model": "phase"},
+        task_class={},
+    )
+    assert out == "phase"
+
+
+def test_phase_falls_through_when_key_absent():
+    out = resolve(
+        "model",
+        task={},
+        file_defaults={"model": "file"},
+        cli_overrides={},
+        phase={"effort": "max"},   # unrelated key
+        task_class={},
+    )
+    assert out == "file"
+
+
+def test_task_class_falls_through_when_key_absent():
+    out = resolve(
+        "model",
+        task={},
+        file_defaults={"model": "file"},
+        cli_overrides={},
+        phase=None,
+        task_class={"effort": "max"},
+    )
+    assert out == "file"
+
+
+def test_phase_none_is_no_op():
+    """Passing phase=None is identical to omitting the kwarg."""
+    out = resolve("model", {}, {"model": "file"}, {}, phase=None, task_class=None)
+    assert out == "file"
+
+
+def test_phase_empty_dict_is_no_op():
+    out = resolve("model", {}, {"model": "file"}, {}, phase={}, task_class={})
+    assert out == "file"
+
+
+def test_phase_with_none_value_falls_through():
+    out = resolve(
+        "model",
+        task={},
+        file_defaults={"model": "file"},
+        cli_overrides={},
+        phase={"model": None},
+        task_class={"model": None},
+    )
+    assert out == "file"
+
+
+def test_max_attempts_is_a_hardcoded_default():
+    assert HARDCODED_DEFAULTS["max_attempts"] == 3
+    assert resolve("max_attempts", {}, {}, {}) == 3

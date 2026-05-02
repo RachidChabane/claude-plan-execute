@@ -1,4 +1,4 @@
-"""tasks.yaml / tasks.json discovery and loading."""
+"""tasks.yaml / tasks.json discovery, loading, and validation."""
 from __future__ import annotations
 
 import json
@@ -12,6 +12,11 @@ except ImportError:
     sys.exit(1)
 
 from claude_plan_execute.colors import red, yellow
+from claude_plan_execute.schema import (
+    TasksFile,
+    ValidationError,
+    format_validation_error,
+)
 
 
 def find_tasks_file(
@@ -35,34 +40,75 @@ def load_tasks_data(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def load_tasks_file(path: Path) -> tuple[dict, list[dict]]:
-    """Load and validate the tasks file. Returns (defaults, tasks). Calls
-    sys.exit(1) on validation errors — for CLI use only."""
-    with open(path) as f:
-        if path.suffix == ".json":
-            data = json.load(f)
-        else:
-            data = yaml.safe_load(f)
+def load_tasks_file(path: Path) -> TasksFile:
+    """Load and validate the tasks file. Returns the validated TasksFile.
+    Calls sys.exit(1) on validation errors with a formatted message including
+    file path, key path, and (for typos) suggested correction. Emits a
+    deprecation warning on v2 files that use legacy `*_timeout_minutes` keys.
+    """
+    raw = load_tasks_data(path)
 
-    if not isinstance(data, dict) or "tasks" not in data:
+    if not isinstance(raw, dict) or "tasks" not in raw:
         print(red(f"Error: {path} must contain a 'tasks' key"), file=sys.stderr)
         sys.exit(1)
 
-    version = data.get("version")
-    if version is None:
+    if raw.get("version") is None:
         print(yellow(f"Warning: {path} has no 'version' field. Assuming version 1."))
 
-    file_defaults = data.get("defaults", {})
-    tasks = data["tasks"]
-
-    if not isinstance(tasks, list) or not tasks:
-        print(red("Error: 'tasks' must be a non-empty list"), file=sys.stderr)
+    try:
+        tasks_file = TasksFile.model_validate(raw)
+    except ValidationError as exc:
+        print(red(format_validation_error(exc, path)), file=sys.stderr)
         sys.exit(1)
 
-    for t in tasks:
-        for required in ("id", "title", "description"):
-            if required not in t:
-                print(red(f"Error: Task missing required field '{required}': {t}"), file=sys.stderr)
-                sys.exit(1)
+    # Deprecation warnings: v2 files that still set legacy timeout/turns/rounds
+    # keys at defaults level. v1 files are silent.
+    if tasks_file.version == 2:
+        legacy_pairs = {
+            "plan_timeout_minutes": "caps.max_minutes_per_phase",
+            "review_timeout_minutes": "caps.max_minutes_per_phase",
+            "implement_timeout_minutes": "caps.max_minutes_per_phase",
+            "max_review_rounds": "caps.max_review_rounds",
+            "implement_max_turns": "caps.max_implement_turns",
+        }
+        defaults_set = tasks_file.defaults.model_dump(exclude_none=True)
+        for legacy, replacement in legacy_pairs.items():
+            if legacy in defaults_set:
+                print(yellow(
+                    f"Warning: {path}: 'defaults.{legacy}' is deprecated; "
+                    f"use defaults.{replacement} instead."
+                ))
 
-    return file_defaults, tasks
+    return tasks_file
+
+
+def effective_defaults(tasks_file: TasksFile) -> dict:
+    """Flatten the validated defaults into the dict the resolver consumes as
+    the project-defaults layer.
+
+    - Drops nested `caps` and `task_class_models` (not resolver-consumable).
+    - Expands `caps.max_minutes_per_phase` into three legacy resolver keys
+      (`plan_timeout_minutes`, `review_timeout_minutes`,
+      `implement_timeout_minutes`). Caps wins over a directly-set legacy
+      value (S2). Deprecation warning was already emitted at load.
+    - Expands `caps.max_review_rounds`, `caps.max_implement_turns`,
+      `caps.max_attempts` into resolver-friendly keys.
+    """
+    out = tasks_file.defaults.model_dump(exclude_none=True)
+    out.pop("caps", None)
+    out.pop("task_class_models", None)
+
+    caps = tasks_file.defaults.caps
+    if caps is not None:
+        if caps.max_minutes_per_phase is not None:
+            out["plan_timeout_minutes"] = caps.max_minutes_per_phase
+            out["review_timeout_minutes"] = caps.max_minutes_per_phase
+            out["implement_timeout_minutes"] = caps.max_minutes_per_phase
+        if caps.max_review_rounds is not None:
+            out["max_review_rounds"] = caps.max_review_rounds
+        if caps.max_implement_turns is not None:
+            out["implement_max_turns"] = caps.max_implement_turns
+        if caps.max_attempts is not None:
+            out["max_attempts"] = caps.max_attempts
+
+    return out

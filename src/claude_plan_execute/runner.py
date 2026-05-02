@@ -37,6 +37,9 @@ def execute_task(
     state: State,
     file_defaults: dict,
     cli: dict,
+    *,
+    phases_by_id: dict[str, dict] | None = None,
+    task_class_models: dict[str, dict] | None = None,
     skip_to: str | None = None,
     dry_run: bool = False,
 ):
@@ -44,20 +47,39 @@ def execute_task(
     _current_state = state
     _current_task_id = task["id"]
 
+    # Build per-task layer dicts. Empty when None (v1 path) or unmatched.
+    phase_dict: dict = {}
+    if phases_by_id:
+        phase_id = task.get("phase")
+        if phase_id and phase_id in phases_by_id:
+            phase_dict = dict(phases_by_id[phase_id].get("defaults") or {})
+
+    task_class_dict: dict = {}
+    if task_class_models:
+        class_name = task.get("task_class") or phase_dict.get("task_class")
+        if class_name and class_name in task_class_models:
+            task_class_dict = dict(task_class_models[class_name])
+
+    def R(key: str) -> object:
+        return resolve(
+            key, task, file_defaults, cli,
+            phase=phase_dict, task_class=task_class_dict,
+        )
+
     tid = task["id"]
-    plans_dir = Path(resolve("plans_dir", task, file_defaults, cli))
+    plans_dir = Path(R("plans_dir"))
     task_dir = plans_dir / f"task-{tid}"
     task_dir.mkdir(parents=True, exist_ok=True)
     plan_path = task_dir / "plan.md"
 
-    model = resolve("model", task, file_defaults, cli)
-    effort = resolve("effort", task, file_defaults, cli)
-    max_review_rounds = int(resolve("max_review_rounds", task, file_defaults, cli))
-    plan_timeout = int(resolve("plan_timeout_minutes", task, file_defaults, cli))
-    review_timeout = int(resolve("review_timeout_minutes", task, file_defaults, cli))
-    impl_timeout = int(resolve("implement_timeout_minutes", task, file_defaults, cli))
-    impl_turns = int(resolve("implement_max_turns", task, file_defaults, cli))
-    test_command = resolve("test_command", task, file_defaults, cli)
+    model = R("model")
+    effort = R("effort")
+    max_review_rounds = int(R("max_review_rounds"))
+    plan_timeout = int(R("plan_timeout_minutes"))
+    review_timeout = int(R("review_timeout_minutes"))
+    impl_timeout = int(R("implement_timeout_minutes"))
+    impl_turns = int(R("implement_max_turns"))
+    test_command = R("test_command")
     skip_perms = cli.get("skip_permissions", False)
     verbose = cli.get("verbose", False)
 
