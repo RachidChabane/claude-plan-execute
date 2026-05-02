@@ -9,7 +9,8 @@ from claude_plan_execute import claude
 from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
-from claude_plan_execute.gates import default_registry, run_gates
+from claude_plan_execute.gates import Gate, default_registry, run_gates
+from claude_plan_execute.gates.builtin import make_tests_gate
 from claude_plan_execute.loader import (
     load_decisions_index,
     load_persona_fragment,
@@ -257,7 +258,7 @@ def execute_task(
     state.set_status(tid, "implementing")
 
     prompt = build_implement_prompt(
-        task, str(plan_path), test_command, commit_msg,
+        task, str(plan_path), commit_msg,
         persona=persona_section,
         failure_context=failure_context_section,
     )
@@ -312,11 +313,21 @@ def execute_task(
     gate_names = gate_names_project + gate_names_phase
     if gate_names:
         registry = default_registry()
-        resolved_gates, unknown_gates = registry.resolve(gate_names)
+        resolved_gates: list[tuple[str, Gate]] = []
+        unknown_gates: list[str] = []
+        for name in gate_names:
+            if name == "tests":
+                resolved_gates.append((name, make_tests_gate(test_command)))
+            else:
+                g = registry.get(name)
+                if g is None:
+                    unknown_gates.append(name)
+                else:
+                    resolved_gates.append((name, g))
         if unknown_gates:
             print(yellow(
                 f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
-                f"(not registered; tasks 12–17 add built-ins)"
+                f"(not registered; tasks 13–17 add built-ins)"
             ))
         if resolved_gates:
             print(f"\n{bold('--- Phase 4: Gates ---')}")

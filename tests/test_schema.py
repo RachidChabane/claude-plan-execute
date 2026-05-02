@@ -255,6 +255,89 @@ def test_effective_defaults_no_version_treated_as_v1(tmp_path, capsys):
     assert eff["on_max_review_rounds"] == "auto_approve"
 
 
+# --- B2. v1 gates: ["tests"] injection (task 12 §D6) ----------------------
+
+def test_effective_defaults_injects_gates_tests_for_v1_when_unset(tmp_path):
+    """Task 12 §D6: effective_defaults injects gates: ['tests'] for v1
+    files that don't set defaults.gates explicitly. Mirrors the
+    on_max_review_rounds: 'auto_approve' v1 injection (task 6 §D1)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["gates"] == ["tests"]
+
+
+def test_effective_defaults_no_gates_injection_for_v2(tmp_path):
+    """Task 12 §D6: v2 files do NOT receive the gates injection. They
+    must opt in by setting defaults.gates explicitly."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert "gates" not in eff
+
+
+def test_effective_defaults_v1_user_value_wins_over_gates_injection(tmp_path):
+    """Task 12 §D6: an explicit defaults.gates in a v1 file is
+    preserved verbatim; injection only fires when the key is absent."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults:\n"
+        "  gates: [lint]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["gates"] == ["lint"]
+
+
+def test_effective_defaults_v1_explicit_empty_gates_preserved(tmp_path):
+    """Task 12 §D6: explicit gates: [] in a v1 file is preserved as
+    [] (user opted out of all gates). The injection check is 'key
+    absent', not 'falsy' — empty list is a valid explicit choice."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults:\n"
+        "  gates: []\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["gates"] == []
+
+
+def test_effective_defaults_no_version_treated_as_v1_for_gates_injection(
+    tmp_path, capsys,
+):
+    """Task 12 §D6: a file with no version field is v1-equivalent for
+    the gates injection (same as v1 explicit)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    capsys.readouterr()  # discard load-time warnings
+    eff = loader.effective_defaults(tf)
+    assert eff["gates"] == ["tests"]
+
+
 # --- C. Caps-vs-legacy precedence (S2) --------------------------------------
 
 def test_effective_defaults_caps_wins_over_legacy_when_both_set(tmp_path, capsys):

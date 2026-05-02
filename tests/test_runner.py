@@ -173,27 +173,19 @@ def test_revise_prompt_does_not_mention_implementation():
     assert "Do NOT implement anything" in out
 
 
-def test_implement_prompt_includes_test_command_verbatim():
-    out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md",
-        "pytest tests/ -k foo", "msg",
-    )
-    assert "pytest tests/ -k foo" in out
-
-
 def test_implement_prompt_includes_commit_message_verbatim():
     out = build_implement_prompt(
         {"id": 1, "title": "T", "description": "D"}, "p.md",
-        "pytest", "feat: my custom commit message",
+        "feat: my custom commit message",
     )
     assert "feat: my custom commit message" in out
 
 
 def test_implement_prompt_byte_length_matches_baseline():
     out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 415
+    assert len(out) == 350
 
 
 # ---------------------------------------------------------------------------
@@ -2516,3 +2508,333 @@ def test_execute_task_dry_run_does_NOT_run_gates(
         cli={}, skip_to="implement", dry_run=True,
     )
     assert invoked == []
+
+
+# ---------------------------------------------------------------------------
+# O. `tests` built-in gate integration (task 12)
+# ---------------------------------------------------------------------------
+
+# These tests do NOT use the _clean_default_registry fixture. The runner's
+# special-case for `tests` (task 12 §D3) constructs the Gate via
+# make_tests_gate(test_command) WITHOUT consulting default_registry —
+# the fixture's emptiness is irrelevant for the `tests` path. (See §D9.)
+
+
+def test_execute_task_tests_gate_runs_resolved_test_command(monkeypatch, tmp_path):
+    """Pin §D2 / §D3: when 'tests' is in the gate list, the runner
+    constructs the Gate with command=('bash', '-c', test_command) using
+    the resolved test_command from the resolver chain."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests"],
+            "test_command": "pytest -q",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", "pytest -q"]]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_tests_gate_uses_per_task_test_command(monkeypatch, tmp_path):
+    """Pin §D3: per-task test_command override is what the gate runs."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, test_command="rspec --fail-fast"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests"],
+            "test_command": "pytest",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", "rspec --fail-fast"]]
+
+
+def test_execute_task_tests_gate_failure_blocks_and_records(monkeypatch, tmp_path):
+    """Pin §D3 / task 11 §D12: a failing tests gate blocks the task
+    with block_reason='gate_failed' and records a FailureRecord."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 1
+        p.stdout = "FAILED tests/test_x.py::test_y\n"
+        p.stderr = "1 failed, 0 passed\n"
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests"],
+            "test_command": "pytest",
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    assert len(entry["attempts"]) == 1
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"
+    assert rec["phase"] == "gate"
+    assert "FAILED tests/test_x.py::test_y" in rec["verbatim"]
+    assert "gate:tests" in rec["artifacts"]
+
+
+def test_execute_task_tests_gate_writes_output_file(monkeypatch, tmp_path):
+    """Pin task 11 §D8: the gate's output is captured to
+    plans/task-{id}/gates/tests.txt."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "OUTPUT_MARKER\n"
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests"],
+            "test_command": "pytest",
+        },
+        cli={}, skip_to="implement",
+    )
+    out_file = tmp_path / "task-1" / "gates" / "tests.txt"
+    assert out_file.is_file()
+    assert "OUTPUT_MARKER" in out_file.read_text()
+
+
+def test_execute_task_tests_name_does_NOT_warn_as_unknown(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D3: the runner's special-case prevents 'tests' from being
+    reported as an unknown-gate name. (Task 11's empty-registry path
+    would have warned for 'tests'; task 12 makes the warning silence.)"""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests"],
+            "test_command": "pytest",
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s) skipped" not in out
+    assert "tests" not in out or "Phase 4: Gates" in out  # may print 'tests: PASS'
+
+
+def test_execute_task_tests_gate_skipped_when_implementer_timed_out(
+    monkeypatch, tmp_path,
+):
+    """Pin task 11 §D12 carry-forward: implementer_timeout returns
+    BEFORE the gate run, so the tests gate does not fire."""
+    invoked = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd)
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_timeout(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests"],
+            "test_command": "pytest",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == []
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["block_reason"] == "implementer_timeout"
+
+
+def test_execute_task_tests_gate_runs_alongside_unknown_lint(
+    monkeypatch, tmp_path, capsys,
+):
+    """Integration with task 11: 'tests' resolves via the runner's
+    special-case; 'lint' (not yet registered) warns and skips. Both
+    coexist without the runner crashing."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests", "lint"],     # mirrors the repo's tasks.yaml
+            "test_command": "pytest",
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    # tests gate ran:
+    assert invoked == [["bash", "-c", "pytest"]]
+    # lint warned (still unknown until task 13):
+    assert "Unknown gate(s) skipped: lint" in out
+    # task reaches done because lint warning is non-blocking:
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_tests_gate_phase_extra_appended(monkeypatch, tmp_path):
+    """Pin task 11 §D12 + §D3: the runner walks gate_names in order;
+    a phase's gates_extra='tests' is appended to project gates and runs
+    after them. (Phase ordering doesn't change the tests gate's
+    behavior — both invocations produce the same Gate via the factory.)"""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": [],          # nothing at project level
+            "test_command": "pytest",
+        },
+        cli={},
+        phases_by_id={"ui": {"id": "ui", "defaults": {"gates_extra": ["tests"]}}},
+        skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", "pytest"]]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_tests_gate_does_NOT_pass_test_command_to_implement_prompt(
+    monkeypatch, tmp_path,
+):
+    """Pin §D4 / §D10: the runner stops passing test_command to
+    build_implement_prompt. We assert the spy receives the new
+    signature (commit_msg in the third positional, no test_command)."""
+    captured: dict = {}
+    real_build_impl = runner.build_implement_prompt
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_build_impl(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.build_implement_prompt", spy,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, commit_message="test-commit-msg"), state,
+        file_defaults={"plans_dir": str(tmp_path), "test_command": "pytest"},
+        cli={}, skip_to="implement",
+    )
+    # Positional args: (task, plan_path, commit_msg). Verify length and
+    # types — the third arg is the commit message, NOT a test_command.
+    args = captured["args"]
+    assert len(args) == 3
+    assert args[0]["id"] == 1                      # task dict
+    assert args[1].endswith("task-1/plan.md")      # plan_path
+    assert args[2] == "test-commit-msg"            # commit_msg
+    # And test_command is not anywhere in the kwargs:
+    assert "test_command" not in captured["kwargs"]

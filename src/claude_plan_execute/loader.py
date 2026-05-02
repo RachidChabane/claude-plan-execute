@@ -112,6 +112,8 @@ def effective_defaults(tasks_file: TasksFile) -> dict:
       `caps.max_attempts` into resolver-friendly keys.
     - Injects `on_max_review_rounds: "auto_approve"` for v1 / no-version
       files when the user hasn't set it explicitly (task 6 §D1).
+    - Injects `gates: ["tests"]` for v1 / no-version files when the
+      user hasn't set it explicitly (task 12 §D6).
     """
     out = tasks_file.defaults.model_dump(exclude_none=True)
     out.pop("caps", None)
@@ -133,6 +135,10 @@ def effective_defaults(tasks_file: TasksFile) -> dict:
     if "on_max_review_rounds" not in out:
         if tasks_file.version is None or tasks_file.version == 1:
             out["on_max_review_rounds"] = "auto_approve"
+
+    if "gates" not in out:
+        if tasks_file.version is None or tasks_file.version == 1:
+            out["gates"] = ["tests"]
 
     return out
 

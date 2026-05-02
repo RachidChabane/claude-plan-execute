@@ -258,7 +258,7 @@ def build_revise_prompt(task: dict, plan_path: str, review_path: str,
     )
 
 
-def build_implement_prompt(task: dict, plan_path: str, test_command: str,
+def build_implement_prompt(task: dict, plan_path: str,
                            commit_message: str, *, persona: str = "",
                            failure_context: str = "") -> str:
     return failure_context + persona + (
@@ -269,9 +269,7 @@ def build_implement_prompt(task: dict, plan_path: str, test_command: str,
         f"INSTRUCTIONS:\n"
         f"1. Read the plan completely before starting.\n"
         f"2. Implement every item in the plan, in order.\n"
-        f"3. Run tests: {test_command}\n"
-        f"4. Fix any test failures before proceeding.\n"
-        f"5. Commit with message:\n"
+        f"3. Commit with message:\n"
         f"   {commit_message}\n\n"
         f"Do not skip any part of the plan. Do not add unplanned features.\n"
     )

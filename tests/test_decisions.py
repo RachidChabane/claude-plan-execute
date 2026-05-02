@@ -509,7 +509,7 @@ def test_revise_prompt_does_NOT_accept_decisions_kwarg():
 def test_implement_prompt_does_NOT_accept_decisions_kwarg():
     with pytest.raises(TypeError):
         build_implement_prompt(
-            {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+            {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
             decisions="x",
         )
 

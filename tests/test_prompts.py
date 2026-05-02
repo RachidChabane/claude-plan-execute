@@ -257,7 +257,7 @@ def test_revise_prompt_prepends_persona_when_supplied():
 
 def test_implement_prompt_default_persona_is_empty():
     out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
     assert "## Project conventions" not in out
 
@@ -265,7 +265,7 @@ def test_implement_prompt_default_persona_is_empty():
 def test_implement_prompt_prepends_persona_when_supplied():
     persona = "## Project conventions\n\nIMPL_PERSONA\n\n"
     out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
         persona=persona,
     )
     assert out.startswith("## Project conventions")
@@ -274,12 +274,46 @@ def test_implement_prompt_prepends_persona_when_supplied():
 
 
 def test_implement_prompt_byte_length_unchanged_when_persona_empty():
-    """Pin (D7): with persona='', output is byte-identical to pre-task-7.
-    test_runner.py::test_implement_prompt_byte_length_matches_baseline asserts 415."""
+    """Pin (D7): with persona='', the prompt has the post-task-12
+    baseline byte count (test_command line removed)."""
     out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 415
+    assert len(out) == 350
+
+
+def test_implement_prompt_no_longer_mentions_tests():
+    """Task 12 §D4: the implement prompt no longer instructs the agent
+    to run tests. The `tests` gate runs them after implement."""
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
+    )
+    assert "Run tests" not in out
+    assert "test failures" not in out
+    assert "pytest" not in out
+
+
+def test_implement_prompt_step_3_is_commit():
+    """Renumbered: step 3 was 'Run tests', is now 'Commit'. Pin the
+    new shape so a future format change is intentional."""
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
+    )
+    assert "3. Commit with message:" in out
+    # The old steps 4 and 5 must be gone.
+    assert "4. " not in out
+    assert "5. " not in out
+
+
+def test_implement_prompt_signature_does_not_accept_test_command():
+    """Pin §D4: removing the parameter is a clean break. A caller
+    passing a 4th positional arg (the old test_command shape) raises
+    TypeError because the next param is keyword-only."""
+    with pytest.raises(TypeError):
+        build_implement_prompt(
+            {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
+            "would-be-test-command-positional",
+        )
 
 
 def test_persona_kwarg_is_keyword_only_on_plan_prompt():
@@ -729,7 +763,7 @@ def test_plan_prompt_byte_length_unchanged_when_failure_context_empty():
 
 def test_implement_prompt_default_failure_context_is_empty():
     out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
     assert "[FAILURE CONTEXT" not in out
 
@@ -737,7 +771,7 @@ def test_implement_prompt_default_failure_context_is_empty():
 def test_implement_prompt_prepends_failure_context_when_supplied():
     fc = "FCMARKER\n\n"
     out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
         failure_context=fc,
     )
     assert out.startswith("FCMARKER")
@@ -748,7 +782,7 @@ def test_implement_prompt_failure_context_appears_before_persona():
     fc = "FCMARKER\n\n"
     persona = "PERSONAMARKER\n\n"
     out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
         persona=persona, failure_context=fc,
     )
     fc_idx = out.index("FCMARKER")
@@ -759,14 +793,14 @@ def test_implement_prompt_failure_context_appears_before_persona():
 def test_implement_prompt_failure_context_keyword_only():
     with pytest.raises(TypeError):
         build_implement_prompt(
-            {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+            {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
             "would-be-positional",
         )
 
 
 def test_implement_prompt_byte_length_unchanged_when_failure_context_empty():
-    """Pin: 415 baseline preserved when failure_context defaults to ''."""
+    """Pin: post-task-12 baseline preserved when failure_context defaults to ''."""
     out = build_implement_prompt(
-        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 415
+    assert len(out) == 350

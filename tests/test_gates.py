@@ -152,10 +152,10 @@ def test_default_registry_is_a_singleton():
 
 def test_default_registry_starts_empty_in_task_11():
     """Task 11 ships zero built-in registrations; tasks 12+ add them."""
-    # Note: this test runs in an isolated import — by the time tests
-    # run, only task 11 code is loaded, so the default registry is
-    # empty. This test will UPDATE in task 12 to assert `tests` is
-    # registered.
+    # Task 12 chose Path A (factory pattern, no singleton entry — see
+    # task-12 plan §D1), so this assertion stays empty. The first task
+    # that registers a built-in WITHOUT per-task config (e.g., task 16's
+    # security-auditor) will be the one to add an entry here.
     assert default_registry().names() == []
 
 
