@@ -213,13 +213,18 @@ def test_get_state_returns_state_data_when_file_exists(client, tmp_path):
     _write_tasks_yaml(tmp_path)
     _write_state_json(tmp_path, {"tasks": {"1": {"status": "done"}}})
     r = client.get("/api/state")
-    assert r.json() == {"tasks": {"1": {"status": "done"}}}
+    assert r.json() == {
+        "schema_version": 2,
+        "tasks": {
+            "1": {"status": "done", "attempts": [], "current_attempt": 1},
+        },
+    }
 
 
 def test_get_state_returns_empty_tasks_dict_when_no_state_file(client, tmp_path):
     _write_tasks_yaml(tmp_path)
     r = client.get("/api/state")
-    assert r.json() == {"tasks": {}}
+    assert r.json() == {"schema_version": 2, "tasks": {}}
 
 
 def test_get_state_uses_plans_dir_from_defaults(client, tmp_path):
@@ -238,7 +243,12 @@ tasks:
         _json.dumps({"tasks": {"1": {"status": "implementing"}}})
     )
     r = client.get("/api/state")
-    assert r.json() == {"tasks": {"1": {"status": "implementing"}}}
+    assert r.json() == {
+        "schema_version": 2,
+        "tasks": {
+            "1": {"status": "implementing", "attempts": [], "current_attempt": 1},
+        },
+    }
 
 
 def test_get_state_falls_back_to_default_plans_dir_when_no_defaults_block(
@@ -249,7 +259,12 @@ def test_get_state_falls_back_to_default_plans_dir_when_no_defaults_block(
     )
     _write_state_json(tmp_path, {"tasks": {"1": {"status": "approved"}}})
     r = client.get("/api/state")
-    assert r.json() == {"tasks": {"1": {"status": "approved"}}}
+    assert r.json() == {
+        "schema_version": 2,
+        "tasks": {
+            "1": {"status": "approved", "attempts": [], "current_attempt": 1},
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +723,12 @@ def test_websocket_sends_initial_state_on_connect(client, tmp_path):
     with client.websocket_connect("/ws") as ws:
         msg = ws.receive_json()
         assert msg["type"] == "state"
-        assert msg["data"] == {"tasks": {"1": {"status": "done"}}}
+        assert msg["data"] == {
+            "schema_version": 2,
+            "tasks": {
+                "1": {"status": "done", "attempts": [], "current_attempt": 1},
+            },
+        }
 
 
 def test_websocket_appends_to_clients_list(client, tmp_path):

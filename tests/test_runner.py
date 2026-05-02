@@ -26,13 +26,19 @@ from claude_plan_execute.state import State
 
 @pytest.fixture(autouse=True)
 def _reset_module_globals():
-    """Reset claude._active_child and runner._current_* between tests."""
+    """Reset claude._active_child, claude._last_run_*, and runner._current_*
+    between tests. Without the claude flag reset, a test that sets
+    _last_run_timed_out via a stub leaks the flag into subsequent tests."""
     claude._active_child = None
+    claude._last_run_timed_out = False
+    claude._last_run_subtype = None
     runner._current_state = None
     runner._current_task_id = 0
     runner._current_phase = "plan"
     yield
     claude._active_child = None
+    claude._last_run_timed_out = False
+    claude._last_run_subtype = None
     runner._current_state = None
     runner._current_task_id = 0
     runner._current_phase = "plan"
@@ -589,6 +595,89 @@ def test_run_claude_does_NOT_print_stderr_when_stderr_is_empty(
     )
     out = capsys.readouterr().out
     assert "stderr: " not in out
+
+
+def test_run_claude_sets_subtype_from_list_result_event(monkeypatch):
+    """Pin §D6: CLI v2.x list-of-events output. The terminal
+    `type: result` event's subtype is captured into the side-channel
+    flag for the runner to inspect post-call."""
+    stdout = json.dumps([
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant"},
+        {"type": "result", "subtype": "error_max_turns", "is_error": True},
+    ])
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert claude._last_run_subtype == "error_max_turns"
+
+
+def test_run_claude_sets_subtype_from_dict_legacy_shape(monkeypatch):
+    """Pin §D6: legacy CLI single-dict output. Subtype on the
+    top-level dict still flows through."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "hi",
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert claude._last_run_subtype == "success"
+
+
+def test_run_claude_extracts_result_text_from_list_result_event(monkeypatch):
+    """Pin §R17: the new parser extracts `result` from the list-shape
+    output (pre-task-9 the parser silently fell through and returned
+    raw stdout). No runner caller depends on the text, but the
+    extraction is now real."""
+    stdout = json.dumps([
+        {"type": "result", "subtype": "success", "result": "extracted text"},
+    ])
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    _, text = run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert text == "extracted text"
+
+
+def test_run_claude_resets_subtype_at_call_entry(monkeypatch):
+    """Pin §D6: stale telemetry from a prior call is cleared. Pre-set
+    the flag, then make a call whose stdout has no parseable result
+    event — the flag must be reset to None."""
+    claude._last_run_subtype = "leftover_from_prior_call"
+    _patch_run_claude_subprocess(monkeypatch, stdout="not json")
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert claude._last_run_subtype is None
+
+
+def test_run_claude_timeout_sets_last_run_timed_out_flag(monkeypatch):
+    """Pin §D6: subprocess.TimeoutExpired path sets the side-channel
+    flag. The runner reads this immediately after the call to
+    classify the failure as `implementer_timeout`."""
+    _patch_run_claude_subprocess(monkeypatch, raises_timeout=True)
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert claude._last_run_timed_out is True
+
+
+def test_run_claude_resets_timed_out_flag_at_call_entry(monkeypatch):
+    """Stale-flag pin: a clean call after a prior timeout must clear the flag."""
+    claude._last_run_timed_out = True
+    _patch_run_claude_subprocess(monkeypatch)
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert claude._last_run_timed_out is False
 
 
 # ---------------------------------------------------------------------------
@@ -1390,3 +1479,464 @@ def test_execute_task_does_NOT_pass_decisions_to_review_prompt(monkeypatch, tmp_
     # No TypeError → review builder was called with the existing
     # signature (no decisions kwarg leaked).
     assert captured.get("called") is True
+
+
+# ---------------------------------------------------------------------------
+# L. Failure capture (task 9)
+# ---------------------------------------------------------------------------
+
+from claude_plan_execute.state import make_failure_record
+
+
+# --- L.1: review-rounds exhaustion + fail records FailureRecord -----------
+
+
+def test_max_rounds_with_fail_records_failure(monkeypatch, tmp_path):
+    """Task 9 §D5: review-rounds exhaustion + fail writes a
+    FailureRecord with failure_class=review_rejected_after_max_rounds."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "review_rejected_after_max_rounds"
+
+
+def test_max_rounds_with_fail_failure_record_phase_is_review(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    assert state.get(1)["attempts"][0]["phase"] == "review"
+
+
+def test_max_rounds_with_fail_failure_record_includes_artifacts(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    artifacts = state.get(1)["attempts"][0]["artifacts"]
+    assert "plan" in artifacts
+    assert artifacts["plan"].endswith("task-1/plan.md")
+    assert "last_review" in artifacts
+    assert artifacts["last_review"].endswith("task-1/review-1.md")
+
+
+def test_max_rounds_with_fail_failure_record_captures_last_review_verbatim(
+    monkeypatch, tmp_path,
+):
+    """When the last review file exists on disk, its body is captured
+    into the FailureRecord's verbatim field."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    # Pre-write a review file at the path execute_task will use.
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    review_path = task_dir / "review-1.md"
+    review_path.write_text("## Verdict: NEEDS_REVISION\n\nMy specific complaint")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    verbatim = state.get(1)["attempts"][0]["verbatim"]
+    assert "My specific complaint" in verbatim
+
+
+def test_max_rounds_with_fail_failure_record_verbatim_empty_when_review_missing(
+    monkeypatch, tmp_path,
+):
+    """When the last review file doesn't exist, verbatim is empty (no raise)."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    assert state.get(1)["attempts"][0]["verbatim"] == ""
+
+
+def test_max_rounds_with_auto_approve_does_NOT_record_failure(
+    monkeypatch, tmp_path,
+):
+    """Pin: auto_approve path falls through to Phase 3; no FailureRecord."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={}, skip_to="review",
+    )
+    assert state.get(1)["attempts"] == []
+
+
+def test_max_rounds_with_fail_records_failure_BEFORE_returning(
+    monkeypatch, tmp_path,
+):
+    """Pin: the FailureRecord is persisted before the function returns,
+    so a subsequent State() reload sees it."""
+    _no_run_claude_called(monkeypatch)
+    state_path = tmp_path / "state.json"
+    state = State(state_path)
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    # Reload from disk to confirm persistence.
+    fresh = State(state_path)
+    assert len(fresh.get(1)["attempts"]) == 1
+    assert fresh.get(1)["attempts"][0]["failure_class"] == \
+        "review_rejected_after_max_rounds"
+
+
+def test_max_rounds_with_fail_records_failure_when_max_review_rounds_is_zero(
+    monkeypatch, tmp_path,
+):
+    """Pin §R26: max_review_rounds=0 + on_max_review_rounds=fail must
+    record a FailureRecord with empty verbatim and no `last_review`
+    artifact, without raising NameError on `round_num`."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 0,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "review_rejected_after_max_rounds"
+    assert attempts[0]["verbatim"] == ""
+    assert "last_review" not in attempts[0]["artifacts"]
+    assert "plan" in attempts[0]["artifacts"]
+    # Status transitions to blocked, just like the rounds>=1 path.
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1).get("block_reason") == "max_review_rounds_exhausted"
+
+
+# --- L.2: implement timeout records FailureRecord -------------------------
+
+
+def _patch_run_claude_simulating_timeout(monkeypatch):
+    """Stub run_claude that simulates a timeout: sets the side-channel
+    flag and returns the timeout sentinel (1, '')."""
+    called = []
+
+    def stub(*args, **kwargs):
+        called.append((args, kwargs))
+        claude._last_run_timed_out = True
+        claude._last_run_subtype = None
+        return 1, ""
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    return called
+
+
+def _patch_run_claude_simulating_max_turns(monkeypatch):
+    """Stub run_claude that simulates a max-turns hit: sets the
+    subtype side-channel flag."""
+    called = []
+
+    def stub(*args, **kwargs):
+        called.append((args, kwargs))
+        claude._last_run_timed_out = False
+        claude._last_run_subtype = "error_max_turns"
+        return 0, ""  # CLI exits cleanly even on max-turns
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    return called
+
+
+def _patch_run_claude_simulating_success(monkeypatch):
+    """Stub run_claude that simulates a clean run."""
+    called = []
+
+    def stub(*args, **kwargs):
+        called.append((args, kwargs))
+        claude._last_run_timed_out = False
+        claude._last_run_subtype = "success"
+        return 0, "ok"
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    return called
+
+
+def test_implement_timeout_records_failure(monkeypatch, tmp_path):
+    """Pin §D7: implementer_timeout FailureRecord written when
+    claude._last_run_timed_out is True after Phase 3 run_claude."""
+    _patch_run_claude_simulating_timeout(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "implementer_timeout"
+    assert attempts[0]["phase"] == "implement"
+
+
+def test_implement_timeout_sets_blocked_status(monkeypatch, tmp_path):
+    """Pin §D7: the task transitions to 'blocked', not 'done'."""
+    _patch_run_claude_simulating_timeout(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry.get("block_reason") == "implementer_timeout"
+
+
+def test_implement_timeout_includes_plan_artifact(monkeypatch, tmp_path):
+    _patch_run_claude_simulating_timeout(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    artifacts = state.get(1)["attempts"][0]["artifacts"]
+    assert "plan" in artifacts
+
+
+# --- L.3: implement max-turns records FailureRecord -----------------------
+
+
+def test_implement_max_turns_records_failure(monkeypatch, tmp_path):
+    """Pin §D7: implementer_max_turns FailureRecord written when
+    claude._last_run_subtype == 'error_max_turns'."""
+    _patch_run_claude_simulating_max_turns(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "implementer_max_turns"
+    assert attempts[0]["phase"] == "implement"
+
+
+def test_implement_max_turns_sets_blocked_status(monkeypatch, tmp_path):
+    _patch_run_claude_simulating_max_turns(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry.get("block_reason") == "implementer_max_turns"
+
+
+# --- L.4: implement success does NOT record FailureRecord -----------------
+
+
+def test_implement_success_does_NOT_record_failure(monkeypatch, tmp_path):
+    """Pin §D7: clean run reaches state.set_status(tid, 'done') and writes
+    no FailureRecord."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["attempts"] == []
+    assert state.get(1)["status"] == "done"
+
+
+def test_implement_does_NOT_record_failure_when_pre_set_flag_is_overridden(
+    monkeypatch, tmp_path,
+):
+    """Stronger pin than 'flag is False after success': the stub sets
+    `_last_run_timed_out = False` at call entry, overriding any prior
+    value. Pre-set the flag to True before execute_task — the stub
+    must reset it via its assignment, otherwise a stale flag from a
+    previous call would falsely trigger the timeout branch."""
+    claude._last_run_timed_out = True  # leftover from a prior call
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    # The stub explicitly sets _last_run_timed_out=False; the runner's
+    # post-call check should NOT see True.
+    assert state.get(1)["attempts"] == []
+    assert state.get(1)["status"] == "done"
+
+
+# --- L.5: handle_sigint records manual_stop --------------------------------
+
+
+def test_handle_sigint_records_manual_stop_when_task_in_flight(
+    monkeypatch, tmp_path,
+):
+    """Pin §D10: SIGINT during an active task records a manual_stop record."""
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "implementing")
+    runner._current_state = state
+    runner._current_task_id = 1
+    runner._current_phase = "implement"
+    with pytest.raises(SystemExit):
+        handle_sigint(2, None)
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "manual_stop"
+    assert attempts[0]["phase"] == "implement"
+
+
+def test_handle_sigint_records_manual_stop_during_planning(monkeypatch, tmp_path):
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "planning")
+    runner._current_state = state
+    runner._current_task_id = 1
+    runner._current_phase = "plan"
+    with pytest.raises(SystemExit):
+        handle_sigint(2, None)
+    assert state.get(1)["attempts"][0]["phase"] == "plan"
+
+
+def test_handle_sigint_does_NOT_record_when_status_is_done(monkeypatch, tmp_path):
+    """Pin §D10: tasks already in terminal status are not over-recorded."""
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "done")
+    runner._current_state = state
+    runner._current_task_id = 1
+    with pytest.raises(SystemExit):
+        handle_sigint(2, None)
+    assert state.get(1)["attempts"] == []
+
+
+def test_handle_sigint_does_NOT_record_when_status_is_blocked(monkeypatch, tmp_path):
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "blocked", block_reason="implementer_timeout")
+    runner._current_state = state
+    runner._current_task_id = 1
+    with pytest.raises(SystemExit):
+        handle_sigint(2, None)
+    assert state.get(1)["attempts"] == []
+
+
+def test_handle_sigint_does_NOT_record_when_state_is_None(monkeypatch):
+    """Pin §D10: SIGINT before any execute_task is a noop on the failure surface."""
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    runner._current_state = None
+    runner._current_task_id = 0
+    # Must not raise AttributeError or write anything.
+    with pytest.raises(SystemExit):
+        handle_sigint(2, None)
+
+
+def test_handle_sigint_does_NOT_record_when_task_id_is_zero(monkeypatch, tmp_path):
+    """Pin §D10: _current_task_id == 0 (initial sentinel) means no task in flight."""
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    state = State(tmp_path / "state.json")
+    runner._current_state = state
+    runner._current_task_id = 0
+    runner._current_phase = "plan"
+    with pytest.raises(SystemExit):
+        handle_sigint(2, None)
+    # No task entry should have been touched.
+    assert state.data["tasks"] == {}
+
+
+def test_handle_sigint_swallows_record_failure_exception(monkeypatch, tmp_path):
+    """Pin §D10: signal handlers must never raise. record_failure I/O
+    failure is silently absorbed; sys.exit(130) still fires."""
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "implementing")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    state.record_failure = boom  # type: ignore[method-assign]
+    runner._current_state = state
+    runner._current_task_id = 1
+    runner._current_phase = "implement"
+    with pytest.raises(SystemExit) as exc_info:
+        handle_sigint(2, None)
+    assert exc_info.value.code == 130
+
+
+def test_handle_sigint_still_exits_130(monkeypatch, tmp_path):
+    """Sanity: the recording path does NOT change the SIGINT exit code."""
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "implementing")
+    runner._current_state = state
+    runner._current_task_id = 1
+    runner._current_phase = "implement"
+    with pytest.raises(SystemExit) as exc_info:
+        handle_sigint(2, None)
+    assert exc_info.value.code == 130
+
+
+def test_handle_sigint_still_prints_resume_command(monkeypatch, capsys, tmp_path):
+    """Sanity: the recording path does NOT change the user-facing print."""
+    monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
+    state = State(tmp_path / "state.json")
+    state.set_status(7, "implementing")
+    runner._current_state = state
+    runner._current_task_id = 7
+    runner._current_phase = "implement"
+    with pytest.raises(SystemExit):
+        handle_sigint(2, None)
+    out = capsys.readouterr().out
+    assert "--task 7 --skip-to implement" in out

@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from claude_plan_execute import claude
 from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
@@ -20,7 +21,7 @@ from claude_plan_execute.prompts import (
     build_review_prompt,
     build_revise_prompt,
 )
-from claude_plan_execute.state import State
+from claude_plan_execute.state import State, make_failure_record
 
 
 def check_verdict(review_path: Path) -> tuple[bool, str]:
@@ -200,10 +201,39 @@ def execute_task(
                     f"  Max review rounds reached ({max_review_rounds}). "
                     f"on_max_review_rounds: fail — stopping; Implement skipped."
                 ))
+                # When max_review_rounds == 0 the for-loop never bound
+                # round_num; guard the path construction.
+                if max_review_rounds > 0:
+                    last_review_path = task_dir / f"review-{round_num}.md"
+                    try:
+                        last_review_text = (
+                            last_review_path.read_text(encoding="utf-8")
+                            if last_review_path.exists()
+                            else ""
+                        )
+                    except OSError:
+                        last_review_text = ""
+                    artifacts = {
+                        "plan": str(plan_path),
+                        "last_review": str(last_review_path),
+                    }
+                else:
+                    last_review_text = ""
+                    artifacts = {"plan": str(plan_path)}
                 state.set_status(
                     tid, "blocked",
                     block_reason="max_review_rounds_exhausted",
                 )
+                state.record_failure(tid, make_failure_record(
+                    failure_class="review_rejected_after_max_rounds",
+                    phase="review",
+                    reason=(
+                        f"Reviewer rejected the plan {max_review_rounds} "
+                        f"round{'s' if max_review_rounds != 1 else ''} in a row."
+                    ),
+                    verbatim=last_review_text,
+                    artifacts=artifacts,
+                ))
                 return
             # auto_approve (legacy v1 default)
             print(yellow(
@@ -226,6 +256,41 @@ def execute_task(
         return
 
     run_claude(prompt, max_turns=impl_turns, timeout_minutes=impl_timeout, **run_kwargs)
+
+    if claude._last_run_timed_out:
+        state.set_status(
+            tid, "blocked",
+            block_reason="implementer_timeout",
+        )
+        state.record_failure(tid, make_failure_record(
+            failure_class="implementer_timeout",
+            phase="implement",
+            reason=(
+                f"Implementer exceeded the {impl_timeout}-minute "
+                f"wall-clock timeout."
+            ),
+            artifacts={"plan": str(plan_path)},
+        ))
+        print(red(f"\n  Task {tid} blocked: implementer timeout."))
+        return
+
+    if claude._last_run_subtype == "error_max_turns":
+        state.set_status(
+            tid, "blocked",
+            block_reason="implementer_max_turns",
+        )
+        state.record_failure(tid, make_failure_record(
+            failure_class="implementer_max_turns",
+            phase="implement",
+            reason=(
+                f"Implementer hit the {impl_turns}-turn cap "
+                f"(CLI subtype 'error_max_turns')."
+            ),
+            artifacts={"plan": str(plan_path)},
+        ))
+        print(red(f"\n  Task {tid} blocked: implementer max-turns."))
+        return
+
     state.set_status(tid, "done")
     print(green(f"\n  Task {tid} complete."))
 
@@ -238,6 +303,32 @@ def save_error_output(task_dir: Path, code: int, output: str):
 
 def handle_sigint(signum, frame):
     _kill_child()  # Kill any running claude process and its children
+
+    # Best-effort: record a manual_stop FailureRecord when a task is
+    # genuinely in flight. Status check filters out completed/idle
+    # tasks (the global _current_task_id is not reset on execute_task
+    # exit). All I/O wrapped — signal handlers must never raise.
+    if _current_state is not None and _current_task_id:
+        try:
+            entry = _current_state.get(_current_task_id)
+            if entry["status"] in (
+                "planning", "reviewing", "revising",
+                "approved", "implementing",
+            ):
+                _current_state.record_failure(
+                    _current_task_id,
+                    make_failure_record(
+                        failure_class="manual_stop",
+                        phase=_current_phase,
+                        reason="User-initiated SIGINT during execution.",
+                    ),
+                )
+        except Exception:
+            pass
+
+    # Belt-and-suspenders save: covers the path where `record_failure`
+    # was skipped (status mismatch) but earlier state mutations need
+    # to flush.
     if _current_state:
         _current_state.save()
     print(f"\n{yellow('Interrupted.')} Resume with:")

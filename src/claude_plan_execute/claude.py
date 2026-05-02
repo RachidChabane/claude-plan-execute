@@ -13,6 +13,15 @@ from claude_plan_execute.colors import dim, red, yellow
 
 _active_child: subprocess.Popen | None = None
 
+# Side-channel telemetry set by `run_claude`. The runner reads these
+# IMMEDIATELY after a `run_claude` call to differentiate normal
+# completion from timeout (subprocess.TimeoutExpired) and from
+# max-turns (CLI subtype "error_max_turns"). Reset to defaults at
+# every `run_claude` entry; never read except through the runner's
+# post-call inspection.
+_last_run_timed_out: bool = False
+_last_run_subtype: str | None = None
+
 
 def _kill_child():
     """Kill the active claude child process and all its descendants."""
@@ -53,8 +62,16 @@ def run_claude(
     skip_permissions: bool,
     verbose: bool,
 ) -> tuple[int, str]:
-    """Invoke claude CLI. Returns (return_code, stdout_text)."""
-    global _active_child
+    """Invoke claude CLI. Returns (return_code, stdout_text).
+
+    Side-channel telemetry: sets module-level `_last_run_timed_out`
+    and `_last_run_subtype` for the runner to inspect post-call.
+    Both are reset at entry.
+    """
+    global _active_child, _last_run_timed_out, _last_run_subtype
+    _last_run_timed_out = False
+    _last_run_subtype = None
+
     cmd = [
         "claude",
         "-p", prompt,
@@ -86,6 +103,7 @@ def run_claude(
         returncode = _active_child.returncode
     except subprocess.TimeoutExpired:
         print(red(f"  TIMEOUT after {timeout_minutes} minutes"))
+        _last_run_timed_out = True
         _kill_child()
         return 1, ""
     finally:
@@ -97,11 +115,32 @@ def run_claude(
     if returncode != 0 and stderr:
         print(yellow(f"  stderr: {stderr[:300]}"))
 
-    # Extract text from JSON output
+    # Parse stdout for both telemetry (subtype) and result-text
+    # extraction. CLI v2.x emits a JSON ARRAY of events; the terminal
+    # "result" event carries `subtype` and `result`. Older CLI
+    # versions emitted a single dict; both shapes handled for compat.
+    #
+    # Dict-path note: legacy single-dict shape is treated as the
+    # result event WITHOUT a `type == "result"` filter to preserve
+    # backward-compat with `{"result": "..."}` outputs (no `type`
+    # key) used by older CLI versions and existing tests. Future
+    # subtype-conditioned branches must guard the dict path with
+    # `evt.get("type") == "result"` if they consume other subtypes.
+    result_text = stdout
     try:
-        output = json.loads(stdout)
-        if isinstance(output, dict) and "result" in output:
-            return returncode, output["result"]
-    except (json.JSONDecodeError, KeyError):
+        parsed = json.loads(stdout)
+        result_event: dict | None = None
+        if isinstance(parsed, list):
+            for evt in reversed(parsed):
+                if isinstance(evt, dict) and evt.get("type") == "result":
+                    result_event = evt
+                    break
+        elif isinstance(parsed, dict):
+            result_event = parsed
+        if result_event is not None:
+            _last_run_subtype = result_event.get("subtype")
+            if "result" in result_event:
+                result_text = result_event["result"]
+    except (json.JSONDecodeError, KeyError, TypeError):
         pass
-    return returncode, stdout
+    return returncode, result_text
