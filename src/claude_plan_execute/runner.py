@@ -96,6 +96,7 @@ def execute_task(
     impl_timeout = int(resolved["implement_timeout_minutes"]["value"])
     impl_turns = int(resolved["implement_max_turns"]["value"])
     test_command = resolved["test_command"]["value"]
+    on_max_review_rounds = resolved["on_max_review_rounds"]["value"]
     skip_perms = cli.get("skip_permissions", False)
     verbose = cli.get("verbose", False)
 
@@ -141,7 +142,7 @@ def execute_task(
                 print(dim(f"  [DRY RUN] Review prompt: {len(prompt)} chars"))
                 return
 
-            run_claude(prompt, max_turns=30, timeout_minutes=review_timeout, **run_kwargs)
+            run_claude(prompt, max_turns=60, timeout_minutes=review_timeout, **run_kwargs)
 
             approved, feedback = check_verdict(review_path)
             if approved:
@@ -155,9 +156,23 @@ def execute_task(
                 # Revise
                 state.set_status(tid, "revising", review_round=round_num)
                 revise_prompt = build_revise_prompt(task, str(plan_path), str(review_path))
-                run_claude(revise_prompt, max_turns=30, timeout_minutes=review_timeout, **run_kwargs)
+                run_claude(revise_prompt, max_turns=60, timeout_minutes=review_timeout, **run_kwargs)
         else:
-            print(yellow(f"  Max review rounds reached. Proceeding with current plan."))
+            if on_max_review_rounds == "fail":
+                print(red(
+                    f"  Max review rounds reached ({max_review_rounds}). "
+                    f"on_max_review_rounds: fail — stopping; Implement skipped."
+                ))
+                state.set_status(
+                    tid, "blocked",
+                    block_reason="max_review_rounds_exhausted",
+                )
+                return
+            # auto_approve (legacy v1 default)
+            print(yellow(
+                f"  Max review rounds reached. Proceeding with current "
+                f"plan (on_max_review_rounds: auto_approve)."
+            ))
             state.set_status(tid, "approved")
 
     # --- PHASE 3: IMPLEMENT ---

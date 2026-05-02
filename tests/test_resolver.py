@@ -392,5 +392,76 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "implement_timeout_minutes",
         "implement_max_turns",
         "max_attempts",
+        "on_max_review_rounds",
     )
     assert KEYS_TO_AUDIT == expected
+
+
+# ---------------------------------------------------------------------------
+# I. on_max_review_rounds default + provenance (task 6)
+# ---------------------------------------------------------------------------
+
+
+def test_hardcoded_default_for_on_max_review_rounds_is_fail():
+    """Task 6 §D1: modern hardcoded default is 'fail'. v1 compat is
+    layered in by the loader, not by the resolver."""
+    assert HARDCODED_DEFAULTS["on_max_review_rounds"] == "fail"
+
+
+def test_resolve_returns_fail_when_no_layer_supplies_on_max_review_rounds():
+    """No file_defaults injection (simulates v2 + no override): resolver
+    falls through to hardcoded → 'fail'."""
+    out = resolve("on_max_review_rounds", task={}, file_defaults={}, cli_overrides={})
+    assert out == "fail"
+
+
+def test_resolve_returns_auto_approve_when_file_defaults_supplies_it():
+    """Simulates the v1 compat path: loader has injected 'auto_approve'
+    into project_defaults; resolver picks it up there."""
+    out = resolve(
+        "on_max_review_rounds",
+        task={},
+        file_defaults={"on_max_review_rounds": "auto_approve"},
+        cli_overrides={},
+    )
+    assert out == "auto_approve"
+
+
+def test_resolve_task_config_includes_on_max_review_rounds_with_provenance_hardcoded():
+    """v2 + no override path: from = 'hardcoded'."""
+    out = resolve_task_config(task={}, file_defaults={}, cli_overrides={})
+    assert out["on_max_review_rounds"] == {"value": "fail", "from": "hardcoded"}
+
+
+def test_resolve_task_config_includes_on_max_review_rounds_with_provenance_project():
+    """v1 compat path: from = 'project_defaults'."""
+    out = resolve_task_config(
+        task={},
+        file_defaults={"on_max_review_rounds": "auto_approve"},
+        cli_overrides={},
+    )
+    assert out["on_max_review_rounds"] == {
+        "value": "auto_approve", "from": "project_defaults",
+    }
+
+
+def test_resolve_task_config_on_max_review_rounds_picks_phase_layer():
+    out = resolve_task_config(
+        task={},
+        file_defaults={},
+        cli_overrides={},
+        phase={"on_max_review_rounds": "auto_approve"},
+        phase_id="dashboard",
+    )
+    assert out["on_max_review_rounds"] == {
+        "value": "auto_approve", "from": "phase:dashboard",
+    }
+
+
+def test_resolve_task_config_on_max_review_rounds_cli_wins():
+    out = resolve_task_config(
+        task={},
+        file_defaults={"on_max_review_rounds": "auto_approve"},
+        cli_overrides={"on_max_review_rounds": "fail"},
+    )
+    assert out["on_max_review_rounds"] == {"value": "fail", "from": "cli"}

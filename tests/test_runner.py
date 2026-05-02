@@ -988,3 +988,176 @@ def test_execute_task_resolved_config_json_is_valid_json(monkeypatch, tmp_path):
     # Round-trip: parse then compare to the in-memory shape we expect.
     parsed = json.loads(raw)
     assert "model" in parsed and "value" in parsed["model"] and "from" in parsed["model"]
+
+
+# ---------------------------------------------------------------------------
+# I. on_max_review_rounds review-loop branches (task 6)
+# ---------------------------------------------------------------------------
+
+
+# These tests do NOT use dry_run=True. The dry_run path returns inside
+# the review loop on the first iteration, before for-else can fire.
+# Instead they stub run_claude (no-op), use skip_to="review" to bypass
+# Phase 1, set max_review_rounds=1, and never write a review file —
+# check_verdict returns False, the loop body completes once, and
+# for-else triggers. (Plan §8 in plans/task-6/plan.md.)
+
+
+def test_execute_task_max_rounds_with_fail_sets_blocked_status(monkeypatch, tmp_path):
+    """Task 6 §D6: on_max_review_rounds=fail → status 'blocked'."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+
+
+def test_execute_task_max_rounds_with_fail_records_block_reason(monkeypatch, tmp_path):
+    """Task 6 §D8: block_reason persisted as a sibling extra."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    entry = state.get(1)
+    assert entry.get("block_reason") == "max_review_rounds_exhausted"
+
+
+def test_execute_task_max_rounds_with_fail_skips_implement(monkeypatch, tmp_path):
+    """Task 6 §D6: blocked path returns before Phase 3. Status must NOT
+    transition to 'implementing' or 'done'."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    entry = state.get(1)
+    assert entry["status"] != "implementing"
+    assert entry["status"] != "done"
+
+
+def test_execute_task_max_rounds_with_fail_does_NOT_mark_approved(monkeypatch, tmp_path):
+    """Pin §D6: the existing state.set_status(tid, 'approved') line must
+    move INSIDE the auto_approve branch. The fail path must skip it
+    entirely — flickering 'approved' → 'blocked' would churn the
+    dashboard's WebSocket stream pointlessly."""
+    _no_run_claude_called(monkeypatch)
+    state_path = tmp_path / "state.json"
+    state = State(state_path)
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    # The persisted state must read 'blocked' — never an intermediate
+    # 'approved' that got overwritten. (We can't directly observe
+    # intermediate states, but we can assert the final state is right
+    # AND that no spurious approved-then-blocked sequence appears in the
+    # JSON file as a recovered partial write. The test is more about the
+    # branching logic being correct than catching live churn.)
+    on_disk = json.loads(state_path.read_text())
+    assert on_disk["tasks"]["1"]["status"] == "blocked"
+
+
+def test_execute_task_max_rounds_with_auto_approve_proceeds_to_implement(
+    monkeypatch, tmp_path,
+):
+    """Task 6 §D6: on_max_review_rounds=auto_approve → existing behavior
+    (mark 'approved', fall through to Phase 3 'implementing')."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={}, skip_to="review",
+    )
+    entry = state.get(1)
+    # After auto_approve fall-through + Phase 3 stub run_claude, status
+    # ends at 'done' (the last set_status in execute_task). The exact
+    # final state is whatever the stubbed run_claude leaves; the
+    # invariant is that it's NOT 'blocked'.
+    assert entry["status"] != "blocked"
+    assert entry.get("block_reason") is None
+
+
+def test_execute_task_max_rounds_with_auto_approve_does_NOT_set_block_reason(
+    monkeypatch, tmp_path,
+):
+    """Pin: block_reason is NOT set on the auto_approve path."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={}, skip_to="review",
+    )
+    entry = state.get(1)
+    assert "block_reason" not in entry
+
+
+def test_execute_task_resolved_config_includes_on_max_review_rounds_for_v1(
+    monkeypatch, tmp_path,
+):
+    """Task 6 §D9 / §D10: on_max_review_rounds is in the audit JSON.
+    Provenance for v1 compat reads 'project_defaults'."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={}, dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["on_max_review_rounds"] == {
+        "value": "auto_approve", "from": "project_defaults",
+    }
+
+
+def test_execute_task_resolved_config_includes_on_max_review_rounds_for_v2_default(
+    monkeypatch, tmp_path,
+):
+    """Task 6 §D9: v2 + no override → from = 'hardcoded'."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},  # no on_max_review_rounds
+        cli={}, dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["on_max_review_rounds"] == {"value": "fail", "from": "hardcoded"}

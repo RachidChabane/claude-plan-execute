@@ -8,7 +8,7 @@ from pathlib import Path
 
 STATUSES = (
     "pending", "planning", "reviewing", "revising",
-    "approved", "implementing", "done",
+    "approved", "implementing", "done", "blocked",
 )
 
 

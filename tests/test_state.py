@@ -104,10 +104,12 @@ def test_reset_all_on_empty_state_is_noop(tmp_path: Path):
 
 
 def test_statuses_constant_includes_known_values():
-    # Pin: STATUSES is preserved across the move (currently dead code).
+    # Pin: STATUSES documents the known status names. Task 6 added "blocked"
+    # for the on_max_review_rounds: fail path.
     assert "pending" in STATUSES
     assert "done" in STATUSES
     assert "implementing" in STATUSES
+    assert "blocked" in STATUSES
 
 
 def test_use_color_propagates_to_loader_and_deps_via_module_global(monkeypatch, capsys):

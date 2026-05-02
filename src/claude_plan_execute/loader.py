@@ -79,6 +79,22 @@ def load_tasks_file(path: Path) -> TasksFile:
                     f"use defaults.{replacement} instead."
                 ))
 
+    # Version-aware default flip warning (task 6 §D3 / §D4).
+    # v1 / no-version files default to the legacy "auto_approve"
+    # behavior; tell users so they can opt into the safer "fail" or
+    # migrate to v2.
+    if (
+        (tasks_file.version is None or tasks_file.version == 1)
+        and tasks_file.defaults.on_max_review_rounds is None
+    ):
+        print(yellow(
+            f"Warning: {path}: version 1 defaults to "
+            f"'on_max_review_rounds: auto_approve' (unsafe for autonomous "
+            f"runs). The version 2 default is 'fail'. Set "
+            f"'defaults.on_max_review_rounds: fail' explicitly or migrate "
+            f"to 'version: 2'."
+        ))
+
     return tasks_file
 
 
@@ -93,6 +109,8 @@ def effective_defaults(tasks_file: TasksFile) -> dict:
       value (S2). Deprecation warning was already emitted at load.
     - Expands `caps.max_review_rounds`, `caps.max_implement_turns`,
       `caps.max_attempts` into resolver-friendly keys.
+    - Injects `on_max_review_rounds: "auto_approve"` for v1 / no-version
+      files when the user hasn't set it explicitly (task 6 §D1).
     """
     out = tasks_file.defaults.model_dump(exclude_none=True)
     out.pop("caps", None)
@@ -110,5 +128,9 @@ def effective_defaults(tasks_file: TasksFile) -> dict:
             out["implement_max_turns"] = caps.max_implement_turns
         if caps.max_attempts is not None:
             out["max_attempts"] = caps.max_attempts
+
+    if "on_max_review_rounds" not in out:
+        if tasks_file.version is None or tasks_file.version == 1:
+            out["on_max_review_rounds"] = "auto_approve"
 
     return out

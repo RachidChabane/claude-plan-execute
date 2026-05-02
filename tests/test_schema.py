@@ -93,6 +93,168 @@ def test_no_version_emits_assuming_v1_warning(tmp_path, capsys):
     assert "Assuming version 1" in out
 
 
+# --- B2. on_max_review_rounds version-aware default (task 6) ----------------
+
+
+def test_v1_implicit_on_max_review_rounds_emits_legacy_default_warning(
+    tmp_path, capsys,
+):
+    """Task 6 §D3: v1 file with no on_max_review_rounds set → warn at load."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    loader.load_tasks_file(p)
+    out = capsys.readouterr().out
+    assert "on_max_review_rounds" in out
+    assert "auto_approve" in out
+    assert "version 1" in out
+
+
+def test_v1_implicit_on_max_review_rounds_warning_does_not_say_deprecated(
+    tmp_path, capsys,
+):
+    """Task 6 §D4: warning text avoids 'deprecated' so the existing
+    test_v1_with_legacy_timeout_emits_NO_deprecation_warning still passes."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    loader.load_tasks_file(p)
+    out = capsys.readouterr().out
+    assert "deprecated" not in out
+
+
+def test_v1_explicit_on_max_review_rounds_emits_NO_warning(tmp_path, capsys):
+    """Task 6 §D3: v1 file with on_max_review_rounds: auto_approve set
+    explicitly → user is being deliberate; no warning."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults:\n"
+        "  on_max_review_rounds: auto_approve\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    loader.load_tasks_file(p)
+    out = capsys.readouterr().out
+    # No warning at all about on_max_review_rounds when explicitly set.
+    assert "on_max_review_rounds" not in out or "Warning" not in out
+
+
+def test_v1_explicit_fail_opt_in_emits_NO_warning(tmp_path, capsys):
+    """v1 file opting into 'fail' explicitly → user already migrated;
+    no warning."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults:\n"
+        "  on_max_review_rounds: fail\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    loader.load_tasks_file(p)
+    out = capsys.readouterr().out
+    assert "Warning" not in out or "on_max_review_rounds" not in out
+
+
+def test_v2_emits_NO_on_max_review_rounds_warning(tmp_path, capsys):
+    """v2 files always fall through to the modern hardcoded default;
+    no warning regardless of whether the user set the value."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    loader.load_tasks_file(p)
+    out = capsys.readouterr().out
+    assert "on_max_review_rounds" not in out
+
+
+def test_no_version_emits_BOTH_assuming_v1_AND_on_max_review_rounds_warnings(
+    tmp_path, capsys,
+):
+    """Task 6 §D3: a no-version file gets the existing 'Assuming version 1'
+    warning AND the new on_max_review_rounds warning. Both fire — they're
+    separate concerns."""
+    p = tmp_path / "t.yaml"
+    p.write_text("tasks:\n  - { id: 1, title: T, description: D }\n")
+    loader.load_tasks_file(p)
+    out = capsys.readouterr().out
+    assert "Assuming version 1" in out
+    assert "on_max_review_rounds" in out
+
+
+def test_effective_defaults_injects_auto_approve_for_v1_when_unset(tmp_path):
+    """Task 6 §D1 / §D2: effective_defaults supplies 'auto_approve' at
+    the project_defaults layer for v1 files that don't set it."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["on_max_review_rounds"] == "auto_approve"
+
+
+def test_effective_defaults_no_injection_for_v2(tmp_path):
+    """v2 files fall through to HARDCODED_DEFAULTS at the resolver. The
+    loader does NOT inject anything into effective_defaults — the key is
+    absent from the dict so the resolver hits the hardcoded layer."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert "on_max_review_rounds" not in eff
+
+
+def test_effective_defaults_user_value_wins_over_v1_injection(tmp_path):
+    """User's explicit on_max_review_rounds: fail in a v1 file is
+    preserved; injection only fires when the key is absent."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 1\n"
+        "defaults:\n"
+        "  on_max_review_rounds: fail\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["on_max_review_rounds"] == "fail"
+
+
+def test_effective_defaults_no_version_treated_as_v1(tmp_path, capsys):
+    """A file with no version field is treated as v1 for injection
+    purposes (same as v1 explicit)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "defaults: {}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    capsys.readouterr()  # discard the two warnings
+    eff = loader.effective_defaults(tf)
+    assert eff["on_max_review_rounds"] == "auto_approve"
+
+
 # --- C. Caps-vs-legacy precedence (S2) --------------------------------------
 
 def test_effective_defaults_caps_wins_over_legacy_when_both_set(tmp_path, capsys):
