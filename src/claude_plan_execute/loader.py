@@ -13,19 +13,31 @@ except ImportError:
 
 from claude_plan_execute.colors import red, yellow
 
-TASK_FILE_SEARCH = ["tasks.yaml", "docs/tasks.yaml"]
 
-
-def find_tasks_file() -> Path | None:
-    for candidate in TASK_FILE_SEARCH:
-        p = Path(candidate)
+def find_tasks_file(
+    filename: str = "tasks.yaml",
+    start_dir: Path | None = None,
+) -> Path | None:
+    base = start_dir if start_dir is not None else Path.cwd()
+    for candidate in [filename, f"docs/{filename}"]:
+        p = base / candidate
         if p.exists():
             return p
     return None
 
 
+def load_tasks_data(path: Path) -> dict:
+    """Raw read of a tasks file. No validation, no sys.exit. Returns the
+    parsed dict (or {} for an empty YAML file)."""
+    with open(path) as f:
+        if path.suffix == ".json":
+            return json.load(f)
+        return yaml.safe_load(f) or {}
+
+
 def load_tasks_file(path: Path) -> tuple[dict, list[dict]]:
-    """Load and validate the tasks file. Returns (defaults, tasks)."""
+    """Load and validate the tasks file. Returns (defaults, tasks). Calls
+    sys.exit(1) on validation errors — for CLI use only."""
     with open(path) as f:
         if path.suffix == ".json":
             data = json.load(f)

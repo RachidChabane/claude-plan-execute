@@ -511,9 +511,12 @@ def test_run_claude_timeout_clears_active_child(monkeypatch):
 
 
 def test_run_claude_does_NOT_set_preexec_fn(monkeypatch):
-    # Load-bearing pin: workflow-server.py runs the CLI script with
+    # Load-bearing pin: server.py runs the CLI script with
     # preexec_fn=os.setsid so its killpg covers the entire tree. If
     # run_claude added its own setsid, the child would escape that group.
+    # The parallel pin in test_server.py
+    # (test_post_run_uses_setsid_for_process_group) asserts the server
+    # side; this one asserts the run_claude side.
     captured = _patch_run_claude_subprocess(monkeypatch)
     run_claude(
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
