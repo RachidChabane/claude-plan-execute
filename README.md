@@ -9,9 +9,26 @@ Automated plan-review-implement workflow for Claude Code. Reads a task file, the
 ## Install
 
 ```bash
-# Symlink to PATH
+# 1. Install the package (puts `claude_plan_execute` on your Python path).
+pip install -e .
+
+# 2. Symlink the entry script onto your PATH:
 ln -s "$(pwd)/claude-plan-execute" ~/.local/bin/claude-plan-execute
 ln -s "$(pwd)/workflow-server.py" ~/.local/bin/claude-workflow-dashboard
+
+#    (Alternative: symlink from bin/ instead of the repo root.)
+ln -s "$(pwd)/bin/claude-plan-execute" ~/.local/bin/claude-plan-execute
+```
+
+Optional dashboard dependencies:
+```bash
+pip install -e '.[dashboard]'   # FastAPI + uvicorn for workflow-server.py
+```
+
+For development:
+```bash
+pip install -e '.[dev]'         # pytest
+pytest -q
 ```
 
 ## Usage
@@ -90,5 +107,5 @@ Progress is tracked in `{plans_dir}/state.json`. If interrupted (Ctrl+C), the sc
 
 - Python 3.11+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
-- PyYAML (`pip install pyyaml`)
-- FastAPI + uvicorn for the dashboard (`pip install fastapi uvicorn`)
+- Runtime deps installed via `pip install -e .` (PyYAML).
+- Dashboard deps installed via `pip install -e '.[dashboard]'` (FastAPI, uvicorn).
