@@ -9,6 +9,7 @@ from claude_plan_execute import claude
 from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
+from claude_plan_execute.gates import default_registry, run_gates
 from claude_plan_execute.loader import (
     load_decisions_index,
     load_persona_fragment,
@@ -160,7 +161,7 @@ def execute_task(
             print(prompt[:800])
             return
 
-        code, _ = run_claude(prompt, max_turns=50, timeout_minutes=plan_timeout, **run_kwargs)
+        code, _ = run_claude(prompt, max_turns=100, timeout_minutes=plan_timeout, **run_kwargs)
         if not plan_path.exists():
             print(red(f"  Plan file not created at {plan_path}"))
             save_error_output(task_dir, code, _)
@@ -299,6 +300,67 @@ def execute_task(
         ))
         print(red(f"\n  Task {tid} blocked: implementer max-turns."))
         return
+
+    # --- PHASE 4: GATES (task 11) ---
+    # `defaults.gates` (project-level list of names) + `phases[i].
+    # defaults.gates_extra` (phase overlay). Names are resolved
+    # against the default registry; unknown names produce a single
+    # warning and are skipped (forward-compat with task 12+
+    # registering built-ins).
+    gate_names_project = list(file_defaults.get("gates") or [])
+    gate_names_phase = list(phase_dict.get("gates_extra") or [])
+    gate_names = gate_names_project + gate_names_phase
+    if gate_names:
+        registry = default_registry()
+        resolved_gates, unknown_gates = registry.resolve(gate_names)
+        if unknown_gates:
+            print(yellow(
+                f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
+                f"(not registered; tasks 12–17 add built-ins)"
+            ))
+        if resolved_gates:
+            print(f"\n{bold('--- Phase 4: Gates ---')}")
+            gate_results = run_gates(
+                resolved_gates,
+                task=task,
+                task_dir=task_dir,
+                cli=cli,
+            )
+            blocking = [
+                r for r in gate_results
+                if not r.passed and r.on_failure == "block"
+            ]
+            if blocking:
+                verbatim = "\n\n".join(
+                    f"--- {r.name} ---\n{r.output}"
+                    for r in blocking
+                )
+                artifacts: dict[str, str] = {
+                    "plan": str(plan_path),
+                    "gates_dir": str(task_dir / "gates"),
+                }
+                for r in blocking:
+                    if r.output_path:
+                        artifacts[f"gate:{r.name}"] = r.output_path
+                state.set_status(
+                    tid, "blocked",
+                    block_reason="gate_failed",
+                )
+                state.record_failure(tid, make_failure_record(
+                    failure_class="gate_failed",
+                    phase="gate",
+                    reason=(
+                        f"{len(blocking)} gate(s) failed: "
+                        f"{', '.join(r.name for r in blocking)}"
+                    ),
+                    verbatim=verbatim,
+                    artifacts=artifacts,
+                ))
+                print(red(
+                    f"\n  Task {tid} blocked: gate(s) failed "
+                    f"({', '.join(r.name for r in blocking)})."
+                ))
+                return
 
     state.set_status(tid, "done")
     print(green(f"\n  Task {tid} complete."))

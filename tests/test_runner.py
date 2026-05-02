@@ -2188,3 +2188,331 @@ def test_execute_task_failure_context_persists_across_plan_to_implement(
     assert fc_at_plan["v"] != ""
     assert fc_at_plan["v"] == fc_at_impl["v"]
     assert "implementer_max_turns" in fc_at_plan["v"]
+
+
+# ---------------------------------------------------------------------------
+# N. Gate integration in execute_task (task 11)
+# ---------------------------------------------------------------------------
+
+from claude_plan_execute.gates import (
+    Gate,
+    GateRegistry,
+)
+
+
+@pytest.fixture
+def _clean_default_registry(monkeypatch):
+    """Replace the module-level default registry with a fresh local one
+    for the duration of a test. Tests that need built-ins register them
+    explicitly within the fixture's scope."""
+    fresh = GateRegistry()
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.default_registry", lambda: fresh,
+    )
+    yield fresh
+
+
+def test_execute_task_with_no_gates_configured_reaches_done(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D12 / §D13: empty gates list → Phase 4 is skipped → done."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},  # NO 'gates' key
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    assert state.get(1)["attempts"] == []
+
+
+def test_execute_task_with_unknown_gate_name_warns_and_proceeds_to_done(
+    monkeypatch, tmp_path, capsys, _clean_default_registry,
+):
+    """Pin §D13: unknown gate name → warning printed, runner reaches done."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["definitely-unknown"]},
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s)" in out
+    assert "definitely-unknown" in out
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_with_passing_gate_reaches_done(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "ok-gate", Gate(kind="shell", command=("true",)),
+    )
+
+    # Stub subprocess.run inside gates.shell so the gate "passes."
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "all good\n"
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["ok-gate"]},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    assert state.get(1)["attempts"] == []
+    assert (tmp_path / "task-1" / "gates" / "ok-gate.txt").is_file()
+
+
+def test_execute_task_with_blocking_gate_failure_blocks_and_records(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D12: a `block`-mode gate failing transitions to blocked + records."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "bad-gate",
+        Gate(kind="shell", command=("false",), on_failure="block"),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 1
+        p.stdout = ""
+        p.stderr = "test failed: 3 errors\n"
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["bad-gate"]},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    assert len(entry["attempts"]) == 1
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"
+    assert rec["phase"] == "gate"
+    assert "test failed: 3 errors" in rec["verbatim"]
+    assert "plan" in rec["artifacts"]
+    assert "gates_dir" in rec["artifacts"]
+    assert "gate:bad-gate" in rec["artifacts"]
+
+
+def test_execute_task_with_warn_gate_failure_does_NOT_block(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: `warn`-mode gate failing → still reaches done. No FailureRecord."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "warn-only",
+        Gate(kind="shell", command=("false",), on_failure="warn"),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 1
+        p.stdout = "warning text"
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["warn-only"]},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    assert state.get(1)["attempts"] == []
+
+
+def test_execute_task_phase_gates_extra_appended_to_project_gates(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D12: phases[].defaults.gates_extra appended to defaults.gates."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd[0])
+
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _clean_default_registry.register("g-proj",  Gate(kind="shell", command=("PROJ",)))
+    _clean_default_registry.register("g-phase", Gate(kind="shell", command=("PHASE",)))
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="ui"), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["g-proj"]},
+        cli={},
+        phases_by_id={"ui": {"id": "ui", "defaults": {"gates_extra": ["g-phase"]}}},
+        skip_to="implement",
+    )
+    assert sorted(invoked) == ["PHASE", "PROJ"]
+
+
+def test_execute_task_blocking_gate_does_NOT_set_done(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Regression: status='done' must NOT be set after a block-failure."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "blocker", Gate(kind="shell", command=("false",), on_failure="block"),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 1
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["blocker"]},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["status"] != "done"
+
+
+def test_execute_task_gate_run_skipped_when_implementer_timed_out(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D12: implementer_timeout path returns BEFORE the gate run."""
+    invoked = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd)
+
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _clean_default_registry.register(
+        "x", Gate(kind="shell", command=("X",)),
+    )
+    _patch_run_claude_simulating_timeout(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["x"]},
+        cli={}, skip_to="implement",
+    )
+    # Gate must NOT have been invoked.
+    assert invoked == []
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["block_reason"] == "implementer_timeout"
+
+
+def test_execute_task_gate_run_skipped_when_implementer_max_turns(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: max_turns path also returns before the gate run."""
+    invoked = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd)
+
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _clean_default_registry.register(
+        "x", Gate(kind="shell", command=("X",)),
+    )
+    _patch_run_claude_simulating_max_turns(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["x"]},
+        cli={}, skip_to="implement",
+    )
+    assert invoked == []
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["block_reason"] == "implementer_max_turns"
+
+
+def test_execute_task_dry_run_does_NOT_run_gates(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: dry_run returns from execute_task before reaching Phase 4."""
+    invoked = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd)
+
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _clean_default_registry.register(
+        "x", Gate(kind="shell", command=("X",)),
+    )
+
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["x"]},
+        cli={}, skip_to="implement", dry_run=True,
+    )
+    assert invoked == []
