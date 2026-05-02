@@ -394,6 +394,7 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "max_attempts",
         "on_max_review_rounds",
         "persona_file",
+        "decisions_dir",
     )
     assert KEYS_TO_AUDIT == expected
 

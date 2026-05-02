@@ -9,16 +9,73 @@ import sys
 from pathlib import Path
 
 from claude_plan_execute import colors
-from claude_plan_execute.colors import bold, dim, green, red, status_color
+from claude_plan_execute.colors import bold, dim, green, red, status_color, yellow
 from claude_plan_execute.config import resolve
 from claude_plan_execute.deps import validate_dependencies
 from claude_plan_execute.loader import (
     effective_defaults,
     find_tasks_file,
+    load_tasks_data,
     load_tasks_file,
+    render_decisions_index,
+    scan_decisions,
 )
 from claude_plan_execute.runner import execute_task, handle_sigint
 from claude_plan_execute.state import State
+
+
+def cmd_decisions_index(args) -> int:
+    """Rebuild `<decisions_dir>/index.md` from per-file frontmatter.
+
+    Resolution order for `decisions_dir` (highest priority first):
+      1. `--decisions-dir` flag.
+      2. `defaults.decisions_dir` from the resolved tasks file
+         (auto-detected via `find_tasks_file()` or `--tasks`).
+      3. Hardcoded fallback `docs/decisions`.
+
+    Returns 0 on success (file written), 1 on hard error (target
+    directory missing). The presence of zero scannable decision files
+    is NOT an error: the banner-only `index.md` is still written.
+    """
+    if args.dir:
+        os.chdir(args.dir)
+
+    decisions_dir: str | None = None
+    if args.decisions_dir:
+        decisions_dir = args.decisions_dir
+    else:
+        # Try to read decisions_dir from the resolved tasks file.
+        tasks_path = Path(args.tasks) if args.tasks else find_tasks_file()
+        if tasks_path and tasks_path.exists():
+            try:
+                raw = load_tasks_data(tasks_path)
+                defaults = (raw or {}).get("defaults") or {}
+                decisions_dir = defaults.get("decisions_dir")
+            except Exception as exc:
+                # Don't hard-fail on a malformed tasks file when the
+                # user asked for the decisions subcommand — they may
+                # be using --decisions-dir on its own. Log and fall
+                # through to the hardcoded fallback.
+                print(yellow(
+                    f"Warning: could not read decisions_dir from "
+                    f"{tasks_path}: {exc}"
+                ))
+        if not decisions_dir:
+            from claude_plan_execute.config import HARDCODED_DEFAULTS
+            decisions_dir = HARDCODED_DEFAULTS["decisions_dir"]
+
+    d = Path(decisions_dir)
+    if not d.exists() or not d.is_dir():
+        print(red(f"Error: decisions directory not found: {d}"), file=sys.stderr)
+        return 1
+
+    entries = scan_decisions(d)
+    rendered = render_decisions_index(entries)
+    index_path = d / "index.md"
+    index_path.write_text(rendered, encoding="utf-8")
+
+    print(green(f"Wrote {len(entries)} entries to {index_path}"))
+    return 0
 
 
 def main():
@@ -26,6 +83,26 @@ def main():
         prog="claude-plan-execute",
         description="Automated plan-review-implement workflow for Claude Code.",
     )
+    subparsers = parser.add_subparsers(dest="command", required=False)
+
+    # 'decisions' subcommand and its 'index' action.
+    decisions_parser = subparsers.add_parser(
+        "decisions", help="Decision-log management."
+    )
+    decisions_actions = decisions_parser.add_subparsers(
+        dest="action", required=True
+    )
+    index_parser = decisions_actions.add_parser(
+        "index", help="Rebuild decisions/index.md from frontmatter."
+    )
+    index_parser.add_argument("--tasks", type=str,
+        help="Path to tasks file (default: auto-detect)")
+    index_parser.add_argument("--dir", type=str,
+        help="Working directory (default: cwd)")
+    index_parser.add_argument("--decisions-dir", type=str,
+        help="Override decisions directory (otherwise resolved from tasks file)")
+
+    # Existing top-level flags. UNCHANGED.
     parser.add_argument("--tasks", type=str, help="Path to tasks file (default: auto-detect)")
     parser.add_argument("--dir", type=str, help="Working directory (default: cwd)")
     parser.add_argument("--task", type=int, help="Run a specific task by ID")
@@ -45,8 +122,15 @@ def main():
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     args = parser.parse_args()
 
-    if args.no_color:
+    if getattr(args, "no_color", False):
         colors.set_use_color(False)
+
+    # Subcommand dispatch. The handler returns an int exit code; we
+    # propagate it via sys.exit because the entry-point script calls
+    # main() without consuming its return value (see §D8). Using
+    # sys.exit also matches main's other error branches.
+    if args.command == "decisions" and args.action == "index":
+        sys.exit(cmd_decisions_index(args))
 
     # Change working directory
     if args.dir:

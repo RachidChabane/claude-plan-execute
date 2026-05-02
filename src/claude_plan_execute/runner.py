@@ -8,8 +8,12 @@ from pathlib import Path
 from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
-from claude_plan_execute.loader import load_persona_fragment
+from claude_plan_execute.loader import (
+    load_decisions_index,
+    load_persona_fragment,
+)
 from claude_plan_execute.prompts import (
+    build_decisions_section,
     build_implement_prompt,
     build_persona_section,
     build_plan_prompt,
@@ -114,6 +118,15 @@ def execute_task(
     extra_text = load_persona_fragment(persona_extra_path)
     persona_section = build_persona_section(persona_text, extra_text)
 
+    # Architectural decisions index (task 8).
+    # Read once per execute_task; reused only for the Plan prompt
+    # (§D1). The path comes from the resolver chain
+    # (HARDCODED_DEFAULTS["decisions_dir"] = "docs/decisions" if
+    # unset). No per-phase overlay (§"Non-goals").
+    decisions_dir = resolved["decisions_dir"]["value"]
+    decisions_text = load_decisions_index(decisions_dir)
+    decisions_section = build_decisions_section(decisions_text)
+
     commit_msg = task.get("commit_message", f"task-{tid}: {task['title']}")
 
     print(f"\n{bold('=' * 60)}")
@@ -128,7 +141,11 @@ def execute_task(
         print(f"\n{bold('--- Phase 1: Planning ---')}")
         state.set_status(tid, "planning", plan_path=str(plan_path))
 
-        prompt = build_plan_prompt(task, str(plan_path), persona=persona_section)
+        prompt = build_plan_prompt(
+            task, str(plan_path),
+            persona=persona_section,
+            decisions=decisions_section,
+        )
         if dry_run:
             print(dim(f"  [DRY RUN] {len(prompt)} char prompt"))
             print(prompt[:800])

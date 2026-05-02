@@ -36,7 +36,31 @@ def build_persona_section(persona: str, persona_extra: str = "") -> str:
     return f"## Project conventions\n\n{body}\n\n"
 
 
-def build_plan_prompt(task: dict, plan_path: str, *, persona: str = "") -> str:
+def build_decisions_section(decisions: str) -> str:
+    """Compose the architectural-decisions block for the Plan prompt.
+
+    Returns "" when input is empty or whitespace-only. Otherwise
+    returns:
+
+        ## Architectural decisions on file
+
+        <body, rstripped>
+
+    Trailing newlines are normalized so the caller can do
+    `persona + decisions + body` without a manual separator. Only the
+    Plan prompt receives this block (§D1); Review/Revise/Implement
+    builders do not accept a decisions kwarg.
+    """
+    body = decisions.strip()
+    if not body:
+        return ""
+    return f"## Architectural decisions on file\n\n{body}\n\n"
+
+
+def build_plan_prompt(
+    task: dict, plan_path: str,
+    *, persona: str = "", decisions: str = "",
+) -> str:
     files_section = ""
     key_files = task.get("key_files", [])
     if key_files:
@@ -46,7 +70,7 @@ def build_plan_prompt(task: dict, plan_path: str, *, persona: str = "") -> str:
             f"for additional relevant files):\n{files_list}\n"
         )
 
-    return persona + (
+    return persona + decisions + (
         f"You are planning the implementation of a task in this codebase.\n"
         f"Read all relevant files before producing your plan.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"

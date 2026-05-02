@@ -20,14 +20,15 @@ HARDCODED_DEFAULTS: dict = {
     "max_attempts": 3,
     "on_max_review_rounds": "fail",
     "persona_file": "docs/persona.md",
+    "decisions_dir": "docs/decisions",
 }
 
 
 # Keys serialized to plans/task-{id}/resolved-config.json. Policy
 # (task 5 §D3): currently-consumed keys only. Task 6 added
-# on_max_review_rounds. Task 7 added persona_file. Future tasks
-# (8, 11, 13, …) extend this tuple as new keys become
-# resolver-consumable.
+# on_max_review_rounds. Task 7 added persona_file. Task 8 added
+# decisions_dir. Future tasks (11, 13, …) extend this tuple as new
+# keys become resolver-consumable.
 KEYS_TO_AUDIT: tuple[str, ...] = (
     "model",
     "effort",
@@ -41,6 +42,7 @@ KEYS_TO_AUDIT: tuple[str, ...] = (
     "max_attempts",
     "on_max_review_rounds",
     "persona_file",
+    "decisions_dir",
 )
 
 

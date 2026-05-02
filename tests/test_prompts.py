@@ -312,3 +312,31 @@ def test_review_prompt_accepts_positional_prev_feedback_and_keyword_persona():
     # NOT inlined; same as test_review_prompt_does_NOT_inline_prev_feedback_body).
     assert "previous notes" not in out
     assert "revised based on previous feedback" in out
+
+
+# ---------------------------------------------------------------------------
+# D. Prompt builders — decisions kwarg (task 8)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_prompt_default_decisions_is_empty():
+    out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
+    assert "## Architectural decisions on file" not in out
+
+
+def test_plan_prompt_accepts_decisions_kwarg():
+    decisions = "## Architectural decisions on file\n\n- [001](x.md) — Foo\n\n"
+    out = build_plan_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md",
+        decisions=decisions,
+    )
+    assert "Foo" in out
+    assert "TASK 1: T" in out
+
+
+def test_plan_prompt_byte_length_unchanged_when_decisions_empty():
+    """Pin (D9): with decisions='' (and persona='' default), output is
+    byte-identical to pre-task-7. Same fixed input as
+    test_plan_prompt_byte_length_matches_baseline in test_runner.py."""
+    out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
+    assert len(out) == 734

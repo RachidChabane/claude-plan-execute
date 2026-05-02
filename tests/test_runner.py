@@ -1280,3 +1280,113 @@ def test_execute_task_appends_persona_extra_from_phase(monkeypatch, tmp_path):
     g_idx = captured["persona"].index("GLOBAL_MARKER")
     e_idx = captured["persona"].index("EXTRA_MARKER")
     assert g_idx < e_idx
+
+
+# ---------------------------------------------------------------------------
+# K. Decisions injection (task 8)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_task_loads_decisions_index_into_plan_prompt(monkeypatch, tmp_path):
+    """Task 8: runner reads decisions_dir from the resolved dict, loads
+    index.md, and passes the section to build_plan_prompt. Pin the wiring;
+    the loader internals are tested in test_decisions.py."""
+    captured: dict = {}
+    real_build_plan = runner.build_plan_prompt
+
+    def spy_build_plan(*args, **kwargs):
+        captured["decisions"] = kwargs.get("decisions", "")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_build_plan)
+    _no_run_claude_called(monkeypatch)
+
+    decisions_dir = tmp_path / "decisions"
+    decisions_dir.mkdir()
+    (decisions_dir / "index.md").write_text("- [001](one.md) — First decision")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "decisions_dir": str(decisions_dir),
+        },
+        cli={}, dry_run=True,
+    )
+
+    assert "## Architectural decisions on file" in captured["decisions"]
+    assert "First decision" in captured["decisions"]
+
+
+def test_execute_task_passes_empty_decisions_when_index_missing(monkeypatch, tmp_path):
+    """Pin: when decisions_dir/index.md doesn't exist, the runner runs
+    cleanly (silent fallback) and the prompt builder gets decisions=''.
+
+    Note: pin decisions_dir explicitly to a tmp_path-owned filename we
+    never create, so the missing-index path is independent of the
+    project's filesystem state. Same approach as task 7 §R1's persona
+    test (`test_execute_task_passes_empty_persona_when_persona_file_missing`)."""
+    captured: dict = {}
+    real_build_plan = runner.build_plan_prompt
+
+    def spy_build_plan(*args, **kwargs):
+        captured["decisions"] = kwargs.get("decisions", "")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_build_plan)
+    _no_run_claude_called(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "decisions_dir": str(tmp_path / "definitely_missing_decisions"),
+        },
+        cli={}, dry_run=True,
+    )
+    assert captured["decisions"] == ""
+
+
+def test_execute_task_does_NOT_pass_decisions_to_review_prompt(monkeypatch, tmp_path):
+    """Pin §D1: decisions are Plan-only. The Review builder must not
+    receive a decisions kwarg.
+
+    We can't directly assert "kwarg never passed" without monkeypatching
+    the function call site. Easier: monkeypatch build_review_prompt with
+    a strict signature that rejects unknown kwargs, and verify the
+    review-phase code path completes without TypeError."""
+    decisions_dir = tmp_path / "decisions"
+    decisions_dir.mkdir()
+    (decisions_dir / "index.md").write_text("- [001](one.md) — DECISIONS_MARKER")
+
+    captured: dict = {}
+    real_build_review = runner.build_review_prompt
+
+    def strict_build_review(task, plan_path, review_path, prev_feedback="",
+                            *, persona=""):
+        # If runner passed decisions=..., this raises TypeError before
+        # the call returns. The dry-run path returns inside the review
+        # loop on round 1 before this matters, but we also assert that
+        # the captured kwargs do NOT include decisions.
+        captured["called"] = True
+        return real_build_review(task, plan_path, review_path,
+                                 prev_feedback, persona=persona)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_review_prompt",
+                        strict_build_review)
+    _no_run_claude_called(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "decisions_dir": str(decisions_dir),
+        },
+        cli={}, skip_to="review", dry_run=True,
+    )
+    # No TypeError → review builder was called with the existing
+    # signature (no decisions kwarg leaked).
+    assert captured.get("called") is True
