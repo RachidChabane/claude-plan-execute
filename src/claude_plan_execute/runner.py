@@ -15,6 +15,7 @@ from claude_plan_execute.loader import (
 )
 from claude_plan_execute.prompts import (
     build_decisions_section,
+    build_failure_context_section,
     build_implement_prompt,
     build_persona_section,
     build_plan_prompt,
@@ -93,6 +94,12 @@ def execute_task(
     entry["resolved_config_path"] = str(resolved_config_path)
     state.save()
 
+    # Snapshot prior failures for resume-context (task 10). The same
+    # section is reused across the Plan and Implement builders below;
+    # any failure recorded mid-run is for FUTURE re-runs, not this one.
+    prior_attempts = list(entry.get("attempts", []))
+    failure_context_section = build_failure_context_section(prior_attempts)
+
     plan_path = task_dir / "plan.md"
 
     model = resolved["model"]["value"]
@@ -146,6 +153,7 @@ def execute_task(
             task, str(plan_path),
             persona=persona_section,
             decisions=decisions_section,
+            failure_context=failure_context_section,
         )
         if dry_run:
             print(dim(f"  [DRY RUN] {len(prompt)} char prompt"))
@@ -250,6 +258,7 @@ def execute_task(
     prompt = build_implement_prompt(
         task, str(plan_path), test_command, commit_msg,
         persona=persona_section,
+        failure_context=failure_context_section,
     )
     if dry_run:
         print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))

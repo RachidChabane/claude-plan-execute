@@ -340,3 +340,433 @@ def test_plan_prompt_byte_length_unchanged_when_decisions_empty():
     test_plan_prompt_byte_length_matches_baseline in test_runner.py."""
     out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
     assert len(out) == 734
+
+
+# ---------------------------------------------------------------------------
+# E. build_failure_context_section + kwarg wiring (task 10)
+# ---------------------------------------------------------------------------
+
+import re
+
+from claude_plan_execute.prompts import build_failure_context_section
+from claude_plan_execute.state import make_failure_record
+
+
+# E1. Empty / null inputs
+
+
+def test_failure_context_empty_list_returns_empty_string():
+    assert build_failure_context_section([]) == ""
+
+
+def test_failure_context_None_returns_empty_string():
+    assert build_failure_context_section(None) == ""
+
+
+# E2. Header references most-recent attempt's phase
+
+
+def test_failure_context_header_uses_last_attempt_phase():
+    attempts = [
+        make_failure_record("manual_stop", "plan", reason="x"),
+        make_failure_record("implementer_timeout", "implement", reason="y"),
+    ]
+    out = build_failure_context_section(attempts)
+    assert "[FAILURE CONTEXT — previous attempt failed in phase: implement]" in out
+
+
+def test_failure_context_header_falls_back_when_phase_missing():
+    """Defensive: a corrupt attempt with no 'phase' key renders 'unknown'."""
+    out = build_failure_context_section([{
+        "failure_class": "x", "reason": "r", "verbatim": "",
+        "artifacts": {}, "hypothesis": None,
+    }])
+    assert "phase: unknown" in out
+
+
+# E3. Per-attempt body — required fields
+
+
+def test_failure_context_renders_attempt_failure_class():
+    out = build_failure_context_section([
+        make_failure_record("review_rejected_after_max_rounds", "review", reason="r"),
+    ])
+    assert "Attempt 1: review_rejected_after_max_rounds" in out
+
+
+def test_failure_context_always_renders_reason():
+    out = build_failure_context_section([
+        make_failure_record("manual_stop", "plan", reason="MARKER_REASON"),
+    ])
+    assert "- Reason: MARKER_REASON" in out
+
+
+def test_failure_context_numbers_attempts_starting_at_1():
+    attempts = [
+        make_failure_record("manual_stop", "plan", reason="a"),
+        make_failure_record("manual_stop", "plan", reason="b"),
+        make_failure_record("manual_stop", "plan", reason="c"),
+    ]
+    out = build_failure_context_section(attempts)
+    assert "Attempt 1: " in out
+    assert "Attempt 2: " in out
+    assert "Attempt 3: " in out
+
+
+# E4. Conditional fields — verbatim
+
+
+def test_failure_context_renders_verbatim_when_present():
+    attempts = [make_failure_record(
+        "review_rejected_after_max_rounds", "review",
+        reason="r", verbatim="MY_VERBATIM_TEXT",
+    )]
+    out = build_failure_context_section(attempts)
+    assert "MY_VERBATIM_TEXT" in out
+
+
+def test_failure_context_skips_verbatim_line_when_empty():
+    attempts = [make_failure_record(
+        "manual_stop", "plan", reason="r", verbatim="",
+    )]
+    out = build_failure_context_section(attempts)
+    assert "Verbatim" not in out
+
+
+def test_failure_context_uses_class_specific_label_for_review():
+    attempts = [make_failure_record(
+        "review_rejected_after_max_rounds", "review",
+        reason="r", verbatim="x",
+    )]
+    out = build_failure_context_section(attempts)
+    assert "Verbatim (last review): x" in out
+
+
+def test_failure_context_uses_class_specific_label_for_timeout():
+    attempts = [make_failure_record(
+        "implementer_timeout", "implement",
+        reason="r", verbatim="x",
+    )]
+    out = build_failure_context_section(attempts)
+    assert "Verbatim (stderr): x" in out
+
+
+def test_failure_context_uses_bare_label_for_unknown_class():
+    attempts = [{
+        "failure_class": "completely_made_up", "phase": "plan",
+        "reason": "r", "verbatim": "x", "artifacts": {}, "hypothesis": None,
+    }]
+    out = build_failure_context_section(attempts)
+    assert "Verbatim: x" in out
+    assert "Verbatim (" not in out
+
+
+# E5. Conditional fields — hypothesis
+
+
+def test_failure_context_renders_hypothesis_when_set():
+    attempts = [make_failure_record(
+        "manual_stop", "plan", reason="r", hypothesis="MY_HYPOTHESIS",
+    )]
+    out = build_failure_context_section(attempts)
+    assert "- Hypothesis: MY_HYPOTHESIS" in out
+
+
+def test_failure_context_skips_hypothesis_when_None():
+    attempts = [make_failure_record("manual_stop", "plan", reason="r")]
+    out = build_failure_context_section(attempts)
+    assert "Hypothesis" not in out
+
+
+def test_failure_context_skips_hypothesis_when_empty_string():
+    attempts = [make_failure_record(
+        "manual_stop", "plan", reason="r", hypothesis="",
+    )]
+    out = build_failure_context_section(attempts)
+    assert "Hypothesis" not in out
+
+
+def test_failure_context_skips_hypothesis_when_whitespace_only():
+    attempts = [make_failure_record(
+        "manual_stop", "plan", reason="r", hypothesis="   \n  ",
+    )]
+    out = build_failure_context_section(attempts)
+    assert "Hypothesis" not in out
+
+
+# E6. Conditional fields — artifacts
+
+
+def test_failure_context_renders_artifacts_paths_only():
+    attempts = [make_failure_record(
+        "review_rejected_after_max_rounds", "review",
+        reason="r", artifacts={"plan": "p.md", "last_review": "r.md"},
+    )]
+    out = build_failure_context_section(attempts)
+    assert "- Artifacts: p.md, r.md" in out
+    assert "plan:" not in out
+    assert "last_review:" not in out
+
+
+def test_failure_context_skips_artifacts_when_empty():
+    attempts = [make_failure_record(
+        "manual_stop", "plan", reason="r", artifacts={},
+    )]
+    out = build_failure_context_section(attempts)
+    assert "Artifacts" not in out
+
+
+# E7. Footer — instruction list
+
+
+def test_failure_context_footer_always_includes_address_prior_failure():
+    attempts = [make_failure_record("manual_stop", "plan", reason="r")]
+    out = build_failure_context_section(attempts)
+    assert "1. Address the prior failure verbatim before adding new work" in out
+
+
+def test_failure_context_footer_includes_hypothesis_check_when_any_set():
+    attempts = [
+        make_failure_record("manual_stop", "plan", reason="r"),
+        make_failure_record("manual_stop", "plan", reason="r2", hypothesis="H"),
+    ]
+    out = build_failure_context_section(attempts)
+    assert "2. Specifically check the hypothesis above" in out
+
+
+def test_failure_context_footer_omits_hypothesis_check_when_none_set():
+    attempts = [
+        make_failure_record("manual_stop", "plan", reason="r"),
+        make_failure_record("manual_stop", "plan", reason="r2"),
+    ]
+    out = build_failure_context_section(attempts)
+    assert "check the hypothesis" not in out
+
+
+def test_failure_context_ends_with_END_marker():
+    attempts = [make_failure_record("manual_stop", "plan", reason="r")]
+    out = build_failure_context_section(attempts)
+    assert "[END FAILURE CONTEXT]\n\n" in out
+
+
+def test_failure_context_ends_with_double_newline_for_caller_concat():
+    """Caller does `failure_context + persona + ...`; the trailing
+    '\\n\\n' supplies the separator with no manual padding."""
+    out = build_failure_context_section([
+        make_failure_record("manual_stop", "plan", reason="r"),
+    ])
+    assert out.endswith("\n\n")
+
+
+# E8. 8 KB cap — drop oldest
+
+
+def test_failure_context_drops_oldest_when_block_exceeds_8kb():
+    """Three attempts with 4-KB verbatims each will overflow 8 KB.
+    The render keeps the most recent ones and prepends an omission marker."""
+    big = "X" * 4096
+    attempts = [
+        make_failure_record("manual_stop", "plan", reason=f"a{i}", verbatim=big)
+        for i in range(3)
+    ]
+    out = build_failure_context_section(attempts)
+    assert len(out.encode("utf-8")) <= 8192
+    assert "earlier attempts omitted for length" in out
+
+
+def test_failure_context_omission_marker_uses_correct_count():
+    """If 2 of 3 attempts are dropped, the marker reads '[2 earlier attempts...]'."""
+    huge = "X" * 4096
+    attempts = [
+        make_failure_record("manual_stop", "plan", reason=f"a{i}", verbatim=huge)
+        for i in range(3)
+    ]
+    out = build_failure_context_section(attempts)
+    assert "Attempt 1:" not in out
+    marker = re.search(r"\[(\d+) earlier attempts omitted for length\]", out)
+    assert marker is not None
+    n_dropped = int(marker.group(1))
+    first_kept = re.search(r"Attempt (\d+):", out)
+    assert int(first_kept.group(1)) == n_dropped + 1
+
+
+def test_failure_context_keeps_most_recent_attempt():
+    """When dropping for budget, the most recent attempt (carrying
+    the freshest evidence) is always retained."""
+    huge = "X" * 4096
+    attempts = [
+        make_failure_record("manual_stop", "plan", reason="OLDEST_R", verbatim=huge),
+        make_failure_record("manual_stop", "plan", reason="MIDDLE_R", verbatim=huge),
+        make_failure_record("manual_stop", "plan", reason="NEWEST_R", verbatim=huge),
+    ]
+    out = build_failure_context_section(attempts)
+    assert "NEWEST_R" in out
+    assert "OLDEST_R" not in out
+
+
+def test_failure_context_no_marker_when_all_attempts_fit():
+    """A single small attempt fits comfortably; no omission marker."""
+    attempts = [make_failure_record(
+        "manual_stop", "plan", reason="short", verbatim="tiny",
+    )]
+    out = build_failure_context_section(attempts)
+    assert "earlier attempts omitted" not in out
+
+
+def test_failure_context_block_size_capped_for_pathological_single_attempt():
+    """If a single attempt's render still exceeds 8 KB (e.g., huge
+    artifacts dict), the rendered string is hard-truncated at the cap
+    with a '[truncated]' marker."""
+    huge_paths = {f"k{i}": "X" * 200 for i in range(50)}
+    attempts = [{
+        "failure_class": "manual_stop", "phase": "plan", "reason": "r",
+        "verbatim": "", "artifacts": huge_paths, "hypothesis": None,
+    }]
+    out = build_failure_context_section(attempts)
+    assert len(out.encode("utf-8")) <= 8192 + 20
+
+
+# E8b. Defensive — non-dict entries skipped
+
+
+def test_failure_context_skips_non_dict_entries():
+    """Hand-edited state.json could in principle contain non-dict
+    elements in `attempts`. The render filters them silently rather
+    than raising AttributeError mid-prompt-build."""
+    attempts = [
+        "this is a string, not a dict",
+        make_failure_record("manual_stop", "plan", reason="REAL_REASON"),
+        12345,
+    ]
+    out = build_failure_context_section(attempts)
+    assert "REAL_REASON" in out
+    assert "Attempt 1: manual_stop" in out
+    assert "this is a string" not in out
+    assert "12345" not in out
+
+
+def test_failure_context_returns_empty_when_all_entries_non_dict():
+    """If filtering leaves nothing, behave as if the list were empty."""
+    out = build_failure_context_section(["junk", 123, None])
+    assert out == ""
+
+
+# E9. Verbatim trusted as-pre-truncated
+
+
+def test_failure_context_does_not_double_truncate_verbatim():
+    """make_failure_record already caps verbatim at 4 KB with its own
+    marker. The block render must NOT truncate again or add a second marker."""
+    big_text = "Y" * 5000
+    fr = make_failure_record(
+        "review_rejected_after_max_rounds", "review",
+        reason="r", verbatim=big_text,
+    )
+    assert "[truncated:" in fr["verbatim"]
+    out = build_failure_context_section([fr])
+    assert out.count("[truncated:") == 1
+
+
+# E10. Plan/Implement kwarg wiring
+
+
+def test_plan_prompt_default_failure_context_is_empty():
+    out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
+    assert "[FAILURE CONTEXT" not in out
+
+
+def test_plan_prompt_prepends_failure_context_when_supplied():
+    fc = "[FAILURE CONTEXT — previous attempt failed in phase: plan]\nFAKE_BLOCK\n[END FAILURE CONTEXT]\n\n"
+    out = build_plan_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md",
+        failure_context=fc,
+    )
+    assert out.startswith("[FAILURE CONTEXT")
+    assert "FAKE_BLOCK" in out
+    assert "TASK 1: T" in out
+
+
+def test_plan_prompt_failure_context_appears_before_persona():
+    """§D1 ordering: failure_context, then persona, then decisions, then body."""
+    fc = "FCMARKER\n\n"
+    persona = "PERSONAMARKER\n\n"
+    out = build_plan_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md",
+        persona=persona, failure_context=fc,
+    )
+    fc_idx = out.index("FCMARKER")
+    p_idx = out.index("PERSONAMARKER")
+    assert fc_idx < p_idx
+
+
+def test_plan_prompt_failure_context_appears_before_decisions():
+    fc = "FCMARKER\n\n"
+    decisions = "DECISIONSMARKER\n\n"
+    out = build_plan_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md",
+        decisions=decisions, failure_context=fc,
+    )
+    fc_idx = out.index("FCMARKER")
+    d_idx = out.index("DECISIONSMARKER")
+    assert fc_idx < d_idx
+
+
+def test_plan_prompt_failure_context_keyword_only():
+    """The * separator forces failure_context to be keyword-only."""
+    with pytest.raises(TypeError):
+        build_plan_prompt(
+            {"id": 1, "title": "T", "description": "D"}, "p.md",
+            "would-be-positional-failure-context",
+        )
+
+
+def test_plan_prompt_byte_length_unchanged_when_failure_context_empty():
+    """Pin (D10): with failure_context='' (and persona/decisions defaults),
+    the byte count matches the existing 734 baseline."""
+    out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
+    assert len(out) == 734
+
+
+def test_implement_prompt_default_failure_context_is_empty():
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+    )
+    assert "[FAILURE CONTEXT" not in out
+
+
+def test_implement_prompt_prepends_failure_context_when_supplied():
+    fc = "FCMARKER\n\n"
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        failure_context=fc,
+    )
+    assert out.startswith("FCMARKER")
+    assert "You are implementing" in out
+
+
+def test_implement_prompt_failure_context_appears_before_persona():
+    fc = "FCMARKER\n\n"
+    persona = "PERSONAMARKER\n\n"
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+        persona=persona, failure_context=fc,
+    )
+    fc_idx = out.index("FCMARKER")
+    p_idx = out.index("PERSONAMARKER")
+    assert fc_idx < p_idx
+
+
+def test_implement_prompt_failure_context_keyword_only():
+    with pytest.raises(TypeError):
+        build_implement_prompt(
+            {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+            "would-be-positional",
+        )
+
+
+def test_implement_prompt_byte_length_unchanged_when_failure_context_empty():
+    """Pin: 415 baseline preserved when failure_context defaults to ''."""
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "pytest", "msg",
+    )
+    assert len(out) == 415

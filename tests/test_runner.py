@@ -1940,3 +1940,251 @@ def test_handle_sigint_still_prints_resume_command(monkeypatch, capsys, tmp_path
         handle_sigint(2, None)
     out = capsys.readouterr().out
     assert "--task 7 --skip-to implement" in out
+
+
+# ---------------------------------------------------------------------------
+# M. Resume failure-context wiring (task 10)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_task_passes_empty_failure_context_when_no_attempts(
+    monkeypatch, tmp_path,
+):
+    """Pin: fresh task → builder receives failure_context=''."""
+    captured: dict = {}
+    real_build_plan = runner.build_plan_prompt
+
+    def spy_build_plan(*args, **kwargs):
+        captured["fc"] = kwargs.get("failure_context", "")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_build_plan)
+    _no_run_claude_called(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    assert captured["fc"] == ""
+
+
+def test_execute_task_passes_failure_context_when_attempts_present(
+    monkeypatch, tmp_path,
+):
+    """Pin: state with prior attempts → builder receives a non-empty section
+    that names the last failure's phase."""
+    captured: dict = {}
+    real_build_plan = runner.build_plan_prompt
+
+    def spy_build_plan(*args, **kwargs):
+        captured["fc"] = kwargs.get("failure_context", "")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_build_plan)
+    _no_run_claude_called(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    state.record_failure(1, make_failure_record(
+        "implementer_timeout", "implement",
+        reason="prior implementer timed out",
+        verbatim="stderr from prior run",
+        artifacts={"plan": "plans/task-1/plan.md"},
+    ))
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    fc = captured["fc"]
+    assert "[FAILURE CONTEXT" in fc
+    assert "phase: implement" in fc
+    assert "implementer_timeout" in fc
+    assert "prior implementer timed out" in fc
+
+
+def test_execute_task_passes_failure_context_to_implement_builder(
+    monkeypatch, tmp_path,
+):
+    """Pin: the same section reaches the Implement builder, not just Plan."""
+    captured: dict = {}
+    real_build_impl = runner.build_implement_prompt
+
+    def spy_build_impl(*args, **kwargs):
+        captured["fc"] = kwargs.get("failure_context", "")
+        return real_build_impl(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_implement_prompt", spy_build_impl)
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    state.record_failure(1, make_failure_record(
+        "manual_stop", "implement",
+        reason="user-aborted prior run",
+    ))
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert "[FAILURE CONTEXT" in captured["fc"]
+    assert "manual_stop" in captured["fc"]
+
+
+def test_execute_task_does_NOT_pass_failure_context_to_review_builder(
+    monkeypatch, tmp_path,
+):
+    """Pin §D11 / §D2: failure context is Plan/Implement only. The Review
+    builder must not receive a failure_context kwarg.
+
+    Mirrors the task-8 'decisions don't leak to review' regression — a
+    strict-signature spy raises TypeError if a failure_context kwarg
+    leaks in.
+    """
+    state = State(tmp_path / "state.json")
+    state.record_failure(1, make_failure_record(
+        "review_rejected_after_max_rounds", "review", reason="x",
+    ))
+
+    captured: dict = {}
+    real_build_review = runner.build_review_prompt
+
+    def strict_build_review(task, plan_path, review_path, prev_feedback="",
+                            *, persona=""):
+        captured["called"] = True
+        return real_build_review(task, plan_path, review_path,
+                                 prev_feedback, persona=persona)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_review_prompt",
+                        strict_build_review)
+    _no_run_claude_called(monkeypatch)
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    assert captured.get("called") is True
+
+
+def test_execute_task_does_NOT_pass_failure_context_to_revise_builder(
+    monkeypatch, tmp_path,
+):
+    """Pin §D11 / §D2: same regression for Revise — narrow scope wins."""
+    state = State(tmp_path / "state.json")
+    state.record_failure(1, make_failure_record(
+        "review_rejected_after_max_rounds", "review", reason="x",
+    ))
+
+    captured: dict = {}
+    real_build_revise = runner.build_revise_prompt
+
+    def strict_build_revise(task, plan_path, review_path, *, persona=""):
+        captured["called"] = True
+        return real_build_revise(task, plan_path, review_path, persona=persona)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_revise_prompt",
+                        strict_build_revise)
+
+    _no_run_claude_called(monkeypatch)
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 2,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    assert captured.get("called") is True
+
+
+def test_execute_task_failure_context_renders_two_attempts(
+    monkeypatch, tmp_path,
+):
+    """Integration pin: two prior FailureRecords on disk → both are
+    rendered in the section, in the FailureRecord-list order."""
+    captured: dict = {}
+    real_build_plan = runner.build_plan_prompt
+
+    def spy_build_plan(*args, **kwargs):
+        captured["fc"] = kwargs.get("failure_context", "")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_build_plan)
+    _no_run_claude_called(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    state.record_failure(1, make_failure_record(
+        "manual_stop", "plan", reason="OLDER_REASON",
+    ))
+    state.record_failure(1, make_failure_record(
+        "implementer_timeout", "implement",
+        reason="NEWER_REASON",
+        artifacts={"plan": "plans/task-1/plan.md"},
+    ))
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    fc = captured["fc"]
+    assert "Attempt 1: manual_stop" in fc
+    assert "Attempt 2: implementer_timeout" in fc
+    assert "OLDER_REASON" in fc
+    assert "NEWER_REASON" in fc
+    assert "phase: implement" in fc
+
+
+def test_execute_task_failure_context_persists_across_plan_to_implement(
+    monkeypatch, tmp_path,
+):
+    """Pin §D9: the same snapshot section reaches both builders in one
+    execute_task call (no re-read between phases)."""
+    fc_at_plan: dict = {}
+    fc_at_impl: dict = {}
+    real_build_plan = runner.build_plan_prompt
+    real_build_impl = runner.build_implement_prompt
+
+    def spy_plan(*args, **kwargs):
+        fc_at_plan["v"] = kwargs.get("failure_context", "")
+        return real_build_plan(*args, **kwargs)
+
+    def spy_impl(*args, **kwargs):
+        fc_at_impl["v"] = kwargs.get("failure_context", "")
+        return real_build_impl(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_plan_prompt", spy_plan)
+    monkeypatch.setattr("claude_plan_execute.runner.build_implement_prompt", spy_impl)
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    (tmp_path / "task-1").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "task-1" / "plan.md").write_text("placeholder plan")
+
+    state = State(tmp_path / "state.json")
+    state.record_failure(1, make_failure_record(
+        "implementer_max_turns", "implement",
+        reason="prior max-turns",
+    ))
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 0,
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={},
+    )
+    assert fc_at_plan["v"] != ""
+    assert fc_at_plan["v"] == fc_at_impl["v"]
+    assert "implementer_max_turns" in fc_at_plan["v"]
