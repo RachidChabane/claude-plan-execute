@@ -2196,10 +2196,19 @@ from claude_plan_execute.gates import (
 def _clean_default_registry(monkeypatch):
     """Replace the module-level default registry with a fresh local one
     for the duration of a test. Tests that need built-ins register them
-    explicitly within the fixture's scope."""
+    explicitly within the fixture's scope. Also clears
+    `_loaded_invariant_names` so each Section Q test sees only the
+    invariants IT registers via the loader."""
     fresh = GateRegistry()
     monkeypatch.setattr(
         "claude_plan_execute.runner.default_registry", lambda: fresh,
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.default_registry", lambda: fresh,
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.invariants._loaded_invariant_names",
+        [],
     )
     yield fresh
 
@@ -3242,4 +3251,285 @@ def test_execute_task_lint_phase_extra_appended(monkeypatch, tmp_path):
         skip_to="implement",
     )
     assert invoked == [["bash", "-c", "ruff check"]]
+    assert state.get(1)["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Q. `invariant-grep` meta-name + invariants.yaml integration (task 14)
+# ---------------------------------------------------------------------------
+
+
+def _write_invariants_file(tmp_path, body: str) -> Path:
+    p = tmp_path / "invariants.yaml"
+    p.write_text(body)
+    return p
+
+
+def test_execute_task_invariant_grep_meta_name_expands_to_loaded_invariants(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D3: gates: ['invariant-grep'] expands to every loaded
+    invariant. Each compiled gate runs once."""
+    from claude_plan_execute.gates import default_registry
+    from claude_plan_execute.gates.invariants import (
+        load_invariants,
+        register_invariants_on,
+    )
+    p = _write_invariants_file(tmp_path,
+        "- name: invariant-foo\n"
+        "  command: 'true'\n"
+        "- name: invariant-bar\n"
+        "  command: 'true'\n"
+    )
+    register_invariants_on(default_registry(), load_invariants(p))
+
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        x = P(); x.returncode = 0; x.stdout = ""; x.stderr = ""
+        return x
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["invariant-grep"],
+        },
+        cli={}, skip_to="implement",
+    )
+    cmds = sorted(c[2] for c in invoked)
+    assert cmds == ["true", "true"]
+    assert (tmp_path / "task-1" / "gates" / "invariant-foo.txt").is_file()
+    assert (tmp_path / "task-1" / "gates" / "invariant-bar.txt").is_file()
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_invariant_grep_with_no_loaded_invariants_silently_noops(
+    monkeypatch, tmp_path, _clean_default_registry, capsys,
+):
+    """Pin §D3: invariant-grep meta-name with empty loaded set is a
+    silent no-op (no warning, no skipped gate). The task still
+    reaches done."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["invariant-grep"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s)" not in out
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_invariant_grep_after_tests_runs_in_dispatch_order(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D3: gates: [tests, invariant-grep, lint] order is
+    preserved in dispatch — tests gate first, then expanded
+    invariants in file order, then lint."""
+    from claude_plan_execute.gates import default_registry
+    from claude_plan_execute.gates.invariants import (
+        load_invariants,
+        register_invariants_on,
+    )
+    p = _write_invariants_file(tmp_path,
+        "- name: invariant-a\n"
+        "  command: 'echo INVA'\n"
+        "- name: invariant-b\n"
+        "  command: 'echo INVB'\n"
+    )
+    register_invariants_on(default_registry(), load_invariants(p))
+
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd[2])
+        class P: pass
+        x = P(); x.returncode = 0; x.stdout = ""; x.stderr = ""
+        return x
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests", "invariant-grep", "lint"],
+            "test_command": "pytest",
+            "lint_command": "ruff",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert sorted(invoked) == sorted(["pytest", "echo INVA", "echo INVB", "ruff"])
+
+
+def test_execute_task_specific_invariant_name_runs_directly(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D3: a user can list a specific invariant by name in
+    gates:; the registry-lookup branch handles it without going
+    through the meta-name."""
+    from claude_plan_execute.gates import default_registry
+    from claude_plan_execute.gates.invariants import (
+        load_invariants,
+        register_invariants_on,
+    )
+    p = _write_invariants_file(tmp_path,
+        "- name: invariant-foo\n"
+        "  command: 'echo FOO'\n"
+        "- name: invariant-bar\n"
+        "  command: 'echo BAR'\n"
+    )
+    register_invariants_on(default_registry(), load_invariants(p))
+
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd[2])
+        class P: pass
+        x = P(); x.returncode = 0; x.stdout = ""; x.stderr = ""
+        return x
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["invariant-foo"],
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == ["echo FOO"]
+
+
+def test_execute_task_invariant_failure_blocks_with_gate_failed(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: a failing invariant blocks the task with
+    block_reason='gate_failed' and records a FailureRecord through
+    the existing Phase-4 path."""
+    from claude_plan_execute.gates import default_registry
+    from claude_plan_execute.gates.invariants import (
+        load_invariants,
+        register_invariants_on,
+    )
+    p = _write_invariants_file(tmp_path,
+        "- name: invariant-no-bad\n"
+        "  command: 'echo BAD; exit 1'\n"
+    )
+    register_invariants_on(default_registry(), load_invariants(p))
+
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        x = P()
+        x.returncode = 1
+        x.stdout = "BAD\n"
+        x.stderr = ""
+        return x
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["invariant-grep"],
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"
+    assert "BAD" in rec["verbatim"]
+    assert "gate:invariant-no-bad" in rec["artifacts"]
+
+
+def test_execute_task_invariant_grep_meta_name_does_NOT_warn_as_unknown(
+    monkeypatch, tmp_path, _clean_default_registry, capsys,
+):
+    """Pin §D3: invariant-grep is special-cased before the unknown-
+    gate branch. Even with no invariants loaded, no 'Unknown
+    gate(s)' warning fires."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["invariant-grep"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s)" not in out
+
+
+def test_execute_task_invariant_loaded_but_not_in_gates_does_NOT_run(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D3: an invariant loaded into the registry but NOT named
+    in gates: (and gates: doesn't include 'invariant-grep') is not
+    run. The meta-name is the user's opt-in; loading alone is not."""
+    from claude_plan_execute.gates import default_registry
+    from claude_plan_execute.gates.invariants import (
+        load_invariants,
+        register_invariants_on,
+    )
+    p = _write_invariants_file(tmp_path,
+        "- name: invariant-foo\n"
+        "  command: 'echo FOO'\n"
+    )
+    register_invariants_on(default_registry(), load_invariants(p))
+
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd[2])
+        class P: pass
+        x = P(); x.returncode = 0; x.stdout = ""; x.stderr = ""
+        return x
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": [],
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == []
     assert state.get(1)["status"] == "done"

@@ -396,6 +396,7 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "on_max_review_rounds",
         "persona_file",
         "decisions_dir",
+        "invariants_file",
     )
     assert KEYS_TO_AUDIT == expected
 
@@ -520,3 +521,58 @@ def test_resolve_lint_command_explicit_empty_string_preserved():
         task={}, file_defaults={"lint_command": ""}, cli_overrides={},
     )
     assert out["lint_command"] == {"value": "", "from": "project_defaults"}
+
+
+# ---------------------------------------------------------------------------
+# K. invariants_file resolver (task 14)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_invariants_file_returns_None_when_no_layer_set():
+    """Pin task 14 §D11: HARDCODED_DEFAULTS does NOT include
+    invariants_file, so the resolver returns None when no layer
+    sets it. cli.main() interprets None as 'no invariants
+    configured'."""
+    out = resolve("invariants_file", task={}, file_defaults={}, cli_overrides={})
+    assert out is None
+
+
+def test_resolve_invariants_file_picks_project_layer():
+    """Project-defaults set → resolver returns it with from='project_defaults'."""
+    out = resolve_task_config(
+        task={}, file_defaults={"invariants_file": "docs/invariants.yaml"},
+        cli_overrides={},
+    )
+    assert out["invariants_file"] == {
+        "value": "docs/invariants.yaml", "from": "project_defaults",
+    }
+
+
+def test_resolve_invariants_file_unset_renders_unset_provenance():
+    """When no layer sets invariants_file, the audit dict shows
+    {'value': None, 'from': 'unset'} — surfacing the misconfiguration
+    to anyone reading resolved-config.json."""
+    out = resolve_task_config(task={}, file_defaults={}, cli_overrides={})
+    assert out["invariants_file"] == {"value": None, "from": "unset"}
+
+
+def test_resolve_invariants_file_explicit_empty_string_preserved():
+    """Pin: explicit empty string is distinct from None. cli.main()
+    treats both as no-op, but the audit log preserves provenance."""
+    out = resolve_task_config(
+        task={}, file_defaults={"invariants_file": ""}, cli_overrides={},
+    )
+    assert out["invariants_file"] == {"value": "", "from": "project_defaults"}
+
+
+def test_resolve_invariants_file_phase_layer_wins_over_project():
+    """Phase override picks up correctly through resolve_task_config."""
+    out = resolve_task_config(
+        task={}, file_defaults={"invariants_file": "docs/x.yaml"},
+        cli_overrides={},
+        phase={"invariants_file": "docs/phase.yaml"},
+        phase_id="ui",
+    )
+    assert out["invariants_file"] == {
+        "value": "docs/phase.yaml", "from": "phase:ui",
+    }

@@ -316,6 +316,8 @@ def execute_task(
     gate_names_phase = list(phase_dict.get("gates_extra") or [])
     gate_names = gate_names_project + gate_names_phase
     if gate_names:
+        from claude_plan_execute.gates.invariants import loaded_invariant_names
+        invariant_names = loaded_invariant_names()
         registry = default_registry()
         resolved_gates: list[tuple[str, Gate]] = []
         unknown_gates: list[str] = []
@@ -328,6 +330,11 @@ def execute_task(
                     unconfigured_lint = True
                 else:
                     resolved_gates.append((name, make_lint_gate(lint_command)))
+            elif name == "invariant-grep":
+                for inv_name in invariant_names:
+                    g = registry.get(inv_name)
+                    if g is not None:
+                        resolved_gates.append((inv_name, g))
             else:
                 g = registry.get(name)
                 if g is None:
@@ -341,7 +348,7 @@ def execute_task(
         if unknown_gates:
             print(yellow(
                 f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
-                f"(not registered; tasks 14–17 add built-ins)"
+                f"(not registered; tasks 15–17 add built-ins)"
             ))
         if resolved_gates:
             print(f"\n{bold('--- Phase 4: Gates ---')}")

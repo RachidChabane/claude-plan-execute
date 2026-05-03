@@ -149,6 +149,16 @@ def main():
 
     tasks_file_obj = load_tasks_file(tasks_path)
     file_defaults = effective_defaults(tasks_file_obj)
+    from claude_plan_execute.gates import default_registry
+    from claude_plan_execute.gates.invariants import (
+        load_invariants,
+        register_invariants_on,
+    )
+    invariants_path = file_defaults.get("invariants_file")
+    register_invariants_on(
+        default_registry(),
+        load_invariants(invariants_path),
+    )
     tasks: list[dict] = [t.model_dump(exclude_none=True) for t in tasks_file_obj.tasks]
     phases_by_id: dict[str, dict] = {
         p.id: p.model_dump(exclude_none=True) for p in tasks_file_obj.phases

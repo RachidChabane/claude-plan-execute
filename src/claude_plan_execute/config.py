@@ -27,9 +27,9 @@ HARDCODED_DEFAULTS: dict = {
 # Keys serialized to plans/task-{id}/resolved-config.json. Policy
 # (task 5 §D3): currently-consumed keys only. Task 6 added
 # on_max_review_rounds. Task 7 added persona_file. Task 8 added
-# decisions_dir. Task 13 added lint_command. Future tasks (e.g., 14
-# for invariants_file) extend this tuple as new keys become
-# resolver-consumable.
+# decisions_dir. Task 13 added lint_command. Task 14 added
+# invariants_file. Future tasks extend this tuple as new keys
+# become resolver-consumable.
 KEYS_TO_AUDIT: tuple[str, ...] = (
     "model",
     "effort",
@@ -45,6 +45,7 @@ KEYS_TO_AUDIT: tuple[str, ...] = (
     "on_max_review_rounds",
     "persona_file",
     "decisions_dir",
+    "invariants_file",
 )
 
 
