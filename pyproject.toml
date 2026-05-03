@@ -32,7 +32,7 @@ where = ["src"]
 include = ["claude_plan_execute*"]
 
 [tool.setuptools.package-data]
-"claude_plan_execute" = ["dashboard/index.html"]
+"claude_plan_execute" = ["dashboard/index.html", "gates/templates/*.md"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

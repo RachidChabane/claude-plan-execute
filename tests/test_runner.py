@@ -3533,3 +3533,297 @@ def test_execute_task_invariant_loaded_but_not_in_gates_does_NOT_run(
     )
     assert invoked == []
     assert state.get(1)["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# R. `test-critique` built-in agent gate integration (task 15)
+# ---------------------------------------------------------------------------
+
+# These tests exercise the runner's integration with the
+# import-time-registered `test-critique` agent gate. They use
+# `_clean_default_registry` and explicitly register the gate on
+# the fresh local registry via `_build_test_critique_gate()`.
+# `run_claude` is stubbed because AgentGate calls it directly;
+# no real `claude` subprocess is spawned.
+
+
+def _patch_run_claude_for_agent_gate(monkeypatch, *, text="VERDICT: PASS\n"):
+    """Stub run_claude in BOTH locations it's called from:
+    - claude_plan_execute.runner.run_claude (Phase 3 implementer)
+    - claude_plan_execute.gates.agent.run_claude (AgentGate)
+    Returns a list of (prompt, kwargs) tuples for assertions."""
+    captured: list[tuple[str, dict]] = []
+
+    def stub(prompt, **kwargs):
+        captured.append((prompt, kwargs))
+        claude._last_run_timed_out = False
+        claude._last_run_subtype = "success"
+        return 0, text
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.run_claude", stub,
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", stub,
+    )
+    return captured
+
+
+def test_execute_task_test_critique_runs_via_registry_lookup(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D10: `test-critique` flows through the existing
+    `else: g = registry.get(name)` branch. The runner's Phase-4
+    dispatch needs zero new special-case for it."""
+    from claude_plan_execute.gates.builtin import _build_test_critique_gate
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["test-critique"],
+        },
+        cli={}, skip_to="implement",
+    )
+    # Two run_claude calls: implementer (Phase 3) + agent gate.
+    assert len(captured) == 2
+    # The gate's call uses sonnet/medium per the registered Gate:
+    gate_call = captured[1]
+    assert gate_call[1]["model"] == "sonnet"
+    assert gate_call[1]["effort"] == "medium"
+    # The task reaches done because the stub returns VERDICT: PASS:
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_test_critique_writes_output_file(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin task 11 §D8: the gate's response is captured to
+    plans/task-{id}/gates/test-critique.txt."""
+    from claude_plan_execute.gates.builtin import _build_test_critique_gate
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+    _patch_run_claude_for_agent_gate(
+        monkeypatch, text="VERDICT: PASS\n\nReason: looks good"
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["test-critique"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out_file = tmp_path / "task-1" / "gates" / "test-critique.txt"
+    assert out_file.is_file()
+    body = out_file.read_text()
+    assert "VERDICT: PASS" in body
+    assert "looks good" in body
+
+
+def test_execute_task_test_critique_failure_blocks_with_gate_failed(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin task description: 'On FAIL, the failure record's
+    next-attempt prompt sees the suggested cases.' A FAIL verdict
+    blocks the task with block_reason='gate_failed' and writes a
+    FailureRecord whose verbatim contains the suggested cases."""
+    from claude_plan_execute.gates.builtin import _build_test_critique_gate
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+    fail_text = (
+        "## Verdict: FAIL\n\n"
+        "## Reason\nTests don't cover the empty-input case.\n\n"
+        "## Suggested additional cases\n"
+        "- empty list input\n"
+        "- single-element input\n"
+    )
+    _patch_run_claude_for_agent_gate(monkeypatch, text=fail_text)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["test-critique"],
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"
+    assert rec["phase"] == "gate"
+    assert "empty list input" in rec["verbatim"]
+    assert "gate:test-critique" in rec["artifacts"]
+
+
+def test_execute_task_test_critique_forwards_skip_permissions_from_cli(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D9: when the CLI is invoked with --skip-permissions,
+    the AgentGate's run_claude call sees skip_permissions=True.
+    Without this, the gate's bash tool calls (git diff) auto-deny
+    and the gate cannot fulfill its contract."""
+    from claude_plan_execute.gates.builtin import _build_test_critique_gate
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["test-critique"],
+        },
+        cli={"skip_permissions": True}, skip_to="implement",
+    )
+    # Two calls: implementer + gate. The gate's call (index 1) sees
+    # skip_permissions=True forwarded from the cli dict:
+    assert captured[1][1]["skip_permissions"] is True
+
+
+def test_execute_task_test_critique_runs_after_tests_in_parallel_dispatch(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D5 / §R5: both `tests` and `test-critique` are
+    parallel_safe → both end up in the parallel pool. We can't
+    test concurrency deterministically in unit tests, but we
+    can verify both are invoked and both write output files."""
+    from claude_plan_execute.gates.builtin import _build_test_critique_gate
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+    _patch_run_claude_for_agent_gate(monkeypatch)
+
+    shell_invoked: list[list[str]] = []
+    def fake_shell_run(cmd, **kwargs):
+        shell_invoked.append(list(cmd))
+        class P: pass
+        x = P(); x.returncode = 0; x.stdout = "ok"; x.stderr = ""
+        return x
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_shell_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests", "test-critique"],
+            "test_command": "pytest -q",
+        },
+        cli={}, skip_to="implement",
+    )
+    # The shell gate was invoked once with the test command:
+    assert shell_invoked == [["bash", "-c", "pytest -q"]]
+    # Both output files are written:
+    assert (tmp_path / "task-1" / "gates" / "tests.txt").is_file()
+    assert (tmp_path / "task-1" / "gates" / "test-critique.txt").is_file()
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_test_critique_phase_extra_appended(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: a phase's gates_extra='test-critique' is appended to
+    project gates and resolves through the same registry-lookup
+    branch."""
+    from claude_plan_execute.gates.builtin import _build_test_critique_gate
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="risky"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": [],
+        },
+        cli={},
+        phases_by_id={"risky": {"id": "risky",
+                                "defaults": {"gates_extra": ["test-critique"]}}},
+        skip_to="implement",
+    )
+    # Implementer + gate:
+    assert len(captured) == 2
+    # The gate ran (writes its output file):
+    assert (tmp_path / "task-1" / "gates" / "test-critique.txt").is_file()
+
+
+def test_execute_task_test_critique_does_NOT_warn_as_unknown(
+    monkeypatch, tmp_path, _clean_default_registry, capsys,
+):
+    """Pin §D10: `test-critique` is found via registry.get() so
+    no Unknown gate(s) warning fires. (The registration is on the
+    fresh fixture registry; without registering it, this test
+    would warn.)"""
+    from claude_plan_execute.gates.builtin import _build_test_critique_gate
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+    _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["test-critique"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s)" not in out
+
+
+def test_execute_task_test_critique_skipped_when_implementer_timed_out(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin task 11 §D12 carry-forward: implementer_timeout returns
+    BEFORE the gate run, so test-critique does not fire. (No
+    run_claude calls for the gate; only the implementer's timed-out
+    call.)"""
+    from claude_plan_execute.gates.builtin import _build_test_critique_gate
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+    # Implementer times out (uses the existing helper):
+    _patch_run_claude_simulating_timeout(monkeypatch)
+    # Independent stub for the gate's run_claude (would NOT be called):
+    gate_called: list[bool] = []
+    def gate_stub(prompt, **kwargs):
+        gate_called.append(True)
+        return 0, "VERDICT: PASS"
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", gate_stub,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["test-critique"],
+        },
+        cli={}, skip_to="implement",
+    )
+    assert gate_called == []
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["block_reason"] == "implementer_timeout"

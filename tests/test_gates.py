@@ -150,13 +150,17 @@ def test_default_registry_is_a_singleton():
     assert default_registry() is default_registry()
 
 
-def test_default_registry_starts_empty_in_task_11():
-    """Task 11 ships zero built-in registrations; tasks 12+ add them."""
-    # Task 12 chose Path A (factory pattern, no singleton entry — see
-    # task-12 plan §D1), so this assertion stays empty. The first task
-    # that registers a built-in WITHOUT per-task config (e.g., task 16's
-    # security-auditor) will be the one to add an entry here.
-    assert default_registry().names() == []
+def test_default_registry_has_test_critique_after_builtin_import():
+    """Task 15: importing gates.builtin registers the test-critique
+    agent gate on the default singleton at module-import time.
+    The pre-task-15 'starts empty' contract is preserved IF
+    builtin has not been imported, but every production path
+    (cli → runner → builtin) imports it transitively. The new
+    pin asserts containment after explicit import, not strict
+    equality (other test modules may add unrelated entries to
+    the singleton across a pytest session)."""
+    import claude_plan_execute.gates.builtin  # noqa: F401 — import-time side effect
+    assert "test-critique" in default_registry().names()
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +309,7 @@ def test_agent_gate_calls_run_claude_with_prompt_template(monkeypatch):
     captured = _stub_run_claude(monkeypatch)
     g = Gate(kind="agent", prompt_template="INLINE GATE BODY")
     task = {"id": 5, "title": "T", "description": "D"}
-    AgentGate(name="x", gate=g, task=task).run()
+    AgentGate(name="x", gate=g, task=task, cli={}).run()
     assert "INLINE GATE BODY" in captured["prompt"]
 
 
@@ -313,7 +317,7 @@ def test_agent_gate_includes_task_header(monkeypatch):
     captured = _stub_run_claude(monkeypatch)
     g = Gate(kind="agent", prompt_template="body")
     task = {"id": 9, "title": "MyTitle", "description": "MyDesc"}
-    AgentGate(name="x", gate=g, task=task).run()
+    AgentGate(name="x", gate=g, task=task, cli={}).run()
     assert "TASK 9: MyTitle" in captured["prompt"]
     assert "MyDesc" in captured["prompt"]
 
@@ -324,7 +328,7 @@ def test_agent_gate_loads_template_from_file(monkeypatch, tmp_path):
     template_path.write_text("FILE_TEMPLATE_BODY")
     g = Gate(kind="agent", prompt_template=str(template_path))
     task = {"id": 1, "title": "T", "description": "D"}
-    AgentGate(name="x", gate=g, task=task).run()
+    AgentGate(name="x", gate=g, task=task, cli={}).run()
     assert "FILE_TEMPLATE_BODY" in captured["prompt"]
 
 
@@ -332,28 +336,28 @@ def test_agent_gate_uses_inline_body_when_path_does_not_exist(monkeypatch):
     captured = _stub_run_claude(monkeypatch)
     g = Gate(kind="agent", prompt_template="this is not a path")
     task = {"id": 1, "title": "T", "description": "D"}
-    AgentGate(name="x", gate=g, task=task).run()
+    AgentGate(name="x", gate=g, task=task, cli={}).run()
     assert "this is not a path" in captured["prompt"]
 
 
 def test_agent_gate_default_model_is_sonnet(monkeypatch):
     captured = _stub_run_claude(monkeypatch)
     g = Gate(kind="agent", prompt_template="x")
-    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert captured["kwargs"]["model"] == "sonnet"
 
 
 def test_agent_gate_default_effort_is_medium(monkeypatch):
     captured = _stub_run_claude(monkeypatch)
     g = Gate(kind="agent", prompt_template="x")
-    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert captured["kwargs"]["effort"] == "medium"
 
 
 def test_agent_gate_overrides_model_from_gate_field(monkeypatch):
     captured = _stub_run_claude(monkeypatch)
     g = Gate(kind="agent", prompt_template="x", model="opus", effort="max")
-    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert captured["kwargs"]["model"] == "opus"
     assert captured["kwargs"]["effort"] == "max"
 
@@ -361,35 +365,35 @@ def test_agent_gate_overrides_model_from_gate_field(monkeypatch):
 def test_agent_gate_passes_timeout_minutes_through(monkeypatch):
     captured = _stub_run_claude(monkeypatch)
     g = Gate(kind="agent", prompt_template="x", timeout_minutes=7)
-    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert captured["kwargs"]["timeout_minutes"] == 7
 
 
 def test_agent_gate_max_turns_is_60(monkeypatch):
     captured = _stub_run_claude(monkeypatch)
     g = Gate(kind="agent", prompt_template="x")
-    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert captured["kwargs"]["max_turns"] == 60
 
 
 def test_agent_gate_pass_detection_on_VERDICT_PASS(monkeypatch):
     _stub_run_claude(monkeypatch, text="some text\nVERDICT: PASS\nmore text")
     g = Gate(kind="agent", prompt_template="x")
-    r = AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    r = AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert r.passed is True
 
 
 def test_agent_gate_pass_detection_is_case_insensitive(monkeypatch):
     _stub_run_claude(monkeypatch, text="verdict: pass")
     g = Gate(kind="agent", prompt_template="x")
-    r = AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    r = AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert r.passed is True
 
 
 def test_agent_gate_fail_detection_on_VERDICT_FAIL(monkeypatch):
     _stub_run_claude(monkeypatch, text="VERDICT: FAIL — found 3 issues")
     g = Gate(kind="agent", prompt_template="x")
-    r = AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    r = AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert r.passed is False
 
 
@@ -397,20 +401,65 @@ def test_agent_gate_fails_on_empty_response(monkeypatch):
     """Defensive: an empty / malformed agent reply is a fail."""
     _stub_run_claude(monkeypatch, text="")
     g = Gate(kind="agent", prompt_template="x")
-    r = AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+    r = AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
     assert r.passed is False
 
 
 def test_agent_gate_raises_when_prompt_template_missing():
     g = Gate(kind="agent")  # no prompt_template
     with pytest.raises(ValueError, match="requires a prompt_template"):
-        AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+        AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
 
 
 def test_agent_gate_raises_on_wrong_kind():
     g = Gate(kind="shell", command=("true",))
     with pytest.raises(ValueError, match="kind='agent'"):
-        AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}).run()
+        AgentGate(name="x", gate=g, task={"id": 1, "title": "T", "description": "D"}, cli={}).run()
+
+
+def test_agent_gate_forwards_skip_permissions_from_cli(monkeypatch):
+    """Pin task 15 §D9: AgentGate forwards `skip_permissions` from
+    its `cli` dict to run_claude. Without this, agent-gate bash
+    tool use auto-denies in autonomous mode (--skip-permissions)
+    and gates that need bash (test-critique) cannot fulfill their
+    contract."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent", prompt_template="x")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={"skip_permissions": True},
+    ).run()
+    assert captured["kwargs"]["skip_permissions"] is True
+
+
+def test_agent_gate_forwards_verbose_from_cli(monkeypatch):
+    """Pin task 15 §D9: AgentGate forwards `verbose` from its
+    `cli` dict to run_claude. Mirrors the implementer's behavior
+    at runner.py:121."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent", prompt_template="x")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={"verbose": True},
+    ).run()
+    assert captured["kwargs"]["verbose"] is True
+
+
+def test_agent_gate_skip_permissions_defaults_to_False(monkeypatch):
+    """Pin task 15 §D9: an empty cli dict produces
+    skip_permissions=False (preserves pre-task-15 default for
+    callers who don't care)."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent", prompt_template="x")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},
+    ).run()
+    assert captured["kwargs"]["skip_permissions"] is False
+    assert captured["kwargs"]["verbose"] is False
 
 
 # ---------------------------------------------------------------------------

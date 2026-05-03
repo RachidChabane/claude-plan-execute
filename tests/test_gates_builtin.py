@@ -188,3 +188,148 @@ def test_make_lint_gate_does_NOT_register_on_default_registry():
     make_lint_gate("eslint .")
     after = set(default_registry().names())
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# G. test-critique built-in agent gate (task 15)
+# ---------------------------------------------------------------------------
+
+# These tests exercise gates/builtin.py's import-time registration
+# of `test-critique` and the helper `_build_test_critique_gate()`
+# used by tests with the `_clean_default_registry` fixture.
+
+from pathlib import Path
+
+from claude_plan_execute.gates import default_registry
+from claude_plan_execute.gates.builtin import _build_test_critique_gate
+
+
+def test_test_critique_is_registered_on_default_registry_after_import():
+    """Pin §D1: `test-critique` is registered on the singleton when
+    gates.builtin is imported. The import line at the top of this
+    file already triggered the side effect; assert it took."""
+    assert "test-critique" in default_registry().names()
+
+
+def test_test_critique_gate_kind_is_agent():
+    """Pin §D5: kind=agent (not shell)."""
+    g = default_registry().get("test-critique")
+    assert g is not None
+    assert g.kind == "agent"
+
+
+def test_test_critique_gate_model_is_sonnet():
+    """Pin §D5: model=sonnet baked into the registration."""
+    g = default_registry().get("test-critique")
+    assert g.model == "sonnet"
+
+
+def test_test_critique_gate_effort_is_medium():
+    """Pin §D5: effort=medium baked into the registration."""
+    g = default_registry().get("test-critique")
+    assert g.effort == "medium"
+
+
+def test_test_critique_gate_on_failure_is_block():
+    """Pin §D5 / task description: on_failure=block is required so
+    a failing gate writes a FailureRecord (which carries the
+    suggested cases into the next-attempt prompt)."""
+    g = default_registry().get("test-critique")
+    assert g.on_failure == "block"
+
+
+def test_test_critique_gate_parallel_safe_is_true():
+    """Pin §D5: parallel_safe=True — runs concurrently with
+    `tests`, `lint`, etc."""
+    g = default_registry().get("test-critique")
+    assert g.parallel_safe is True
+
+
+def test_test_critique_gate_when_is_always():
+    """Pin §D5: when=('always',) — no tests-changed filter
+    (deferred per Non-goals)."""
+    g = default_registry().get("test-critique")
+    assert g.when == ("always",)
+
+
+def test_test_critique_gate_timeout_is_10_minutes():
+    """Pin §D5: timeout_minutes=10 (the Gate default; explicit
+    on the registration for clarity)."""
+    g = default_registry().get("test-critique")
+    assert g.timeout_minutes == 10
+
+
+def test_test_critique_gate_prompt_template_is_an_existing_file():
+    """Pin §D2 / §D3 / §D4: the registered prompt_template path
+    resolves to a real file inside the package. Without the
+    pyproject.toml package-data inclusion, wheel installs would
+    fail this assertion at runtime (the path would be a string,
+    not an existing file)."""
+    g = default_registry().get("test-critique")
+    p = Path(g.prompt_template)
+    assert p.is_absolute(), f"prompt_template should be absolute: {p}"
+    assert p.is_file(), f"prompt_template should exist: {p}"
+    assert p.name == "test-critique.md"
+
+
+def test_test_critique_template_has_VERDICT_PASS_pin():
+    """Pin §D8: the template contains the literal substring
+    'VERDICT: PASS' so the agent's pass-detection contract
+    (agent.py:69 — case-insensitive substring search) has the
+    sentinel the template instructs the agent to emit."""
+    g = default_registry().get("test-critique")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "VERDICT: PASS" in body or "Verdict: PASS" in body
+
+
+def test_build_test_critique_gate_returns_a_fresh_Gate():
+    """Pin §D11: _build_test_critique_gate() returns a Gate
+    with the same shape as the registered singleton entry but
+    a fresh instance (callers can register on a fresh registry
+    without mutating the singleton)."""
+    g1 = _build_test_critique_gate()
+    g2 = _build_test_critique_gate()
+    # Same shape:
+    assert g1.kind == g2.kind == "agent"
+    assert g1.model == g2.model == "sonnet"
+    # Frozen dataclasses are equal-by-value; identity is allowed
+    # to differ but value equality holds:
+    assert g1 == g2
+
+
+def test_build_test_critique_gate_does_NOT_register_on_call():
+    """Pin §D1 / §D11: calling the helper does NOT mutate the
+    default registry. (The registration is a one-shot
+    side effect at module import time; the helper is for
+    test fixtures.)"""
+    before = set(default_registry().names())
+    _build_test_critique_gate()
+    _build_test_critique_gate()
+    after = set(default_registry().names())
+    assert before == after
+
+
+def test_test_critique_gate_template_path_is_under_gates_templates_dir():
+    """Pin §D3: the template file lives under
+    src/claude_plan_execute/gates/templates/. A future
+    refactor that moves the templates elsewhere would break
+    the package-data glob and silently break wheel installs;
+    this test pins the location."""
+    g = default_registry().get("test-critique")
+    p = Path(g.prompt_template)
+    assert p.parent.name == "templates"
+    assert p.parent.parent.name == "gates"
+
+
+def test_make_test_critique_gate_template_body_starts_with_test_critique_header():
+    """Defensive: the template body has a recognizable header so
+    accidental file corruption / wrong-file-shipped errors
+    surface in tests."""
+    g = default_registry().get("test-critique")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    # Expect a header that names the gate (or a recognizable
+    # opening sentence). The exact wording is part of the
+    # template body and should not be tested for verbatim
+    # match — that would create a brittle pin every prompt
+    # tweak triggers. Test only for the gate name.
+    assert "test-critique" in body.lower() or "test critic" in body.lower()

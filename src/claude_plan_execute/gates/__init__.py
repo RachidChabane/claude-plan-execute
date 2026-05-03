@@ -160,7 +160,7 @@ def _when_matches(when: tuple[str, ...], task: dict) -> tuple[bool, str]:
 # Per-gate worker (catches exceptions; produces a GateResult either way)
 # ---------------------------------------------------------------------------
 
-def _run_one(name: str, gate: Gate, task: dict) -> GateResult:
+def _run_one(name: str, gate: Gate, task: dict, cli: dict) -> GateResult:
     """Execute one gate, returning a GateResult on success OR failure.
 
     Exceptions are caught and reported; the gate-run loop never raises
@@ -171,7 +171,7 @@ def _run_one(name: str, gate: Gate, task: dict) -> GateResult:
         if gate.kind == "shell":
             return ShellGate(name=name, gate=gate).run()
         if gate.kind == "agent":
-            return AgentGate(name=name, gate=gate, task=task).run()
+            return AgentGate(name=name, gate=gate, task=task, cli=cli).run()
         return GateResult(
             name=name, passed=False, output="",
             output_path=None,
@@ -246,14 +246,14 @@ def run_gates(
     # Serial first (single-runner dependence assumed; see §D5).
     for name, gate in serial:
         print(dim(f"  Running gate '{name}' (serial)..."))
-        results.append(_run_one(name, gate, task))
+        results.append(_run_one(name, gate, task, cli))
 
     # Then parallel.
     if parallel:
         max_workers = min(len(parallel), 4)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
-                ex.submit(_run_one, n, g, task): n
+                ex.submit(_run_one, n, g, task, cli): n
                 for (n, g) in parallel
             }
             for fut in as_completed(futures):

@@ -37,6 +37,7 @@ class AgentGate:
     name: str
     gate: Gate
     task: dict
+    cli: dict
 
     def run(self) -> GateResult:
         if self.gate.kind != "agent":
@@ -63,8 +64,8 @@ class AgentGate:
             effort=self.gate.effort or "medium",
             max_turns=60,
             timeout_minutes=self.gate.timeout_minutes,
-            skip_permissions=False,
-            verbose=False,
+            skip_permissions=self.cli.get("skip_permissions", False),
+            verbose=self.cli.get("verbose", False),
         )
         passed = "verdict: pass" in (text or "").lower()
         return GateResult(

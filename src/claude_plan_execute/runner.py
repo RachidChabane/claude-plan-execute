@@ -348,7 +348,7 @@ def execute_task(
         if unknown_gates:
             print(yellow(
                 f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
-                f"(not registered; tasks 15–17 add built-ins)"
+                f"(not registered; tasks 16–17 add built-ins)"
             ))
         if resolved_gates:
             print(f"\n{bold('--- Phase 4: Gates ---')}")
