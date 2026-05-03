@@ -333,3 +333,152 @@ def test_make_test_critique_gate_template_body_starts_with_test_critique_header(
     # match — that would create a brittle pin every prompt
     # tweak triggers. Test only for the gate name.
     assert "test-critique" in body.lower() or "test critic" in body.lower()
+
+
+# ---------------------------------------------------------------------------
+# H. security-auditor built-in agent gate (task 16)
+# ---------------------------------------------------------------------------
+
+# These tests exercise gates/builtin.py's import-time registration
+# of `security-auditor` and the helper `_build_security_auditor_gate()`
+# used by tests with the `_clean_default_registry` fixture.
+
+from claude_plan_execute.gates.builtin import _build_security_auditor_gate
+
+
+def test_security_auditor_is_registered_on_default_registry_after_import():
+    """Pin §D1: `security-auditor` is registered on the singleton
+    when gates.builtin is imported. The import line at the top of
+    this file already triggered the side effect; assert it took."""
+    assert "security-auditor" in default_registry().names()
+
+
+def test_security_auditor_gate_kind_is_agent():
+    """Pin §D5: kind=agent (not shell)."""
+    g = default_registry().get("security-auditor")
+    assert g is not None
+    assert g.kind == "agent"
+
+
+def test_security_auditor_gate_model_is_opus():
+    """Pin §D5: model=opus baked into the registration (the task
+    description names this explicitly: 'Opus/max budget')."""
+    g = default_registry().get("security-auditor")
+    assert g.model == "opus"
+
+
+def test_security_auditor_gate_effort_is_max():
+    """Pin §D5: effort=max baked into the registration (the task
+    description names this explicitly: 'Opus/max budget')."""
+    g = default_registry().get("security-auditor")
+    assert g.effort == "max"
+
+
+def test_security_auditor_gate_on_failure_is_block():
+    """Pin §D5 / task description ('Block on any found'): a finding
+    must write a FailureRecord and stop the task."""
+    g = default_registry().get("security-auditor")
+    assert g.on_failure == "block"
+
+
+def test_security_auditor_gate_parallel_safe_is_true():
+    """Pin §D5: parallel_safe=True — runs concurrently with
+    `tests`, `lint`, `test-critique`, etc."""
+    g = default_registry().get("security-auditor")
+    assert g.parallel_safe is True
+
+
+def test_security_auditor_gate_when_is_always():
+    """Pin §D5: when=('always',) — no touches:<glob> filter
+    (deferred per Non-goals; in-template heuristic handles
+    docs-only diffs)."""
+    g = default_registry().get("security-auditor")
+    assert g.when == ("always",)
+
+
+def test_security_auditor_gate_timeout_is_10_minutes():
+    """Pin §D5: timeout_minutes=10 (the Gate default; explicit on
+    the registration for clarity)."""
+    g = default_registry().get("security-auditor")
+    assert g.timeout_minutes == 10
+
+
+def test_security_auditor_gate_prompt_template_is_an_existing_file():
+    """Pin §D2 / §D3 / §D4: the registered prompt_template path
+    resolves to a real file inside the package. The pyproject.toml
+    package-data glob `gates/templates/*.md` (set in task 15)
+    covers this file too."""
+    g = default_registry().get("security-auditor")
+    p = Path(g.prompt_template)
+    assert p.is_absolute(), f"prompt_template should be absolute: {p}"
+    assert p.is_file(), f"prompt_template should exist: {p}"
+    assert p.name == "security-auditor.md"
+
+
+def test_security_auditor_template_has_VERDICT_PASS_pin():
+    """Pin §D8: the template contains the literal substring
+    'VERDICT: PASS' (case-insensitive forms accepted) so the
+    agent's pass-detection contract (agent.py:69) has the
+    sentinel the template instructs the agent to emit."""
+    g = default_registry().get("security-auditor")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "VERDICT: PASS" in body or "Verdict: PASS" in body
+
+
+def test_build_security_auditor_gate_returns_a_fresh_Gate():
+    """Pin §D12: _build_security_auditor_gate() returns a Gate
+    with the same shape as the registered singleton entry. Frozen
+    dataclasses are equal-by-value; the helper is for test
+    fixtures."""
+    g1 = _build_security_auditor_gate()
+    g2 = _build_security_auditor_gate()
+    assert g1.kind == g2.kind == "agent"
+    assert g1.model == g2.model == "opus"
+    assert g1.effort == g2.effort == "max"
+    assert g1 == g2
+
+
+def test_build_security_auditor_gate_does_NOT_register_on_call():
+    """Pin §D1 / §D12: calling the helper does NOT mutate the
+    default registry. (Registration is a one-shot side effect at
+    module import time; the helper is for test fixtures.)"""
+    before = set(default_registry().names())
+    _build_security_auditor_gate()
+    _build_security_auditor_gate()
+    after = set(default_registry().names())
+    assert before == after
+
+
+def test_security_auditor_gate_template_path_is_under_gates_templates_dir():
+    """Pin §D3: the template file lives under
+    src/claude_plan_execute/gates/templates/. A future refactor
+    that moves templates elsewhere would break the package-data
+    glob and silently break wheel installs; this test pins the
+    location."""
+    g = default_registry().get("security-auditor")
+    p = Path(g.prompt_template)
+    assert p.parent.name == "templates"
+    assert p.parent.parent.name == "gates"
+
+
+def test_security_auditor_template_body_starts_with_recognizable_header():
+    """Defensive: the template body has a recognizable header so
+    accidental file corruption / wrong-file-shipped errors surface
+    in tests. The gate's name or 'security auditor' must appear in
+    the body somewhere — exact wording is not pinned."""
+    g = default_registry().get("security-auditor")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert (
+        "security-auditor" in body.lower()
+        or "security auditor" in body.lower()
+    )
+
+
+def test_test_critique_and_security_auditor_are_both_registered():
+    """Pin §D1: both task-15 (test-critique) and task-16
+    (security-auditor) registrations coexist on the default
+    singleton after gates.builtin is imported. Regression guard
+    against a future refactor that accidentally deletes one."""
+    names = default_registry().names()
+    assert "test-critique" in names
+    assert "security-auditor" in names

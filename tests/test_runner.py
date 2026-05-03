@@ -3827,3 +3827,283 @@ def test_execute_task_test_critique_skipped_when_implementer_timed_out(
     assert gate_called == []
     assert state.get(1)["status"] == "blocked"
     assert state.get(1)["block_reason"] == "implementer_timeout"
+
+
+# ---------------------------------------------------------------------------
+# S. `security-auditor` built-in agent gate integration (task 16)
+# ---------------------------------------------------------------------------
+
+# These tests exercise the runner's integration with the
+# import-time-registered `security-auditor` agent gate. They use
+# `_clean_default_registry` and explicitly register the gate on
+# the fresh local registry via `_build_security_auditor_gate()`.
+# `run_claude` is stubbed (via `_patch_run_claude_for_agent_gate`
+# defined in Section R) — no real `claude` subprocess is spawned.
+
+
+def test_execute_task_security_auditor_runs_via_registry_lookup(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D10: `security-auditor` flows through the existing
+    `else: g = registry.get(name)` branch. The runner's Phase-4
+    dispatch needs zero new special-case for it."""
+    from claude_plan_execute.gates.builtin import (
+        _build_security_auditor_gate,
+    )
+    _clean_default_registry.register(
+        "security-auditor", _build_security_auditor_gate(),
+    )
+
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["security-auditor"],
+        },
+        cli={}, skip_to="implement",
+    )
+    # Two run_claude calls: implementer (Phase 3) + agent gate.
+    assert len(captured) == 2
+    # The gate's call uses opus/max per the registered Gate:
+    gate_call = captured[1]
+    assert gate_call[1]["model"] == "opus"
+    assert gate_call[1]["effort"] == "max"
+    # The task reaches done because the stub returns VERDICT: PASS:
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_security_auditor_writes_output_file(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin task 11 §D8: the gate's response is captured to
+    plans/task-{id}/gates/security-auditor.txt."""
+    from claude_plan_execute.gates.builtin import (
+        _build_security_auditor_gate,
+    )
+    _clean_default_registry.register(
+        "security-auditor", _build_security_auditor_gate(),
+    )
+    _patch_run_claude_for_agent_gate(
+        monkeypatch, text="VERDICT: PASS\n\nReason: no diff-introduced findings",
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["security-auditor"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out_file = tmp_path / "task-1" / "gates" / "security-auditor.txt"
+    assert out_file.is_file()
+    body = out_file.read_text()
+    assert "VERDICT: PASS" in body
+    assert "no diff-introduced findings" in body
+
+
+def test_execute_task_security_auditor_failure_blocks_with_gate_failed(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin task description ('Block on any found'): a FAIL verdict
+    blocks the task with block_reason='gate_failed' and writes a
+    FailureRecord whose verbatim contains the agent's findings."""
+    from claude_plan_execute.gates.builtin import (
+        _build_security_auditor_gate,
+    )
+    _clean_default_registry.register(
+        "security-auditor", _build_security_auditor_gate(),
+    )
+    fail_text = (
+        "## Verdict: FAIL\n\n"
+        "## Findings\n\n"
+        "### 🔴 Critical\n\n"
+        "**[A] - src/api/docs.py:42**\n"
+        "Risk: missing ownership check\n"
+        "Evidence:\n```\nreturn db.get_doc(id)\n```\n"
+        "Fix: add `if doc.owner_id != user.id: raise Forbidden()`\n"
+    )
+    _patch_run_claude_for_agent_gate(monkeypatch, text=fail_text)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["security-auditor"],
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"
+    assert rec["phase"] == "gate"
+    assert "missing ownership check" in rec["verbatim"]
+    assert "gate:security-auditor" in rec["artifacts"]
+
+
+def test_execute_task_security_auditor_forwards_skip_permissions_from_cli(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D9 (inherited from task 15 §D9): when the CLI is
+    invoked with --skip-permissions, the AgentGate's run_claude
+    call sees skip_permissions=True. Without this, the gate's
+    bash tool calls (git diff) auto-deny and the gate cannot
+    fulfill its contract."""
+    from claude_plan_execute.gates.builtin import (
+        _build_security_auditor_gate,
+    )
+    _clean_default_registry.register(
+        "security-auditor", _build_security_auditor_gate(),
+    )
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["security-auditor"],
+        },
+        cli={"skip_permissions": True}, skip_to="implement",
+    )
+    assert captured[1][1]["skip_permissions"] is True
+
+
+def test_execute_task_security_auditor_runs_alongside_test_critique_in_parallel(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D5 / inherited task-15 §R5: both `test-critique` and
+    `security-auditor` are parallel_safe → both end up in the
+    parallel pool. We can't test concurrency deterministically in
+    unit tests, but we can verify both are invoked and both write
+    output files."""
+    from claude_plan_execute.gates.builtin import (
+        _build_security_auditor_gate,
+        _build_test_critique_gate,
+    )
+    _clean_default_registry.register(
+        "test-critique", _build_test_critique_gate(),
+    )
+    _clean_default_registry.register(
+        "security-auditor", _build_security_auditor_gate(),
+    )
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["test-critique", "security-auditor"],
+        },
+        cli={}, skip_to="implement",
+    )
+    # Implementer (1) + two gates (2) = 3 run_claude calls:
+    assert len(captured) == 3
+    # Both output files written:
+    assert (tmp_path / "task-1" / "gates" / "test-critique.txt").is_file()
+    assert (tmp_path / "task-1" / "gates" / "security-auditor.txt").is_file()
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_security_auditor_phase_extra_appended(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: a phase's gates_extra=['security-auditor'] is appended
+    to project gates and resolves through the same registry-lookup
+    branch. Mirrors the canonical opt-in shape from enhancement
+    plan §2.1 / §2.4 (phases like `schema` opt in via gates_extra)."""
+    from claude_plan_execute.gates.builtin import (
+        _build_security_auditor_gate,
+    )
+    _clean_default_registry.register(
+        "security-auditor", _build_security_auditor_gate(),
+    )
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="schema"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": [],
+        },
+        cli={},
+        phases_by_id={"schema": {"id": "schema",
+                                 "defaults": {"gates_extra": ["security-auditor"]}}},
+        skip_to="implement",
+    )
+    # Implementer + gate:
+    assert len(captured) == 2
+    assert (tmp_path / "task-1" / "gates" / "security-auditor.txt").is_file()
+
+
+def test_execute_task_security_auditor_does_NOT_warn_as_unknown(
+    monkeypatch, tmp_path, _clean_default_registry, capsys,
+):
+    """Pin §D10: `security-auditor` is found via registry.get() so
+    no Unknown gate(s) warning fires. (The registration is on the
+    fresh fixture registry; without registering it, this test
+    would warn.)"""
+    from claude_plan_execute.gates.builtin import (
+        _build_security_auditor_gate,
+    )
+    _clean_default_registry.register(
+        "security-auditor", _build_security_auditor_gate(),
+    )
+    _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["security-auditor"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s)" not in out
+
+
+def test_execute_task_security_auditor_skipped_when_implementer_timed_out(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin task 11 §D12 carry-forward: implementer_timeout returns
+    BEFORE the gate run, so security-auditor does not fire. (No
+    run_claude calls for the gate; only the implementer's timed-out
+    call.)"""
+    from claude_plan_execute.gates.builtin import (
+        _build_security_auditor_gate,
+    )
+    _clean_default_registry.register(
+        "security-auditor", _build_security_auditor_gate(),
+    )
+    _patch_run_claude_simulating_timeout(monkeypatch)
+    gate_called: list[bool] = []
+    def gate_stub(prompt, **kwargs):
+        gate_called.append(True)
+        return 0, "VERDICT: PASS"
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", gate_stub,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["security-auditor"],
+        },
+        cli={}, skip_to="implement",
+    )
+    assert gate_called == []
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["block_reason"] == "implementer_timeout"

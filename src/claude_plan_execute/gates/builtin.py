@@ -9,17 +9,17 @@ Exports two kinds of built-ins:
     Gates are NOT pre-registered on `default_registry()`.
 
   - Module-import-time registrations for built-ins WITHOUT
-    per-task config: `test-critique` (task 15). The Gate is
-    constructed once and registered on the default singleton
-    when this module is imported (transitively via `runner.py`
-    or directly in tests).
+    per-task config: `test-critique` (task 15) and
+    `security-auditor` (task 16). The Gate is constructed once
+    and registered on the default singleton when this module is
+    imported (transitively via `runner.py` or directly in tests).
 
 The factory pattern and the import-time pattern coexist; the
-test-critique entry is the first of the import-time kind.
-Future built-ins (security-auditor — task 16) follow the same
-import-time pattern. If/when a third built-in joins, this
-module can refactor to a `_register_all_builtin_agents(registry)`
-helper, but with one entry the explicit call is the simplest
+test-critique entry was the first of the import-time kind, and
+security-auditor (task 16) is the second. If a third built-in
+agent gate joins (e.g., design-fidelity — task 20), this
+module should refactor to a `_register_all_builtin_agents(registry)`
+helper; with two entries the explicit calls remain the simplest
 form.
 """
 from __future__ import annotations
@@ -118,11 +118,47 @@ def _build_test_critique_gate() -> Gate:
     )
 
 
+def _build_security_auditor_gate() -> Gate:
+    """Construct the `security-auditor` agent Gate.
+
+    Opus/max agent gate that reads the diff and scans for OWASP-
+    relevant security regressions: ACL/IDOR bypasses, missing 403
+    paths, secrets, injection, unsafe deserialization, weak
+    crypto, permissive CORS, sensitive-data leaks. Returns
+    PASS/FAIL with itemized findings (file:line, category,
+    evidence, suggested fix). Block on any finding.
+    See plans/task-16/plan.md §D5 for the knob choices.
+
+    The Gate's `prompt_template` is the absolute path to the
+    shipped template at `gates/templates/security-auditor.md`,
+    computed via the module-level `_TEMPLATES_DIR` constant
+    (task 15 §D2) so the gate is location-independent.
+
+    Tests using the `_clean_default_registry` fixture (which
+    replaces the singleton with a fresh empty registry) call
+    this helper to register `security-auditor` on their fresh
+    registry. (§D12.)
+    """
+    return Gate(
+        kind="agent",
+        prompt_template=str(_TEMPLATES_DIR / "security-auditor.md"),
+        model="opus",
+        effort="max",
+        timeout_minutes=10,
+        parallel_safe=True,
+        on_failure="block",
+        when=("always",),
+    )
+
+
 # Side-effecting registration. Runs once when this module is first
 # imported (via `runner.py:13` in production, via test files
 # directly in tests). See §D1 for the design choice.
 default_registry().register(
     "test-critique", _build_test_critique_gate(),
+)
+default_registry().register(
+    "security-auditor", _build_security_auditor_gate(),
 )
 
 
