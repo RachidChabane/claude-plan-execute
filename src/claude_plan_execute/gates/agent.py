@@ -23,10 +23,19 @@ def _load_template(path_or_inline: str) -> str:
     `src/claude_plan_execute/gates/templates/<name>.md`. The dual-
     purpose form lets a registration pass either a path or an
     inline body without a discriminator field on Gate. (Plan §D7.)
+
+    On Python 3.8+, `Path.is_file()` raises OSError (ENAMETOOLONG)
+    for strings longer than the OS filename limit (~255 bytes on
+    macOS/Linux). Task 20's design-fidelity factory passes a multi-
+    KB rendered template body; OSError is treated as "not a file"
+    so the inline body falls through to verbatim-return.
     """
     p = Path(path_or_inline)
-    if p.is_file():
-        return p.read_text(encoding="utf-8")
+    try:
+        if p.is_file():
+            return p.read_text(encoding="utf-8")
+    except OSError:
+        pass
     return path_or_inline
 
 

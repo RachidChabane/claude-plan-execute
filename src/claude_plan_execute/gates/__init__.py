@@ -140,16 +140,29 @@ from claude_plan_execute.gates.agent import AgentGate  # noqa: E402
 def _when_matches(when: tuple[str, ...], task: dict) -> tuple[bool, str]:
     """Determine whether a Gate's `when` filter permits running for this task.
 
-    Task 11 supports:
+    Supported matchers:
       - empty tuple, or any tuple containing "always" → match.
-      - any other value                                → no match (deferred).
+      - "task_class:<name>" → matches when task["task_class"] == "<name>".
+        Multiple `task_class:<name>` tokens in the same `when` are OR-ed.
+      - any other token, in absence of "always" or a matching
+        task_class — no match (skipped with a passive-result reason).
 
     Future tasks add cases here:
-      - "task_class:<name>"  (task 20: design-fidelity)
       - "touches:<glob>"     (enhancement plan §2.1)
     """
     if not when or "always" in when:
         return True, "always"
+
+    actual = task.get("task_class")
+    class_tokens = [t for t in when if t.startswith("task_class:")]
+    if class_tokens:
+        wanted = {t[len("task_class:"):] for t in class_tokens}
+        if actual in wanted:
+            return True, f"task_class={actual!r}"
+        return False, (
+            f"task_class={actual!r} not in {sorted(wanted)}"
+        )
+
     return False, (
         f"when={list(when)} not implemented in v1 "
         f"(future task adds matchers)"

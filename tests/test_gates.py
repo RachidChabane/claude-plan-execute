@@ -177,14 +177,58 @@ def test_when_matches_empty_tuple_matches():
     assert ok is True
 
 
-def test_when_matches_unknown_does_not_match():
+def test_when_matches_task_class_matches_when_task_class_equals_name():
+    """Task 20: task_class:<name> is implemented; matches when the
+    task's effective class equals the named class."""
     ok, reason = _when_matches(("task_class:ui",), {"id": 1, "task_class": "ui"})
+    assert ok is True
+    assert "ui" in reason
+
+
+def test_when_matches_task_class_does_not_match_when_class_differs():
+    """Task 20: a task whose class doesn't equal the named class
+    is skipped with a clear reason."""
+    ok, reason = _when_matches(
+        ("task_class:ui",), {"id": 1, "task_class": "schema"},
+    )
     assert ok is False
-    assert "not implemented in v1" in reason
+    assert "schema" in reason
+    assert "ui" in reason
+
+
+def test_when_matches_task_class_does_not_match_when_class_unset():
+    """Task 20: a task with no task_class is skipped against a
+    task_class:<name> filter."""
+    ok, reason = _when_matches(
+        ("task_class:ui",), {"id": 1},
+    )
+    assert ok is False
+    assert "ui" in reason
+
+
+def test_when_matches_task_class_or_semantics_with_multiple_tokens():
+    """Task 20: multiple task_class:<name> tokens are OR-ed."""
+    ok, _ = _when_matches(
+        ("task_class:ui", "task_class:landing"),
+        {"id": 1, "task_class": "landing"},
+    )
+    assert ok is True
+
+
+def test_when_matches_always_wins_over_task_class():
+    """Task 20: 'always' anywhere in `when` short-circuits class
+    checking; gate runs even if the class doesn't match."""
+    ok, _ = _when_matches(
+        ("task_class:ui", "always"),
+        {"id": 1, "task_class": "schema"},
+    )
+    assert ok is True
 
 
 def test_when_matches_touches_glob_does_not_match_in_task_11():
-    """Task 11 defers `touches:<glob>` matchers."""
+    """Task 11 defers `touches:<glob>` matchers; task 20 does NOT add
+    them. Verifies non-task_class non-always tokens still fall through
+    to the 'not implemented' branch."""
     ok, _ = _when_matches(("touches:src/auth/**",), {"id": 1})
     assert ok is False
 
@@ -635,7 +679,10 @@ def test_run_gates_parallel_gates_can_run_concurrently(monkeypatch, tmp_path):
 
 
 def test_run_gates_when_filter_skips_with_passive_result(monkeypatch, tmp_path):
-    """Pin §D6: a gate with when=("task_class:ui",) is skipped in v1."""
+    """Pin task 20: a gate with when=('task_class:ui',) is skipped when
+    the task has no matching task_class. Task 20 implemented the matcher;
+    the test body's task fixture (no task_class set) still produces a
+    skip, exercising the negative path."""
     g = Gate(kind="shell", command=("true",), when=("task_class:ui",))
     results = run_gates(
         [("ui-only", g)],
@@ -648,7 +695,9 @@ def test_run_gates_when_filter_skips_with_passive_result(monkeypatch, tmp_path):
 
 
 def test_run_gates_skip_writes_output_file(monkeypatch, tmp_path):
-    """Pin §D16: skipped gates DO write output files for audit."""
+    """Pin §D16 (task 11): skipped gates DO write output files for
+    audit. Test fixture uses task_class:ui filter against a task
+    with no task_class — skip path exercised."""
     g = Gate(kind="shell", command=("true",), when=("task_class:ui",))
     run_gates(
         [("ui-only", g)],

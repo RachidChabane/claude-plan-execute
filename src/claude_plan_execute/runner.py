@@ -11,6 +11,7 @@ from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
 from claude_plan_execute.gates import Gate, default_registry, run_gates
 from claude_plan_execute.gates.builtin import (
+    make_design_fidelity_gate,
     make_lint_gate,
     make_tests_gate,
     make_untranslated_strings_gate,
@@ -118,6 +119,7 @@ def execute_task(
     test_command = resolved["test_command"]["value"]
     lint_command = resolved["lint_command"]["value"]
     untranslated_strings_command = resolved["untranslated_strings_command"]["value"]
+    dev_server_url = resolved["dev_server_url"]["value"]
     on_max_review_rounds = resolved["on_max_review_rounds"]["value"]
     skip_perms = cli.get("skip_permissions", False)
     verbose = cli.get("verbose", False)
@@ -343,6 +345,14 @@ def execute_task(
                             untranslated_strings_command,
                         ),
                     ))
+            elif name == "design-fidelity":
+                resolved_gates.append((
+                    name,
+                    make_design_fidelity_gate(
+                        dev_server_url=dev_server_url,
+                        persona=persona_section,
+                    ),
+                ))
             elif name == "invariant-grep":
                 for inv_name in invariant_names:
                     g = registry.get(inv_name)
@@ -370,9 +380,12 @@ def execute_task(
             ))
         if resolved_gates:
             print(f"\n{bold('--- Phase 4: Gates ---')}")
+            # Augment the task dict so phase-inherited task_class
+            # is visible to gate `when` filters (task 20 §D9).
+            task_for_gates = {**task, "task_class": task_class_name}
             gate_results = run_gates(
                 resolved_gates,
-                task=task,
+                task=task_for_gates,
                 task_dir=task_dir,
                 cli=cli,
             )

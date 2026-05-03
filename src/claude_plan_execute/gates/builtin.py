@@ -4,10 +4,11 @@ Exports two kinds of built-ins:
 
   - Factory functions for built-ins WITH per-task config:
     `make_tests_gate(test_command)`, `make_lint_gate(lint_command)`,
-    `make_untranslated_strings_gate(untranslated_strings_command)`.
+    `make_untranslated_strings_gate(untranslated_strings_command)`,
+    `make_design_fidelity_gate(*, dev_server_url, persona="")`.
     The runner calls these factories at gate-resolution time
-    inside `execute_task` (task 12 / 13 / 17 §D3); the resulting
-    Gates are NOT pre-registered on `default_registry()`.
+    inside `execute_task` (task 12 / 13 / 17 / 20 §D3); the
+    resulting Gates are NOT pre-registered on `default_registry()`.
 
   - Module-import-time registrations for built-ins WITHOUT
     per-task config: `test-critique` (task 15) and
@@ -15,15 +16,20 @@ Exports two kinds of built-ins:
     and registered on the default singleton when this module is
     imported (transitively via `runner.py` or directly in tests).
 
-The factory pattern and the import-time pattern coexist; the
-test-critique entry was the first of the import-time kind, and
-security-auditor (task 16) is the second. If a third built-in
-agent gate joins (e.g., design-fidelity — task 20), this
-module should refactor to a `_register_all_builtin_agents(registry)`
-helper; with two entries the explicit calls remain the simplest
-form. Likewise, with three shell factories the explicit if/elif
-chain in the runner's Phase-4 dispatch remains simpler than a
-name-keyed factory map; revisit at four.
+The factory pattern and the import-time pattern coexist:
+test-critique (task 15) and security-auditor (task 16) are
+import-time registrations on `default_registry()`. Task 20's
+`design-fidelity` ships as a FACTORY (per-project knobs:
+`dev_server_url`, persona) — same shape as `make_tests_gate` etc.
+The import-time count stays at two; the
+`_register_all_builtin_agents(registry)` refactor threshold
+("three or more import-time agent gates") has not been reached.
+Likewise the shell-factory if/elif chain in the runner's Phase-4
+dispatch reaches four entries (tests, lint, untranslated-strings,
+design-fidelity); this is the natural threshold for a name-keyed
+factory map, but with a single new entry shipping in this task
+we keep the explicit form to minimise churn — a follow-up
+refactor task can land the map.
 """
 from __future__ import annotations
 
@@ -125,6 +131,59 @@ def make_untranslated_strings_gate(
     )
 
 
+def make_design_fidelity_gate(
+    *, dev_server_url: str, persona: str = "",
+) -> Gate:
+    """Construct the `design-fidelity` Gate from a resolved
+    dev_server_url and a project persona block.
+
+    Sonnet/medium agent gate that drives the project's running dev
+    server through three viewports (320, 768, 1280) using the
+    preconfigured Playwright MCP tools, and reports semantic
+    design findings (no horizontal scroll, semantic structure,
+    touch targets ≥ 44 CSS-px on mobile, focus-visible rings,
+    contrast ratios, no overflow). See plans/task-20/plan.md §D5
+    for the knob choices.
+
+    The factory reads the shipped template at `gates/templates/
+    design-fidelity.md`, substitutes the `{dev_server_url}` and
+    `{persona}` placeholders with the supplied values, and
+    returns a Gate whose `prompt_template` is the rendered inline
+    body (NOT a path). `AgentGate._load_template` falls through
+    to verbatim-return for non-path strings, so the inline body
+    becomes the prompt body at gate-run time.
+
+    `parallel_safe=False` — the gate assumes exclusive use of the
+    running dev server (Playwright manipulates the shared browser
+    context). `run_gates` partitions parallel_safe=False into a
+    serial pool that runs first.
+
+    `when=("task_class:ui",)` — the gate only runs on tasks whose
+    effective class is `ui` (either set on the task or inherited
+    from the phase). `_when_matches` (gates/__init__.py) implements
+    the matcher; non-UI tasks skip with a passive PASS result.
+
+    The runner calls this factory inside `execute_task` (task 20
+    §D7) when it sees the name "design-fidelity" in the configured
+    gate-name list; the Gate is NOT pre-registered on
+    `default_registry()` because both inputs are per-project.
+    """
+    template_path = _TEMPLATES_DIR / "design-fidelity.md"
+    body = template_path.read_text(encoding="utf-8")
+    rendered = body.replace("{dev_server_url}", dev_server_url)
+    rendered = rendered.replace("{persona}", persona)
+    return Gate(
+        kind="agent",
+        prompt_template=rendered,
+        model="sonnet",
+        effort="medium",
+        timeout_minutes=10,
+        parallel_safe=False,
+        on_failure="block",
+        when=("task_class:ui",),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Built-in agent gates registered on default_registry() at import time
 # ---------------------------------------------------------------------------
@@ -207,6 +266,7 @@ default_registry().register(
 
 
 __all__ = [
+    "make_design_fidelity_gate",
     "make_lint_gate",
     "make_tests_gate",
     "make_untranslated_strings_gate",

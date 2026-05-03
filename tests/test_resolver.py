@@ -398,6 +398,7 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "decisions_dir",
         "invariants_file",
         "untranslated_strings_command",
+        "dev_server_url",
     )
     assert KEYS_TO_AUDIT == expected
 
@@ -411,6 +412,13 @@ def test_hardcoded_default_for_on_max_review_rounds_is_fail():
     """Task 6 §D1: modern hardcoded default is 'fail'. v1 compat is
     layered in by the loader, not by the resolver."""
     assert HARDCODED_DEFAULTS["on_max_review_rounds"] == "fail"
+
+
+def test_hardcoded_default_for_dev_server_url_is_localhost_5173():
+    """Task 20 §D6: hardcoded default URL is the Vite-style
+    http://localhost:5173. Other ports (3000 for Next.js, etc.)
+    require explicit project override."""
+    assert HARDCODED_DEFAULTS["dev_server_url"] == "http://localhost:5173"
 
 
 def test_resolve_returns_fail_when_no_layer_supplies_on_max_review_rounds():

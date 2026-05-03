@@ -56,6 +56,7 @@ class Defaults(BaseModel):
     persona_file: str | None = None
     decisions_dir: str | None = None
     invariants_file: str | None = None
+    dev_server_url: str | None = None
     gates: list[str] | None = None
     task_class_models: dict[str, TaskClassConfig] | None = None
     caps: Caps | None = None

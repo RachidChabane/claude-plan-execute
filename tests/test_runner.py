@@ -4544,3 +4544,264 @@ def test_execute_task_untranslated_strings_phase_extra_appended(
     )
     assert invoked == [["bash", "-c", "scripts/i18n.sh"]]
     assert state.get(1)["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# U. `design-fidelity` built-in agent gate integration (task 20)
+# ---------------------------------------------------------------------------
+
+# These tests exercise the runner's Phase-4 dispatch for the
+# `design-fidelity` factory and the integration with phase-
+# inherited task_class via task_for_gates augmentation. `run_claude`
+# is stubbed via `_patch_run_claude_for_agent_gate` (defined in
+# Section R). NO live browser, NO live dev server, NO real Playwright
+# MCP traffic.
+
+
+def test_execute_task_design_fidelity_runs_for_ui_task(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D7 / §D8: a task in a `ui` task_class triggers the gate;
+    the factory dispatch runs the AgentGate."""
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+        },
+        cli={}, skip_to="implement",
+    )
+    # Two run_claude calls: implementer + design-fidelity gate.
+    assert len(captured) == 2
+    gate_call = captured[1]
+    assert gate_call[1]["model"] == "sonnet"
+    assert gate_call[1]["effort"] == "medium"
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_design_fidelity_skipped_for_non_ui_task(
+    monkeypatch, tmp_path, _clean_default_registry, capsys,
+):
+    """Pin §D8: a non-UI task skips the gate via the task_class:ui
+    filter. The runner's stdout shows the 'Skipping gate' message."""
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="schema"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Skipping gate 'design-fidelity'" in out
+    # Implementer ran but the gate did not.
+    assert len(captured) == 1
+    # The skipped gate writes a passive PASS output file.
+    assert (tmp_path / "task-1" / "gates" / "design-fidelity.txt").is_file()
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_design_fidelity_skipped_for_no_class_task(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D9: a task with no task_class (and no phase-inherited
+    class) skips the gate. The augmentation logic still injects the
+    None resolved class; _when_matches handles None correctly."""
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,                    # NO task_class
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+        },
+        cli={}, skip_to="implement",
+    )
+    # Implementer only.
+    assert len(captured) == 1
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_design_fidelity_uses_phase_inherited_task_class(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D9: a task without a per-task task_class but a phase
+    `defaults: { task_class: ui }` triggers the gate via phase
+    inheritance. Without the runner's task_for_gates augmentation,
+    this would skip incorrectly."""
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="ui"), state,        # NO per-task task_class
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+        },
+        cli={},
+        phases_by_id={
+            "ui": {"id": "ui", "defaults": {"task_class": "ui"}},
+        },
+        task_class_models={"ui": {"model": "sonnet", "effort": "medium"}},
+        skip_to="implement",
+    )
+    # Implementer + gate.
+    assert len(captured) == 2
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_design_fidelity_uses_resolved_dev_server_url(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D6: the resolved dev_server_url is substituted into
+    the gate's prompt body. With project_defaults setting
+    dev_server_url, the gate's run_claude call sees a prompt
+    containing the configured URL."""
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+            "dev_server_url": "http://example.test:8080",
+        },
+        cli={}, skip_to="implement",
+    )
+    gate_prompt = captured[1][0]
+    assert "http://example.test:8080" in gate_prompt
+
+
+def test_execute_task_design_fidelity_uses_hardcoded_default_url_when_unset(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D6: when no project override is set, the hardcoded
+    default URL (http://localhost:5173) flows into the gate's prompt."""
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+        },
+        cli={}, skip_to="implement",
+    )
+    gate_prompt = captured[1][0]
+    assert "http://localhost:5173" in gate_prompt
+
+
+def test_execute_task_design_fidelity_failure_blocks_with_gate_failed(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin task description ('On FAIL, the gate writes its findings
+    to plans/task-{id}/gates/design-fidelity.txt; the next implement
+    attempt sees the verbatim findings'): a FAIL verdict produces a
+    FailureRecord whose verbatim contains the agent's findings."""
+    fail_text = (
+        "## Verdict: FAIL\n\n"
+        "## Findings\n\n"
+        "**[A] - / on 320×800**\n"
+        "Risk: horizontal scroll on mobile\n"
+        "Fix: tighten layout\n"
+    )
+    _patch_run_claude_for_agent_gate(monkeypatch, text=fail_text)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"
+    assert rec["phase"] == "gate"
+    assert "horizontal scroll on mobile" in rec["verbatim"]
+    assert "gate:design-fidelity" in rec["artifacts"]
+
+
+def test_execute_task_design_fidelity_does_NOT_warn_as_unknown(
+    monkeypatch, tmp_path, _clean_default_registry, capsys,
+):
+    """Pin §D7: design-fidelity is found via the elif factory branch
+    (not through registry.get) so no Unknown gate(s) warning fires."""
+    _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s)" not in out
+
+
+def test_execute_task_design_fidelity_persona_section_flows_into_prompt(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D2: the persona section loaded by the runner flows
+    through the factory into the gate's prompt body."""
+    persona_file = tmp_path / "persona.md"
+    persona_file.write_text("# Project conventions\n\n8-pt grid.\n")
+
+    captured = _patch_run_claude_for_agent_gate(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+            "persona_file": str(persona_file),
+        },
+        cli={}, skip_to="implement",
+    )
+    gate_prompt = captured[1][0]
+    assert "8-pt grid" in gate_prompt
+
+
+def test_execute_task_design_fidelity_skipped_when_implementer_timed_out(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin task 11 §D12 carry-forward: implementer_timeout returns
+    BEFORE the gate run, so design-fidelity does not fire."""
+    _patch_run_claude_simulating_timeout(monkeypatch)
+    gate_called: list[bool] = []
+    def gate_stub(prompt, **kwargs):
+        gate_called.append(True)
+        return 0, "VERDICT: PASS"
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", gate_stub,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-fidelity"],
+        },
+        cli={}, skip_to="implement",
+    )
+    assert gate_called == []
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["block_reason"] == "implementer_timeout"

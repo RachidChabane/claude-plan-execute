@@ -673,3 +673,26 @@ def test_typo_untranslated_strings_cmd_suggests_full_form(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "untranslated_strings_cmd" in err
     assert "Did you mean 'untranslated_strings_command'?" in err
+
+
+# --- J. dev_server_url field (task 20) -------------------------------------
+
+def test_defaults_accepts_dev_server_url():
+    """Task 20 §D6: Defaults.dev_server_url is a typed string field."""
+    d = Defaults(dev_server_url="http://localhost:3000")
+    assert d.dev_server_url == "http://localhost:3000"
+
+
+def test_defaults_dev_server_url_defaults_to_None():
+    """Task 20 §D6: when unset, Defaults.dev_server_url is None.
+    The hardcoded fallback lives in config.HARDCODED_DEFAULTS."""
+    d = Defaults()
+    assert d.dev_server_url is None
+
+
+def test_defaults_rejects_unknown_dev_server_url_typo():
+    """Task 20 §D6: Defaults uses extra='forbid'. A typo like
+    'dev_servr_url' surfaces as a validation error with a
+    suggested-correction message."""
+    with pytest.raises(ValidationError):
+        Defaults(dev_servr_url="http://localhost:3000")
