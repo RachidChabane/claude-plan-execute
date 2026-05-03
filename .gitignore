@@ -1,1 +1,16 @@
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+build/
+dist/
+
+# Project artefacts
+plans/
+.idea/
+*.egg-info
+src/*.egg-info

@@ -1,0 +1,40 @@
+version: 2
+defaults:
+  model: opus
+  effort: max
+  test_command: "pytest -q"
+  plans_dir: plans
+  task_class_models:
+    schema:    { model: opus,   effort: max }
+    ui:        { model: sonnet, effort: medium }
+    polish:    { model: haiku,  effort: medium }
+  caps:
+    max_minutes_per_phase: 45
+    max_review_rounds: 3
+    max_implement_turns: 200
+    max_attempts: 3
+  on_max_review_rounds: fail
+
+phases:
+  - id: foundation
+    title: "Foundation"
+    defaults: { task_class: schema }
+  - id: ui-polish
+    title: "UI polish"
+    defaults: { task_class: ui }
+
+tasks:
+  - id: 1
+    phase: foundation
+    title: "Bootstrap"
+    description: "First task"
+  - id: 2
+    phase: ui-polish
+    title: "UI"
+    description: "Second"
+    task_class: polish        # explicit override of phase-inherited class
+    depends_on: [1]
+  - id: 3
+    title: "Standalone"
+    description: "Third — no phase, no class"
+    model: sonnet             # explicit per-task override

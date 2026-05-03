@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Shim that runs the repo's root claude-plan-execute script.
+
+For users who prefer symlinking from `bin/` rather than the repo root.
+Requires `pip install -e .` so the `claude_plan_execute` package is importable
+from the root script.
+"""
+from __future__ import annotations
+
+import runpy
+import sys
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parent.parent / "claude-plan-execute"
+
+if __name__ == "__main__":
+    sys.argv[0] = str(SCRIPT)
+    runpy.run_path(str(SCRIPT), run_name="__main__")

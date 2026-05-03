@@ -607,7 +607,7 @@ body::before {
 }
 
 .task-card.expanded .task-body {
-  max-height: 600px;
+  max-height: 2000px;
 }
 
 .task-body-inner {
@@ -835,6 +835,316 @@ body::before {
   transition: opacity 0.15s;
 }
 [data-tooltip]:hover::after { opacity: 1; }
+
+/* Allow the expanded body to scroll when the resolved-config <details>
+   opens. Without this override, the existing max-height: 600px +
+   overflow: hidden clips long audit tables. */
+.task-card.expanded .task-body {
+  overflow-y: auto;
+}
+
+/* Resolved config block */
+.resolved-config-block {
+  margin: 12px 0 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.resolved-config-block summary {
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-tertiary);
+  padding: 4px 0;
+  list-style: none;
+}
+.resolved-config-block summary::-webkit-details-marker { display: none; }
+.resolved-config-block summary::before {
+  content: "›";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s;
+  color: var(--text-tertiary);
+}
+.resolved-config-block[open] summary::before { transform: rotate(90deg); }
+
+.resolved-config-content {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.rcfg-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.rcfg-table th,
+.rcfg-table td {
+  padding: 4px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: top;
+}
+.rcfg-table th {
+  font-weight: 500;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.rcfg-table td:first-child { color: var(--text-secondary); }
+.rcfg-table td:nth-child(2) { color: var(--text-primary); }
+.rcfg-table td:nth-child(3) { color: var(--text-tertiary); }
+
+/* Provenance colour-coding */
+.from-cli            { color: var(--accent-blue) !important; }
+.from-task           { color: var(--accent-green) !important; }
+.from-task-class     { color: var(--accent-violet) !important; }
+.from-phase          { color: var(--accent-amber) !important; }
+.from-project        { color: var(--text-secondary) !important; }
+.from-hardcoded      { color: var(--text-tertiary) !important; }
+.from-unset          { color: var(--accent-red) !important; font-style: italic; }
+
+/* ── Tab bar ── */
+.task-tabs {
+  display: flex;
+  gap: 0;
+  margin: 14px 0 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.task-tab {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  padding: 6px 14px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: all 0.15s;
+  margin-bottom: -1px;
+}
+
+.task-tab:hover { color: var(--text-secondary); }
+
+.task-tab.active {
+  color: var(--accent-blue);
+  border-bottom-color: var(--accent-blue);
+}
+
+.task-tab-panel { display: none; padding-top: 10px; }
+.task-tab-panel.active { display: block; }
+
+/* ── Gates panel ── */
+.gate-list { display: flex; flex-direction: column; gap: 4px; }
+
+.gate-item {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.gate-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  background: var(--bg-deep);
+  user-select: none;
+}
+
+.gate-header:hover { background: var(--bg-hover); }
+
+.gate-status-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.gate-status-dot.pass    { background: var(--accent-green); }
+.gate-status-dot.fail    { background: var(--accent-red); }
+.gate-status-dot.unknown { background: var(--text-tertiary); }
+
+.gate-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  flex: 1;
+}
+
+.gate-size {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+.gate-expand-icon {
+  font-size: 14px;
+  color: var(--text-tertiary);
+  transition: transform 0.15s;
+}
+.gate-item.open .gate-expand-icon { transform: rotate(90deg); }
+
+.gate-output {
+  display: none;
+  padding: 10px;
+  background: var(--bg-deep);
+  border-top: 1px solid var(--border-subtle);
+}
+.gate-item.open .gate-output { display: block; }
+
+.gate-output pre {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 300px;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+
+/* ── Failures panel ── */
+.failure-empty {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+  padding: 8px 0;
+  font-style: italic;
+}
+
+.attempt-list { display: flex; flex-direction: column; gap: 6px; }
+
+.attempt-item {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.attempt-item.attempt-blocking { border-color: rgba(248,113,113,0.2); }
+
+.attempt-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  background: var(--bg-deep);
+  user-select: none;
+}
+.attempt-header:hover { background: var(--bg-hover); }
+
+.attempt-number {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  min-width: 20px;
+}
+
+.attempt-class {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--accent-red-dim);
+  color: var(--accent-red);
+  flex-shrink: 0;
+}
+
+.attempt-phase {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+.attempt-timestamp {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  margin-left: auto;
+}
+
+.attempt-expand-icon {
+  font-size: 14px;
+  color: var(--text-tertiary);
+  transition: transform 0.15s;
+}
+.attempt-item.open .attempt-expand-icon { transform: rotate(90deg); }
+
+.attempt-body {
+  display: none;
+  padding: 10px;
+  background: var(--bg-deep);
+  border-top: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.attempt-item.open .attempt-body { display: block; }
+
+.attempt-reason {
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+}
+
+.hypothesis-block {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: rgba(96,165,250,0.06);
+  border: 1px solid rgba(96,165,250,0.15);
+  margin: 8px 0;
+}
+.hypothesis-label {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--accent-blue);
+  margin-bottom: 4px;
+}
+.hypothesis-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.attempt-verbatim summary {
+  cursor: pointer;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-tertiary);
+  list-style: none;
+  padding: 4px 0;
+  user-select: none;
+}
+.attempt-verbatim summary::-webkit-details-marker { display: none; }
+.attempt-verbatim summary::before {
+  content: "›";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s;
+}
+.attempt-verbatim[open] summary::before { transform: rotate(90deg); }
+
+.attempt-verbatim pre {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+  margin-top: 6px;
+  line-height: 1.5;
+}
 </style>
 </head>
 <body>
@@ -1075,6 +1385,20 @@ function renderTasks() {
             ${ts.review_round ? `<span class="task-meta-item"><strong>review round:</strong> ${ts.review_round}</span>` : ''}
             ${ts.plan_path ? `<span class="task-meta-item"><strong>plan:</strong> ${esc(ts.plan_path)}</span>` : ''}
           </div>
+          <div class="task-tabs">
+            <button class="task-tab active" onclick="switchTab(${task.id}, 'config', this)">Config</button>
+            <button class="task-tab" onclick="switchTab(${task.id}, 'gates', this)">Gates</button>
+            <button class="task-tab" onclick="switchTab(${task.id}, 'failures', this)">Failures</button>
+          </div>
+          <div class="task-tab-panel active" data-tab="config" data-task-id="${task.id}">
+            <div class="resolved-config-content"><em>Expand to load…</em></div>
+          </div>
+          <div class="task-tab-panel" data-tab="gates" data-task-id="${task.id}">
+            <div class="gates-content"></div>
+          </div>
+          <div class="task-tab-panel" data-tab="failures" data-task-id="${task.id}">
+            <div class="failures-content"></div>
+          </div>
           <div class="task-actions">
             ${status !== 'done' ? `
               <button class="btn btn-sm btn-primary" onclick="runTask(${task.id})">
@@ -1163,13 +1487,175 @@ function updateUI() {
     pips[2].className = `phase-pip ${phases.impl}`;
   });
   updateStats();
+
+  document.querySelectorAll('.task-tab-panel[data-tab="failures"].active').forEach(panel => {
+    const taskId = panel.dataset.taskId;
+    if (taskId) renderFailuresPanel(taskId, panel);
+  });
+
+  document.querySelectorAll('.task-tab-panel[data-tab="gates"]').forEach(panel => {
+    const taskId = panel.dataset.taskId;
+    const ts = state.tasks?.[taskId] || {};
+    if (isActive(ts.status)) {
+      const content = panel.querySelector('.gates-content');
+      if (content) delete content.dataset.loaded;
+    }
+  });
 }
 
 // ── Interactions ──
 
 function toggleTask(id) {
   const card = document.querySelector(`.task-card[data-id="${id}"]`);
-  if (card) card.classList.toggle('expanded');
+  if (!card) return;
+  const wasExpanded = card.classList.contains('expanded');
+  card.classList.toggle('expanded');
+  if (!wasExpanded) {
+    const configPanel = card.querySelector('.task-tab-panel[data-tab="config"]');
+    if (configPanel) loadConfigPanel(id, configPanel);
+  }
+}
+
+function switchTab(taskId, tabName, btnEl) {
+  const card = document.querySelector(`.task-card[data-id="${taskId}"]`);
+  if (!card) return;
+  card.querySelectorAll('.task-tab').forEach(b => b.classList.remove('active'));
+  card.querySelectorAll('.task-tab-panel').forEach(p => p.classList.remove('active'));
+  btnEl.classList.add('active');
+  const panel = card.querySelector(`.task-tab-panel[data-tab="${tabName}"]`);
+  if (!panel) return;
+  panel.classList.add('active');
+  if (tabName === 'config')   loadConfigPanel(taskId, panel);
+  if (tabName === 'gates')    loadGatesPanel(taskId, panel);
+  if (tabName === 'failures') renderFailuresPanel(taskId, panel);
+}
+
+async function loadConfigPanel(taskId, panelEl) {
+  const content = panelEl.querySelector('.resolved-config-content');
+  if (!content || content.dataset.loaded === '1') return;
+  content.innerHTML = '<em>Loading…</em>';
+  const data = await api(`/api/resolved-config/${encodeURIComponent(taskId)}`);
+  if (!data || data.error) {
+    content.innerHTML = '<em>Not yet generated. Run the task to produce it.</em>';
+    return;
+  }
+  let rows = '';
+  for (const [key, info] of Object.entries(data)) {
+    const fromLabel = String(info.from || 'unset');
+    const rawKind = fromLabel.split(':')[0];
+    const fromKind = (rawKind === 'project_defaults' ? 'project' : rawKind).replace(/_/g, '-');
+    const valueText = (info.value === null || info.value === undefined)
+      ? '<em>null</em>'
+      : esc(typeof info.value === 'string' ? info.value : JSON.stringify(info.value));
+    rows += `<tr>
+      <td>${esc(key)}</td>
+      <td>${valueText}</td>
+      <td class="from-${fromKind}">${esc(fromLabel)}</td>
+    </tr>`;
+  }
+  content.innerHTML = `
+    <table class="rcfg-table">
+      <thead><tr><th>key</th><th>value</th><th>from</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  content.dataset.loaded = '1';
+}
+
+function gateStatus(taskId, gateName) {
+  const ts = state.tasks?.[String(taskId)] || {};
+  if (ts.status === 'done') return 'pass';
+  for (const a of (ts.attempts || [])) {
+    if (a.artifacts?.[`gate:${gateName}`]) return 'fail';
+  }
+  return 'unknown';
+}
+
+async function loadGatesPanel(taskId, panelEl) {
+  const content = panelEl.querySelector('.gates-content');
+  if (!content || content.dataset.loaded === '1') return;
+  content.innerHTML = '<em>Loading…</em>';
+  const data = await api(`/api/gates/${encodeURIComponent(taskId)}`);
+  if (!data) {
+    content.innerHTML = '<em>Could not load gate data.</em>';
+    return;
+  }
+  if (!data.gates || data.gates.length === 0) {
+    content.innerHTML = '<span class="failure-empty">No gate output files found.</span>';
+    content.dataset.loaded = '1';
+    return;
+  }
+  const items = data.gates.map(g => `
+    <div class="gate-item" id="gate-${taskId}-${g.name}">
+      <div class="gate-header" onclick="toggleGate(${taskId}, '${g.name}')">
+        <div class="gate-status-dot ${gateStatus(taskId, g.name)}"></div>
+        <span class="gate-name">${esc(g.name)}</span>
+        <span class="gate-size">${g.size}b</span>
+        <span class="gate-expand-icon">&#x203A;</span>
+      </div>
+      <div class="gate-output" data-task-id="${taskId}" data-gate-name="${esc(g.name)}">
+        <pre><em>Loading…</em></pre>
+      </div>
+    </div>`).join('');
+  content.innerHTML = `<div class="gate-list">${items}</div>`;
+  content.dataset.loaded = '1';
+}
+
+function toggleGate(taskId, gateName) {
+  const item = document.getElementById(`gate-${taskId}-${gateName}`);
+  if (!item) return;
+  item.classList.toggle('open');
+  if (item.classList.contains('open')) {
+    loadGateOutput(taskId, gateName, item.querySelector('.gate-output'));
+  }
+}
+
+async function loadGateOutput(taskId, gateName, outputEl) {
+  if (!outputEl || outputEl.dataset.loaded === '1') return;
+  const data = await api(`/api/gates/${encodeURIComponent(taskId)}/${encodeURIComponent(gateName)}`);
+  if (!data || data.error) {
+    outputEl.innerHTML = '<pre><em>Could not load output.</em></pre>';
+    return;
+  }
+  outputEl.innerHTML = `<pre>${esc(data.content)}</pre>`;
+  outputEl.dataset.loaded = '1';
+}
+
+function renderFailuresPanel(taskId, panelEl) {
+  const content = panelEl.querySelector('.failures-content');
+  if (!content) return;
+  const ts = state.tasks?.[String(taskId)] || {};
+  const attempts = ts.attempts || [];
+  if (attempts.length === 0) {
+    content.innerHTML = '<span class="failure-empty">No failures recorded.</span>';
+    return;
+  }
+  content.innerHTML = `<div class="attempt-list">${attempts.map((a, i) => `
+    <div class="attempt-item attempt-blocking">
+      <div class="attempt-header" onclick="toggleAttempt(this.parentElement)">
+        <span class="attempt-number">#${i + 1}</span>
+        <span class="attempt-class">${esc(a.failure_class || 'unknown')}</span>
+        <span class="attempt-phase">${esc(a.phase || '')}</span>
+        <span class="attempt-timestamp">${esc((a.timestamp || '').replace('T', ' ').slice(0, 19))}</span>
+        <span class="attempt-expand-icon">&#x203A;</span>
+      </div>
+      <div class="attempt-body">
+        <div class="attempt-reason">${esc(a.reason || '')}</div>
+        ${a.hypothesis ? `
+          <div class="hypothesis-block">
+            <div class="hypothesis-label">Hypothesis</div>
+            <div class="hypothesis-text">${esc(a.hypothesis)}</div>
+          </div>` : ''}
+        ${a.verbatim ? `
+          <details class="attempt-verbatim">
+            <summary>Verbatim output</summary>
+            <pre>${esc(a.verbatim)}</pre>
+          </details>` : ''}
+      </div>
+    </div>`).join('')}</div>`;
+}
+
+function toggleAttempt(itemEl) {
+  itemEl.classList.toggle('open');
 }
 
 async function runAll() {

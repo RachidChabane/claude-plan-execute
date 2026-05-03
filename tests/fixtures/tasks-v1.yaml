@@ -1,0 +1,19 @@
+version: 1
+defaults:
+  model: opus
+  effort: max
+  plans_dir: plans
+  test_command: pytest
+  max_review_rounds: 3
+  plan_timeout_minutes: 20
+  review_timeout_minutes: 15
+  implement_timeout_minutes: 60
+  implement_max_turns: 200
+tasks:
+  - id: 1
+    title: "T1"
+    description: "D1"
+  - id: 2
+    title: "T2"
+    description: "D2"
+    depends_on: [1]
