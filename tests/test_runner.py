@@ -4107,3 +4107,440 @@ def test_execute_task_security_auditor_skipped_when_implementer_timed_out(
     assert gate_called == []
     assert state.get(1)["status"] == "blocked"
     assert state.get(1)["block_reason"] == "implementer_timeout"
+
+
+# ---------------------------------------------------------------------------
+# T. `untranslated-strings` built-in gate integration (task 17)
+# ---------------------------------------------------------------------------
+
+# These tests do NOT use the _clean_default_registry fixture. The runner's
+# special-case for `untranslated-strings` (task 17 §D3) constructs the
+# Gate via make_untranslated_strings_gate(...) WITHOUT consulting
+# default_registry — the fixture's emptiness is irrelevant for the
+# `untranslated-strings` path. (See §D13.)
+
+
+def test_execute_task_untranslated_strings_gate_runs_resolved_command(
+    monkeypatch, tmp_path,
+):
+    """Pin §D2 / §D3: when 'untranslated-strings' is in the gate
+    list and untranslated_strings_command is set, the runner
+    constructs the Gate with command=('bash', '-c', <cmd>) using
+    the resolved value from the resolver chain."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings"],
+            "untranslated_strings_command": "scripts/i18n.sh",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", "scripts/i18n.sh"]]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_untranslated_strings_gate_uses_per_task_command(
+    monkeypatch, tmp_path,
+):
+    """Pin §D6: per-task untranslated_strings_command override is
+    what the gate runs."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(
+            id=1,
+            untranslated_strings_command="python tools/check_i18n.py --strict",
+        ),
+        state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings"],
+            "untranslated_strings_command": "scripts/i18n.sh",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == [
+        ["bash", "-c", "python tools/check_i18n.py --strict"]
+    ]
+
+
+def test_execute_task_untranslated_strings_gate_failure_blocks_and_records(
+    monkeypatch, tmp_path,
+):
+    """Pin §D10 / task 11 §D12: a failing untranslated-strings
+    gate blocks the task with block_reason='gate_failed' and
+    records a FailureRecord."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 1
+        p.stdout = "Untranslated key found: src/locales/en.json:42 'submit_button'\n"
+        p.stderr = "1 untranslated key\n"
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings"],
+            "untranslated_strings_command": "scripts/i18n.sh",
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    assert len(entry["attempts"]) == 1
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"
+    assert rec["phase"] == "gate"
+    assert "submit_button" in rec["verbatim"]
+    assert "gate:untranslated-strings" in rec["artifacts"]
+
+
+def test_execute_task_untranslated_strings_gate_writes_output_file(
+    monkeypatch, tmp_path,
+):
+    """Pin task 11 §D8: the gate's output is captured to
+    plans/task-{id}/gates/untranslated-strings.txt."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "I18N_OUTPUT_MARKER\n"
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings"],
+            "untranslated_strings_command": "scripts/i18n.sh",
+        },
+        cli={}, skip_to="implement",
+    )
+    out_file = tmp_path / "task-1" / "gates" / "untranslated-strings.txt"
+    assert out_file.is_file()
+    assert "I18N_OUTPUT_MARKER" in out_file.read_text()
+
+
+def test_execute_task_untranslated_strings_unconfigured_warns_and_skips(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D2: untranslated_strings_command is None (no layer set
+    it) → runner prints the unconfigured warning and does NOT add
+    the gate to the resolved list. The task still reaches done."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings"],
+            # NO untranslated_strings_command — None across the chain.
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert (
+        "Skipping gate 'untranslated-strings': no "
+        "defaults.untranslated_strings_command configured."
+    ) in out
+    assert invoked == []                          # gate never built
+    assert state.get(1)["status"] == "done"
+    # No FailureRecord written for the warn-skip path:
+    assert state.get(1)["attempts"] == []
+
+
+def test_execute_task_untranslated_strings_explicit_empty_command_runs_noop(
+    monkeypatch, tmp_path,
+):
+    """Pin §D2 / §D5: an explicit
+    defaults.untranslated_strings_command: '' (empty string) is a
+    valid 'no-op' choice — the factory builds the Gate and `bash
+    -c ''` exits 0. Distinguishes from the None case (which warns
+    and skips)."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings"],
+            "untranslated_strings_command": "",   # explicit empty string
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", ""]]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_untranslated_strings_unconfigured_warning_does_not_double_print(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D2: the warning fires once even if
+    `untranslated-strings` is listed multiple times (e.g.,
+    gates: [untranslated-strings, untranslated-strings])."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings", "untranslated-strings"],
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert out.count("Skipping gate 'untranslated-strings':") == 1
+
+
+def test_execute_task_untranslated_strings_name_does_NOT_warn_as_unknown(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D3: the runner's special-case prevents
+    'untranslated-strings' from being reported as an unknown-gate
+    name. Pre-task-17 the empty-registry path warned for
+    'untranslated-strings'; task 17 makes the unknown-gate warning
+    silent for the literal name 'untranslated-strings'."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings"],
+            "untranslated_strings_command": "scripts/i18n.sh",
+        },
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s) skipped" not in out
+
+
+def test_execute_task_untranslated_strings_gate_skipped_when_implementer_timed_out(
+    monkeypatch, tmp_path,
+):
+    """Pin task 11 §D12 carry-forward: implementer_timeout returns
+    BEFORE the gate run, so the untranslated-strings gate does not
+    fire."""
+    invoked = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(cmd)
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_timeout(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["untranslated-strings"],
+            "untranslated_strings_command": "scripts/i18n.sh",
+        },
+        cli={}, skip_to="implement",
+    )
+    assert invoked == []
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["block_reason"] == "implementer_timeout"
+
+
+def test_execute_task_untranslated_strings_runs_alongside_tests_and_lint_in_parallel(
+    monkeypatch, tmp_path,
+):
+    """Pin §D10: tests, lint, and untranslated-strings are all
+    parallel_safe → they end up in the parallel pool. We can't
+    test concurrency deterministically in unit tests, but we can
+    verify all three subprocess.run invocations happen and all
+    three gate output files are written."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "ok\n"
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests", "lint", "untranslated-strings"],
+            "test_command": "pytest -q",
+            "lint_command": "ruff check",
+            "untranslated_strings_command": "scripts/i18n.sh",
+        },
+        cli={}, skip_to="implement",
+    )
+    cmds = sorted(c[2] for c in invoked)
+    assert cmds == ["pytest -q", "ruff check", "scripts/i18n.sh"]
+    assert (tmp_path / "task-1" / "gates" / "tests.txt").is_file()
+    assert (tmp_path / "task-1" / "gates" / "lint.txt").is_file()
+    assert (tmp_path / "task-1" / "gates" / "untranslated-strings.txt").is_file()
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_untranslated_strings_phase_extra_appended(
+    monkeypatch, tmp_path,
+):
+    """Pin task 11 §D12 + §D3: a phase's
+    gates_extra=['untranslated-strings'] is appended to project
+    gates and resolves through the same special-case dispatch."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": [],
+            "untranslated_strings_command": "scripts/i18n.sh",
+        },
+        cli={},
+        phases_by_id={
+            "ui": {
+                "id": "ui",
+                "defaults": {"gates_extra": ["untranslated-strings"]},
+            },
+        },
+        skip_to="implement",
+    )
+    assert invoked == [["bash", "-c", "scripts/i18n.sh"]]
+    assert state.get(1)["status"] == "done"

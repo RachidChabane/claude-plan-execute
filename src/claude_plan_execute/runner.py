@@ -13,6 +13,7 @@ from claude_plan_execute.gates import Gate, default_registry, run_gates
 from claude_plan_execute.gates.builtin import (
     make_lint_gate,
     make_tests_gate,
+    make_untranslated_strings_gate,
 )
 from claude_plan_execute.loader import (
     load_decisions_index,
@@ -116,6 +117,7 @@ def execute_task(
     impl_turns = int(resolved["implement_max_turns"]["value"])
     test_command = resolved["test_command"]["value"]
     lint_command = resolved["lint_command"]["value"]
+    untranslated_strings_command = resolved["untranslated_strings_command"]["value"]
     on_max_review_rounds = resolved["on_max_review_rounds"]["value"]
     skip_perms = cli.get("skip_permissions", False)
     verbose = cli.get("verbose", False)
@@ -322,6 +324,7 @@ def execute_task(
         resolved_gates: list[tuple[str, Gate]] = []
         unknown_gates: list[str] = []
         unconfigured_lint = False
+        unconfigured_untranslated_strings = False
         for name in gate_names:
             if name == "tests":
                 resolved_gates.append((name, make_tests_gate(test_command)))
@@ -330,6 +333,16 @@ def execute_task(
                     unconfigured_lint = True
                 else:
                     resolved_gates.append((name, make_lint_gate(lint_command)))
+            elif name == "untranslated-strings":
+                if untranslated_strings_command is None:
+                    unconfigured_untranslated_strings = True
+                else:
+                    resolved_gates.append((
+                        name,
+                        make_untranslated_strings_gate(
+                            untranslated_strings_command,
+                        ),
+                    ))
             elif name == "invariant-grep":
                 for inv_name in invariant_names:
                     g = registry.get(inv_name)
@@ -345,10 +358,15 @@ def execute_task(
             print(yellow(
                 "  Skipping gate 'lint': no defaults.lint_command configured."
             ))
+        if unconfigured_untranslated_strings:
+            print(yellow(
+                "  Skipping gate 'untranslated-strings': no "
+                "defaults.untranslated_strings_command configured."
+            ))
         if unknown_gates:
             print(yellow(
                 f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
-                f"(not registered; task 17 adds built-ins)"
+                f"(not registered; check spelling)"
             ))
         if resolved_gates:
             print(f"\n{bold('--- Phase 4: Gates ---')}")

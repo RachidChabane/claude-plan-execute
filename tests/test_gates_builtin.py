@@ -482,3 +482,100 @@ def test_test_critique_and_security_auditor_are_both_registered():
     names = default_registry().names()
     assert "test-critique" in names
     assert "security-auditor" in names
+
+
+# ---------------------------------------------------------------------------
+# I. make_untranslated_strings_gate basic shape (task 17)
+# ---------------------------------------------------------------------------
+
+from claude_plan_execute.gates.builtin import make_untranslated_strings_gate
+
+
+def test_make_untranslated_strings_gate_returns_a_Gate():
+    g = make_untranslated_strings_gate("scripts/i18n.sh")
+    assert isinstance(g, Gate)
+
+
+def test_make_untranslated_strings_gate_kind_is_shell():
+    """Pin §D4: untranslated-strings gate is a shell gate (not agent)."""
+    assert make_untranslated_strings_gate("scripts/i18n.sh").kind == "shell"
+
+
+def test_make_untranslated_strings_gate_command_uses_bash_minus_c():
+    """Pin §D4: command is wrapped in ('bash', '-c',
+    untranslated_strings_command) to preserve shell semantics
+    (pipelines, &&, env vars, redirection)."""
+    g = make_untranslated_strings_gate("scripts/i18n.sh")
+    assert g.command == ("bash", "-c", "scripts/i18n.sh")
+
+
+def test_make_untranslated_strings_gate_preserves_pipeline_command_verbatim():
+    """Pin §D4: shell pipelines like 'scripts/i18n.sh && python
+    tools/check_locales.py' must NOT be pre-split (shlex.split
+    would be a silent regression)."""
+    cmd = "scripts/i18n.sh && python tools/check_locales.py"
+    g = make_untranslated_strings_gate(cmd)
+    assert g.command == ("bash", "-c", cmd)
+
+
+def test_make_untranslated_strings_gate_preserves_grep_one_liner_verbatim():
+    """Pin §D4: a one-liner like grep -RIn 'TODO\\(i18n\\)' src/
+    is a valid shape for this gate; the factory must hand bash
+    the verbatim string."""
+    cmd = r"grep -RIn 'TODO\(i18n\)' src/ && exit 1 || exit 0"
+    g = make_untranslated_strings_gate(cmd)
+    assert g.command == ("bash", "-c", cmd)
+
+
+def test_make_untranslated_strings_gate_handles_empty_string_command():
+    """Pin §D5: an empty untranslated_strings_command produces a
+    no-op gate (`bash -c ''` exits 0). The factory itself does no
+    validation; the runner's None-vs-'' discriminator (§D2) decides
+    whether to call the factory at all."""
+    g = make_untranslated_strings_gate("")
+    assert g.command == ("bash", "-c", "")
+
+
+def test_make_untranslated_strings_gate_default_timeout_is_10_minutes():
+    assert make_untranslated_strings_gate(
+        "scripts/i18n.sh"
+    ).timeout_minutes == 10
+
+
+def test_make_untranslated_strings_gate_default_parallel_safe_is_true():
+    assert make_untranslated_strings_gate(
+        "scripts/i18n.sh"
+    ).parallel_safe is True
+
+
+def test_make_untranslated_strings_gate_default_on_failure_is_block():
+    assert make_untranslated_strings_gate(
+        "scripts/i18n.sh"
+    ).on_failure == "block"
+
+
+def test_make_untranslated_strings_gate_default_when_is_always():
+    assert make_untranslated_strings_gate(
+        "scripts/i18n.sh"
+    ).when == ("always",)
+
+
+def test_make_untranslated_strings_gate_returns_a_frozen_Gate():
+    """Pin: the returned Gate inherits the dataclass frozen
+    semantics (Gate is frozen by task 11 §D1). A caller that tries
+    to mutate the result raises."""
+    import pytest
+    g = make_untranslated_strings_gate("scripts/i18n.sh")
+    with pytest.raises(Exception):
+        g.timeout_minutes = 99
+
+
+def test_make_untranslated_strings_gate_does_NOT_register_on_default_registry():
+    """Pin §D1: the factory does NOT touch default_registry. Calling
+    it has no observable side effect on the singleton's name list."""
+    from claude_plan_execute.gates import default_registry
+    before = set(default_registry().names())
+    make_untranslated_strings_gate("scripts/i18n.sh")
+    make_untranslated_strings_gate("python tools/check_i18n.py")
+    after = set(default_registry().names())
+    assert before == after

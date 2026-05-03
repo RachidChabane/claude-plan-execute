@@ -28,8 +28,9 @@ HARDCODED_DEFAULTS: dict = {
 # (task 5 §D3): currently-consumed keys only. Task 6 added
 # on_max_review_rounds. Task 7 added persona_file. Task 8 added
 # decisions_dir. Task 13 added lint_command. Task 14 added
-# invariants_file. Future tasks extend this tuple as new keys
-# become resolver-consumable.
+# invariants_file. Task 17 added untranslated_strings_command.
+# Future tasks extend this tuple as new keys become resolver-
+# consumable.
 KEYS_TO_AUDIT: tuple[str, ...] = (
     "model",
     "effort",
@@ -46,6 +47,7 @@ KEYS_TO_AUDIT: tuple[str, ...] = (
     "persona_file",
     "decisions_dir",
     "invariants_file",
+    "untranslated_strings_command",
 )
 
 

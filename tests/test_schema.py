@@ -618,3 +618,58 @@ def test_typo_lint_cmd_suggests_lint_command(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "lint_cmd" in err
     assert "Did you mean 'lint_command'?" in err
+
+
+# --- I. untranslated_strings_command field (task 17) -----------------------
+
+def test_defaults_accepts_untranslated_strings_command(tmp_path):
+    """Task 17 §D7: Defaults gains untranslated_strings_command field."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  untranslated_strings_command: scripts/i18n.sh\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.untranslated_strings_command == "scripts/i18n.sh"
+
+
+def test_task_accepts_per_task_untranslated_strings_command(tmp_path):
+    """Task 17 §D7: Task gains per-task untranslated_strings_command
+    override."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - id: 1\n"
+        "    title: T\n"
+        "    description: D\n"
+        "    untranslated_strings_command: python tools/check_i18n.py\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert (
+        tf.tasks[0].untranslated_strings_command
+        == "python tools/check_i18n.py"
+    )
+
+
+def test_typo_untranslated_strings_cmd_suggests_full_form(tmp_path, capsys):
+    """Task 17 §D7: extra='forbid' + difflib suggests
+    'untranslated_strings_command' when the user types
+    'untranslated_strings_cmd' (close-match cutoff is 0.6)."""
+    import pytest
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  untranslated_strings_cmd: scripts/i18n.sh\n"     # typo
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "untranslated_strings_cmd" in err
+    assert "Did you mean 'untranslated_strings_command'?" in err

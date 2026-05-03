@@ -51,6 +51,7 @@ class Defaults(BaseModel):
     effort: str | None = None
     test_command: str | None = None
     lint_command: str | None = None
+    untranslated_strings_command: str | None = None
     plans_dir: str | None = None
     persona_file: str | None = None
     decisions_dir: str | None = None
@@ -97,6 +98,7 @@ class Task(BaseModel):
     plans_dir: str | None = None
     test_command: str | None = None
     lint_command: str | None = None
+    untranslated_strings_command: str | None = None
     plan_timeout_minutes: int | None = None
     review_timeout_minutes: int | None = None
     implement_timeout_minutes: int | None = None

@@ -397,6 +397,7 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "persona_file",
         "decisions_dir",
         "invariants_file",
+        "untranslated_strings_command",
     )
     assert KEYS_TO_AUDIT == expected
 
@@ -575,4 +576,71 @@ def test_resolve_invariants_file_phase_layer_wins_over_project():
     )
     assert out["invariants_file"] == {
         "value": "docs/phase.yaml", "from": "phase:ui",
+    }
+
+
+# ---------------------------------------------------------------------------
+# L. untranslated_strings_command resolver (task 17)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_untranslated_strings_command_returns_None_when_no_layer_set():
+    """Pin task 17 §D2 / §D6: HARDCODED_DEFAULTS does NOT include
+    untranslated_strings_command, so the resolver returns None when
+    no layer sets it. The runner's None-vs-'' discriminator (§D2)
+    treats this as 'unconfigured'."""
+    out = resolve(
+        "untranslated_strings_command",
+        task={}, file_defaults={}, cli_overrides={},
+    )
+    assert out is None
+
+
+def test_resolve_untranslated_strings_command_picks_project_layer():
+    """Project-defaults set → resolver returns it with
+    from='project_defaults'."""
+    out = resolve_task_config(
+        task={},
+        file_defaults={"untranslated_strings_command": "scripts/i18n.sh"},
+        cli_overrides={},
+    )
+    assert out["untranslated_strings_command"] == {
+        "value": "scripts/i18n.sh", "from": "project_defaults",
+    }
+
+
+def test_resolve_untranslated_strings_command_task_wins_over_project():
+    """Per-task untranslated_strings_command override wins over
+    project default."""
+    out = resolve_task_config(
+        task={"untranslated_strings_command": "python tools/check_i18n.py"},
+        file_defaults={"untranslated_strings_command": "scripts/i18n.sh"},
+        cli_overrides={},
+    )
+    assert out["untranslated_strings_command"] == {
+        "value": "python tools/check_i18n.py", "from": "task",
+    }
+
+
+def test_resolve_untranslated_strings_command_unset_renders_unset_provenance():
+    """When no layer sets untranslated_strings_command, the audit
+    dict shows {'value': None, 'from': 'unset'} — surfacing the
+    misconfiguration to anyone reading resolved-config.json."""
+    out = resolve_task_config(task={}, file_defaults={}, cli_overrides={})
+    assert out["untranslated_strings_command"] == {
+        "value": None, "from": "unset",
+    }
+
+
+def test_resolve_untranslated_strings_command_explicit_empty_string_preserved():
+    """Pin §D2: an explicit empty string is distinct from None.
+    The resolver returns ('', 'project_defaults'); the runner's
+    discriminator passes it to the factory unchanged."""
+    out = resolve_task_config(
+        task={},
+        file_defaults={"untranslated_strings_command": ""},
+        cli_overrides={},
+    )
+    assert out["untranslated_strings_command"] == {
+        "value": "", "from": "project_defaults",
     }

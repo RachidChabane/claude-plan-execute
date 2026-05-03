@@ -3,9 +3,10 @@
 Exports two kinds of built-ins:
 
   - Factory functions for built-ins WITH per-task config:
-    `make_tests_gate(test_command)`, `make_lint_gate(lint_command)`.
+    `make_tests_gate(test_command)`, `make_lint_gate(lint_command)`,
+    `make_untranslated_strings_gate(untranslated_strings_command)`.
     The runner calls these factories at gate-resolution time
-    inside `execute_task` (task 12 / 13 §D3); the resulting
+    inside `execute_task` (task 12 / 13 / 17 §D3); the resulting
     Gates are NOT pre-registered on `default_registry()`.
 
   - Module-import-time registrations for built-ins WITHOUT
@@ -20,7 +21,9 @@ security-auditor (task 16) is the second. If a third built-in
 agent gate joins (e.g., design-fidelity — task 20), this
 module should refactor to a `_register_all_builtin_agents(registry)`
 helper; with two entries the explicit calls remain the simplest
-form.
+form. Likewise, with three shell factories the explicit if/elif
+chain in the runner's Phase-4 dispatch remains simpler than a
+name-keyed factory map; revisit at four.
 """
 from __future__ import annotations
 
@@ -74,6 +77,47 @@ def make_lint_gate(lint_command: str) -> Gate:
     return Gate(
         kind="shell",
         command=("bash", "-c", lint_command),
+        timeout_minutes=10,
+        parallel_safe=True,
+        on_failure="block",
+        when=("always",),
+    )
+
+
+def make_untranslated_strings_gate(
+    untranslated_strings_command: str,
+) -> Gate:
+    """Construct the `untranslated-strings` Gate from a resolved
+    untranslated_strings_command string.
+
+    The canonical place to enforce i18n discipline. The user's
+    project-supplied script (or one-liner command) decides what
+    "untranslated" means: missing locale entries, TODO(i18n)
+    sentinels, key-extraction diff vs. the locale catalog, etc.
+    The gate is intentionally schema-free — `tasks.yaml` does not
+    surface i18n_files / locales / key formats; the project
+    encapsulates all of that in the script.
+
+    Wraps the command in `("bash", "-c",
+    untranslated_strings_command)` to preserve shell semantics
+    (pipelines, `&&`, env-var substitution, redirection) so a
+    project's `untranslated_strings_command: "scripts/i18n.sh
+    && python tools/check_locales.py"` works without the runner
+    pre-splitting. The runner calls this factory inside
+    `execute_task` (task 17 §D3) when it sees the name
+    "untranslated-strings" in the configured gate-name list AND
+    the resolved command is non-None; the Gate is NOT pre-
+    registered on `default_registry()` because the command is
+    per-task.
+
+    An explicit empty string produces a no-op gate (`bash -c ''`
+    exits 0). The runner reserves None for the "unconfigured"
+    state and skips with a warning instead of calling this
+    factory; see §D2.
+    """
+    return Gate(
+        kind="shell",
+        command=("bash", "-c", untranslated_strings_command),
         timeout_minutes=10,
         parallel_safe=True,
         on_failure="block",
@@ -165,4 +209,5 @@ default_registry().register(
 __all__ = [
     "make_lint_gate",
     "make_tests_gate",
+    "make_untranslated_strings_gate",
 ]
