@@ -801,3 +801,90 @@ def test_loader_load_tasks_data_does_NOT_validate(tmp_path):
     p = tmp_path / "bad.yaml"
     p.write_text("not a tasks dict — just a string")
     assert isinstance(loader.load_tasks_data(p), str)
+
+
+# ---------------------------------------------------------------------------
+# J. Gates API
+# ---------------------------------------------------------------------------
+
+class TestGatesAPI:
+    """Tests for GET /api/gates/{task_id} and /api/gates/{task_id}/{gate_name}."""
+
+    def _write_gate(self, work_dir: Path, task_id: str, name: str, content: str = "output\n"):
+        d = work_dir / "plans" / f"task-{task_id}" / "gates"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.txt").write_text(content)
+
+    # ── List endpoint ──
+
+    def test_list_empty_when_no_gates_dir(self, client, tmp_path):
+        _write_tasks_yaml(tmp_path)
+        r = client.get("/api/gates/1")
+        assert r.status_code == 200
+        assert r.json() == {"gates": []}
+
+    def test_list_returns_sorted_files(self, client, tmp_path):
+        _write_tasks_yaml(tmp_path)
+        self._write_gate(tmp_path, "1", "tests", "passed\n")
+        self._write_gate(tmp_path, "1", "lint", "clean\n")
+        r = client.get("/api/gates/1")
+        assert r.status_code == 200
+        names = [g["name"] for g in r.json()["gates"]]
+        assert names == ["lint", "tests"]
+
+    def test_list_includes_file_size(self, client, tmp_path):
+        _write_tasks_yaml(tmp_path)
+        self._write_gate(tmp_path, "1", "tests", "hello\n")
+        r = client.get("/api/gates/1")
+        assert r.json()["gates"][0]["size"] == 6  # "hello\n"
+
+    def test_list_rejects_path_traversal_task_id(self, client, tmp_path):
+        r = client.get("/api/gates/..%2Fetc")
+        assert r.status_code in (400, 422)
+
+    def test_list_rejects_dotted_task_id(self, client, tmp_path):
+        r = client.get("/api/gates/task.one")
+        assert r.status_code == 400
+
+    # ── Content endpoint ──
+
+    def test_get_output_returns_content(self, client, tmp_path):
+        _write_tasks_yaml(tmp_path)
+        self._write_gate(tmp_path, "2", "tests", "all green\n")
+        r = client.get("/api/gates/2/tests")
+        assert r.status_code == 200
+        assert r.json()["content"] == "all green\n"
+
+    def test_get_output_404_when_missing(self, client, tmp_path):
+        _write_tasks_yaml(tmp_path)
+        r = client.get("/api/gates/1/nonexistent")
+        assert r.status_code == 404
+
+    def test_get_output_rejects_dotted_gate_name(self, client, tmp_path):
+        r = client.get("/api/gates/1/foo.bar")
+        assert r.status_code == 400
+
+    def test_get_output_rejects_path_traversal_task_id(self, client, tmp_path):
+        r = client.get("/api/gates/bad%2Fid/tests")
+        assert r.status_code in (400, 404, 422)
+
+    def test_get_output_rejects_path_traversal_gate_name(self, client, tmp_path):
+        r = client.get("/api/gates/1/bad%2Fname")
+        assert r.status_code in (400, 404, 422)
+
+    def test_get_output_uses_custom_plans_dir(self, client, tmp_path):
+        _write_tasks_yaml(tmp_path, """\
+version: 1
+defaults:
+  plans_dir: artifacts
+tasks:
+  - id: 1
+    title: T
+    description: D
+""")
+        d = tmp_path / "artifacts" / "task-1" / "gates"
+        d.mkdir(parents=True)
+        (d / "tests.txt").write_text("ok\n")
+        r = client.get("/api/gates/1/tests")
+        assert r.status_code == 200
+        assert r.json()["content"] == "ok\n"

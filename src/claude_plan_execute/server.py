@@ -172,6 +172,56 @@ async def get_resolved_config(task_id: str):
         )
 
 
+@app.get("/api/gates/{task_id}")
+async def get_gates(task_id: str):
+    """List gate output files for a task.
+
+    Returns {"gates": [{"name": str, "size": int}]}, sorted by name.
+    Empty list when the gates directory does not exist yet.
+    """
+    if not _SAFE_TASK_ID_RE.fullmatch(task_id):
+        return JSONResponse({"error": "Invalid task id"}, status_code=400)
+
+    defaults = load_tasks().get("defaults", {})
+    plans_dir = defaults.get("plans_dir", "plans")
+    gates_dir = work_dir / plans_dir / f"task-{task_id}" / "gates"
+
+    if not gates_dir.exists():
+        return JSONResponse({"gates": []})
+
+    gates = [
+        {"name": f.stem, "size": f.stat().st_size}
+        for f in sorted(gates_dir.glob("*.txt"))
+        if _SAFE_TASK_ID_RE.fullmatch(f.stem)
+    ]
+    return JSONResponse({"gates": gates})
+
+
+@app.get("/api/gates/{task_id}/{gate_name}")
+async def get_gate_output(task_id: str, gate_name: str):
+    """Return the text content of a single gate output file.
+
+    Path: {plans_dir}/task-{task_id}/gates/{gate_name}.txt
+    Returns {"content": str} on success; 400/404/500 on error.
+    """
+    if not _SAFE_TASK_ID_RE.fullmatch(task_id):
+        return JSONResponse({"error": "Invalid task id"}, status_code=400)
+    if not _SAFE_TASK_ID_RE.fullmatch(gate_name):
+        return JSONResponse({"error": "Invalid gate name"}, status_code=400)
+
+    defaults = load_tasks().get("defaults", {})
+    plans_dir = defaults.get("plans_dir", "plans")
+    gate_path = work_dir / plans_dir / f"task-{task_id}" / "gates" / f"{gate_name}.txt"
+
+    if not gate_path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    try:
+        return JSONResponse({"content": gate_path.read_text(encoding="utf-8")})
+    except OSError as exc:
+        return JSONResponse({"error": f"Could not read file: {exc}"}, status_code=500)
+
+
 @app.get("/api/config")
 async def get_config():
     return JSONResponse(config)
