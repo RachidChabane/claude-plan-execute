@@ -8,3 +8,9 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
+
+# Project artefacts
+plans/
+.idea/
+*.egg-info
+src/*.egg-info

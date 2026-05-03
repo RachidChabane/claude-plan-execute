@@ -1,0 +1,498 @@
+version: 2
+defaults:
+  model: opus
+  effort: max
+  test_command: "pytest -q"
+  plans_dir: plans
+  persona_file: docs/persona.md
+  decisions_dir: docs/decisions
+  invariants_file: docs/invariants.yaml
+  gates: [tests, lint]
+  task_class_models:
+    refactor:  { model: opus, effort: max }
+    feature:   { model: opus, effort: max }
+    polish:    { model: sonnet, effort: medium }
+  caps:
+    max_minutes_per_phase: 60
+    max_review_rounds: 3
+    max_implement_turns: 200
+    max_attempts: 3
+  on_max_review_rounds: fail
+
+phases:
+  - id: split
+    title: "Package split"
+    defaults: { task_class: refactor }
+  - id: config
+    title: "Configuration overhaul"
+    defaults: { task_class: feature }
+  - id: prompts
+    title: "Persona, decisions, failure context"
+    defaults: { task_class: feature }
+  - id: failure
+    title: "Failure capture and resume"
+    defaults: { task_class: feature }
+  - id: gates
+    title: "Gate Registry and built-in gates"
+    defaults: { task_class: feature }
+  - id: dashboard
+    title: "Dashboard surfaces and polish"
+    defaults: { task_class: polish }
+
+tasks:
+  # ── Phase: split ─────────────────────────────────────────────────────────
+  - id: 1
+    phase: split
+    title: "Bootstrap package skeleton"
+    description: |
+      Create `pyproject.toml`, `src/claude_plan_execute/`, `bin/` shims. Move pure
+      helpers (color, status_color, validate_dependencies, find_tasks_file,
+      load_tasks_file, resolve, State) into modules with no behavior change. The
+      existing `claude-plan-execute` script imports from the package and shrinks but
+      remains executable. The `workflow-server.py` script unchanged in this task.
+      Add `pip install -e .` instructions to README. Tests added: `test_resolver.py`,
+      `test_state.py` covering the moved code.
+    key_files:
+      - claude-plan-execute
+      - pyproject.toml
+      - src/claude_plan_execute/__init__.py
+      - src/claude_plan_execute/state.py
+      - src/claude_plan_execute/config.py
+      - src/claude_plan_execute/loader.py
+      - src/claude_plan_execute/deps.py
+      - tests/test_resolver.py
+      - tests/test_state.py
+    commit_message: "refactor: bootstrap claude_plan_execute package"
+    depends_on: []
+
+  - id: 2
+    phase: split
+    title: "Move runner + claude subprocess wrapper into modules"
+    description: |
+      Move execute_task, run_claude, _kill_child, _active_child, signal handling, and
+      the prompt builders (build_plan/review/revise/implement_prompt) into
+      `runner.py`, `claude.py`, `prompts.py`. The original `claude-plan-execute`
+      becomes a 30-line wrapper that calls `cli.main()`. Tests: `test_runner.py`
+      with subprocess fixtures.
+    key_files:
+      - claude-plan-execute
+      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/claude.py
+      - src/claude_plan_execute/prompts.py
+      - src/claude_plan_execute/cli.py
+      - tests/test_runner.py
+    commit_message: "refactor: move runner and claude wrapper into modules"
+    depends_on: [1]
+
+  - id: 3
+    phase: split
+    title: "Move server into package"
+    description: |
+      Convert `workflow-server.py` to `src/claude_plan_execute/server.py`. Drop the
+      re-implemented find_tasks_file/load_tasks/load_state — import from
+      claude_plan_execute.loader and claude_plan_execute.state. Move
+      `workflow-dashboard.html` to `src/claude_plan_execute/dashboard/index.html`.
+      The `/api/run` endpoint continues to shell out to `claude-plan-execute` for
+      v1 (process isolation). Tests: `test_server.py` with FastAPI TestClient.
+    key_files:
+      - workflow-server.py
+      - src/claude_plan_execute/server.py
+      - src/claude_plan_execute/dashboard/index.html
+      - bin/claude-workflow-dashboard
+      - tests/test_server.py
+    commit_message: "refactor: move dashboard server into package"
+    depends_on: [2]
+
+  # ── Phase: config ────────────────────────────────────────────────────────
+  - id: 4
+    phase: config
+    title: "Add `version: 2` schema with phases, task_class, and Pydantic validation"
+    description: |
+      Extend the loader to parse `phases:` blocks and `task_class_models` mapping.
+      Update the resolver to a 5-tier order: hardcoded → project → phase →
+      task_class_models[class] → task → CLI. Backward-compatible: `version: 1` files
+      load unchanged. Add `defaults.caps` block (max_minutes_per_phase,
+      max_review_rounds, max_implement_turns, max_attempts). Existing
+      `*_timeout_minutes` keys still work but get deprecation warning. Add Pydantic
+      v2 models for TasksFile, Phase, Task, Caps, TaskClassConfig — validation
+      runs on load with helpful errors (file path, key, suggested correction).
+    key_files:
+      - src/claude_plan_execute/config.py
+      - src/claude_plan_execute/loader.py
+      - src/claude_plan_execute/schema.py
+      - tests/test_resolver.py
+      - tests/test_schema.py
+      - tests/fixtures/tasks-v2.yaml
+    commit_message: "feat: phases, task_class, caps, and Pydantic schema for tasks.yaml v2"
+    depends_on: [1]
+
+  - id: 5
+    phase: config
+    title: "Write resolved-config.json audit artifact per task"
+    description: |
+      After `resolve_task_config()` runs for a task, write the result to
+      `plans/task-{id}/resolved-config.json` with provenance per key. Surface the
+      file in the dashboard's task panel.
+    key_files:
+      - src/claude_plan_execute/config.py
+      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/server.py
+      - src/claude_plan_execute/dashboard/index.html
+    commit_message: "feat: resolved-config.json audit artifact"
+    depends_on: [4]
+
+  - id: 6
+    phase: config
+    title: "Flip on_max_review_rounds to fail; version-aware default"
+    description: |
+      `version: 2` files default `on_max_review_rounds: fail`. `version: 1` files
+      keep the legacy `auto_approve` behavior with a warning at load. Surface the
+      setting in the resolved-config panel.
+    key_files:
+      - src/claude_plan_execute/config.py
+      - src/claude_plan_execute/runner.py
+      - tests/test_resolver.py
+    commit_message: "feat: on_max_review_rounds: fail default for v2"
+    depends_on: [4]
+
+  # ── Phase: prompts ───────────────────────────────────────────────────────
+  - id: 7
+    phase: prompts
+    title: "Persona prompt fragment loader"
+    description: |
+      Read `defaults.persona_file` (default `docs/persona.md`) on prompt build.
+      Concatenate into Plan, Review, Revise, Implement prompts under a
+      `## Project conventions` header. Refuse to load if over 800 lines (warning
+      and skip). Per-phase `phases[].persona_extra` is appended after the global
+      persona.
+    key_files:
+      - src/claude_plan_execute/prompts.py
+      - src/claude_plan_execute/loader.py
+      - tests/test_prompts.py
+    commit_message: "feat: persona.md auto-injection into Plan/Implement prompts"
+    depends_on: [4]
+
+  - id: 8
+    phase: prompts
+    title: "Decision log loader + index builder"
+    description: |
+      Read `decisions/*.md` files (frontmatter + body). Inject `decisions/index.md`
+      into Plan prompts under `## Architectural decisions on file`. Add
+      `claude-plan-execute decisions index` subcommand to rebuild the index from
+      frontmatter.
+    key_files:
+      - src/claude_plan_execute/loader.py
+      - src/claude_plan_execute/prompts.py
+      - src/claude_plan_execute/cli.py
+      - tests/test_decisions.py
+    commit_message: "feat: decisions/ auto-load + index subcommand"
+    depends_on: [4]
+
+  # ── Phase: failure ───────────────────────────────────────────────────────
+  - id: 9
+    phase: failure
+    title: "Failure record schema + writer (state.json v2)"
+    description: |
+      Bump state.json `schema_version: 2`. Add `attempts: list[FailureRecord]`,
+      `current_attempt: int` to per-task entries. Write FailureRecord on review-rounds
+      exhaustion (when on_max_review_rounds=fail), implement timeout, gate failure
+      (capability 2.1; gate writer ships in task 12, but the FailureRecord shape
+      already accounts for it), max-turns hit, manual stop. Backward compatible:
+      schema-1 reads default `attempts: []` and `current_attempt: 1`. Every write
+      from this task forward emits `schema_version: 2`, so the file self-heals on
+      first save. `hypothesis` is a free-form string field, populated manually for
+      v1; auto-fill is deferred to v1.5.
+    key_files:
+      - src/claude_plan_execute/state.py
+      - src/claude_plan_execute/runner.py
+      - tests/test_state.py
+    commit_message: "feat: FailureRecord schema in state.json v2"
+    depends_on: [3, 6]
+
+  - id: 10
+    phase: failure
+    title: "Resume-with-failure-context prompt block"
+    description: |
+      `prompts.py` adds a `[FAILURE CONTEXT — previous attempt failed in phase: X]`
+      block prepended to Plan/Implement prompts when `attempts` is non-empty. Cap
+      verbatim at 4 KB; full block at 8 KB. The block lists prior attempts,
+      verbatim reason (last review or gate output), hypothesis (if set), and
+      artifact paths.
+    key_files:
+      - src/claude_plan_execute/prompts.py
+      - src/claude_plan_execute/runner.py
+      - tests/test_prompts.py
+    commit_message: "feat: resume injects failure context into prompts"
+    depends_on: [9]
+
+  # ── Phase: gates ─────────────────────────────────────────────────────────
+  - id: 11
+    phase: gates
+    title: "Gate Registry foundation"
+    description: |
+      Add `gates/` module with `Gate` dataclass (kind, command, prompt_template,
+      model, effort, timeout_minutes, parallel_safe, on_failure, when), `ShellGate`,
+      `AgentGate`, `GateRegistry`, `run_gates()` parallel runner. Gates run after
+      implement; output captured to `plans/task-{id}/gates/{name}.txt`. On any
+      `on_failure: block` failure, the runner records the failure and does not mark
+      the task done.
+    key_files:
+      - src/claude_plan_execute/gates/__init__.py
+      - src/claude_plan_execute/gates/shell.py
+      - src/claude_plan_execute/gates/agent.py
+      - src/claude_plan_execute/runner.py
+      - tests/test_gates.py
+    commit_message: "feat: Gate Registry and parallel gate runner"
+    depends_on: [9]
+
+  - id: 12
+    phase: gates
+    title: "Built-in gate: tests (relocate test_command)"
+    description: |
+      Move the existing `test_command` execution out of the implement prompt and
+      into a `tests` gate. The implement prompt no longer instructs the agent to
+      run tests — the gate runs them after implement, on the produced commit. v1
+      tasks.yaml files get a default `gates: [tests]`.
+    key_files:
+      - src/claude_plan_execute/gates/builtin.py
+      - src/claude_plan_execute/prompts.py
+      - src/claude_plan_execute/runner.py
+    commit_message: "feat: tests gate replaces implement-prompt test command"
+    depends_on: [11]
+
+  - id: 13
+    phase: gates
+    title: "Built-in gate: lint"
+    description: |
+      Project-supplied lint command runs as a parallel gate after implement.
+      Configured via `defaults.lint_command` or per gate registration.
+    key_files:
+      - src/claude_plan_execute/gates/builtin.py
+      - tests/test_gates.py
+    commit_message: "feat: lint gate"
+    depends_on: [11]
+
+  - id: 14
+    phase: gates
+    title: "Built-in gate: invariant-grep + invariants.yaml loader"
+    description: |
+      Optional `docs/invariants.yaml` (`defaults.invariants_file`). Each entry is a
+      shell or agent gate registered at load time. Bayān-style entries: grep
+      assertions (regex must match / must not match) plus optional agent-judged
+      invariants. Output collected per gate name.
+    key_files:
+      - src/claude_plan_execute/gates/builtin.py
+      - src/claude_plan_execute/loader.py
+      - tests/test_invariants.py
+    commit_message: "feat: invariants.yaml + invariant-grep gate"
+    depends_on: [11]
+
+  - id: 15
+    phase: gates
+    title: "Built-in gate: test-critique (agent gate)"
+    description: |
+      Sonnet/medium agent gate: reads the diff and the new tests, asks "would these
+      tests catch a regression in the actual contract?" Returns PASS/FAIL with
+      suggested cases. Flag-only — never auto-edits. On FAIL, the failure record's
+      next-attempt prompt sees the suggested cases.
+    key_files:
+      - src/claude_plan_execute/gates/builtin.py
+      - src/claude_plan_execute/gates/templates/test-critique.md
+    commit_message: "feat: test-critique agent gate"
+    depends_on: [11]
+
+  - id: 16
+    phase: gates
+    title: "Built-in gate: security-auditor (agent gate)"
+    description: |
+      Reuses the security-auditor subagent prompt. Opus/max budget. Scans the diff
+      for ACL bypasses, secrets, missing 403 paths, injection patterns. Block on
+      any found.
+    key_files:
+      - src/claude_plan_execute/gates/builtin.py
+      - src/claude_plan_execute/gates/templates/security-auditor.md
+    commit_message: "feat: security-auditor agent gate"
+    depends_on: [11]
+
+  - id: 17
+    phase: gates
+    title: "Built-in gate: untranslated-strings (project-supplied script)"
+    description: |
+      Generic shell-gate variant that runs a project-supplied script. Documented as
+      the canonical place to enforce i18n discipline. No first-class i18n schema in
+      tasks.yaml.
+    key_files:
+      - src/claude_plan_execute/gates/builtin.py
+    commit_message: "feat: untranslated-strings gate hook"
+    depends_on: [11]
+
+  # ── Phase: dashboard ─────────────────────────────────────────────────────
+  - id: 18
+    phase: dashboard
+    title: "Dashboard panels: resolved config, gates, failure record"
+    description: |
+      Three new tabs/panels in the task detail view: (1) resolved-config.json
+      formatted with provenance; (2) gates list with per-gate output collapsible;
+      (3) failure record with attempts timeline and hypothesis. WebSocket already
+      broadcasts state; no protocol changes.
+    key_files:
+      - src/claude_plan_execute/dashboard/index.html
+      - src/claude_plan_execute/server.py
+    commit_message: "feat: dashboard panels for config, gates, failures"
+    depends_on: [5, 9, 11]
+
+  - id: 19
+    phase: dashboard
+    title: "README + migration guide"
+    description: |
+      Update README for `pip install -e .` install, `version: 2` schema,
+      capability summary, link to migration notes. Add `docs/migration-v2.md`
+      with side-by-side v1 → v2 examples for tasks.yaml and a note on the
+      state.json schema_version: 2 self-heal on first save.
+    key_files:
+      - README.md
+      - docs/migration-v2.md
+    commit_message: "docs: README + v2 migration guide"
+    depends_on: [3, 4, 6, 9, 11]
+
+  - id: 20
+    phase: gates
+    title: "Built-in gate: design-fidelity (Playwright MCP agent gate)"
+    description: |
+      Sonnet/medium agent gate that uses the preconfigured Playwright MCP to drive
+      a real browser against the project's running dev server. Verifies semantic
+      design properties at multiple viewports (320, 768, 1280): no horizontal
+      scroll, semantic structure (headings, landmarks), interactive element sizes
+      (touch targets >=44px on mobile), focus-visible rings, contrast ratios,
+      no overflow on the key flows declared in docs/persona.md. Reads design
+      rules from docs/persona.md (auto-injected by the persona loader from
+      task 7). Returns PASS/FAIL with itemized findings.
+
+      Flag-only — never auto-edits the implementation. On FAIL, the gate writes
+      its findings to plans/task-{id}/gates/design-fidelity.txt; the next
+      implement attempt sees the verbatim findings under [FAILURE CONTEXT]
+      (task 10) and is asked to address them. This is the same loop as
+      test-critique (task 15), just driven by browser observation instead of
+      static diff reading.
+
+      Gate registration in gates/builtin.py:
+        - kind: agent
+        - prompt_template: src/claude_plan_execute/gates/templates/design-fidelity.md
+        - model: sonnet, effort: medium
+        - on_failure: block
+        - parallel_safe: false  (assumes exclusive use of the running dev server)
+        - when: ["task_class:ui"]  (only runs on UI tasks; non-UI tasks skip it)
+
+      The Playwright MCP is preconfigured at the agent runtime — no --mcp-config
+      plumbing is required in the runner. The prompt template tells the agent to
+      use the Playwright MCP tools (browser_navigate, browser_snapshot,
+      browser_resize, browser_evaluate, etc.). The dev server URL is read from
+      defaults.dev_server_url in tasks.yaml (fallback http://localhost:5173).
+      The dev server is the project's responsibility to start before the run;
+      the gate does not orchestrate it.
+
+      Tests: tests/test_gates_design_fidelity.py with a mocked agent run
+      verifying registration, the when-filter behavior, and that PASS/FAIL
+      output is captured to the gate output file. No live browser in tests.
+    key_files:
+      - src/claude_plan_execute/gates/builtin.py
+      - src/claude_plan_execute/gates/templates/design-fidelity.md
+      - tests/test_gates_design_fidelity.py
+    commit_message: "feat: design-fidelity Playwright MCP agent gate"
+    depends_on: [11]
+
+  - id: 21
+    task_class: refactor
+    title: "Clean working tree, verify green, merge to trunk"
+    description: |
+      Final task. Make the repo shippable, verify it, and merge the feature
+      branch (feat/v2-enhancement-slate) into the trunk branch (main if it
+      exists, else master).
+
+      PRECONDITIONS:
+      - All prior tasks (1..20) are status: done in plans/state.json.
+      - The current branch is feat/v2-enhancement-slate.
+      - Two git stashes exist (stash@{0}, stash@{1}) holding the user's
+        pre-slate modifications to workflow-dashboard.html and
+        workflow-server.py. DO NOT touch the stashes — that is user data
+        the user will integrate manually post-merge.
+
+      STEPS (execute in this exact order; verify each before continuing):
+
+      1. Update .gitignore to include (if not already present): plans/,
+         .idea/, *.egg-info, src/*.egg-info, __pycache__/, .DS_Store. After
+         editing, run `git status` — confirm no previously-tracked file has
+         been moved to ignored. If any was, abort.
+
+      2. Track project-config files that should be committed but currently
+         are not. The expected set is exactly:
+           - tasks.yaml at repo root (the slate's input config)
+           - docs/enhancement-plan.md (the v2 strategy document; was
+             intentionally untracked at slate-start, must be committed
+             now so the strategy travels with the merge)
+           - docs/migration-v2.md (was added by task 19; check tracked
+             status — if already tracked from task 19's commit, omit)
+         Stage them with specific paths only:
+            git add .gitignore tasks.yaml docs/enhancement-plan.md
+         DO NOT use `git add -A`, `git add .`, or `git add docs/` — those
+         risk sweeping up user-only files. If docs/enhancement-plan.md
+         is missing, abort and report.
+
+      3. Run `pytest -q`. The output must report 0 failures. If any test
+         fails, abort.
+
+      4. Run `./claude-plan-execute --list`. Must list 21 tasks (1..21)
+         and exit 0.
+
+      5. Run `./claude-plan-execute --task 1 --dry-run`. Must exit 0 and
+         print a prompt (the v1 fast-path that proves prompt composition
+         and config resolution work end-to-end).
+
+      6. Commit the staged changes from steps 1–2 with the commit message
+         from this task's commit_message field. This is task 21's commit
+         on feat/v2-enhancement-slate.
+
+      7. Determine the trunk branch:
+            git show-ref --verify --quiet refs/heads/main && echo main || echo master
+         Capture into shell variable TRUNK.
+
+      8. Run `git checkout $TRUNK`. Verify with `git status` that the
+         working tree is clean (no modified, no staged, untracked only
+         the gitignored set). If not clean, abort.
+
+      9. Merge the feature branch with an explicit merge commit (NOT
+         fast-forward). Use this exact command:
+            git merge --no-ff feat/v2-enhancement-slate -m "Merge v2 enhancement slate (20 tasks + fix-ups)"
+
+      10. Run `pytest -q` on the merged trunk. The output must report 0
+          failures.
+
+      11. Run `git log --oneline -5` to display the merge commit and
+          recent history. Print: "v2 slate merged to $TRUNK. Push when
+          ready: git push origin $TRUNK"
+
+      FORBIDDEN OPERATIONS (the agent must refuse these even if it
+      believes they would help):
+      - git push (any flavor)
+      - git push --force or --force-with-lease
+      - git reset --hard (anything)
+      - git stash drop, git stash pop, git stash clear
+      - git branch -D, git branch -d on feat/v2-enhancement-slate
+      - --no-verify on any commit
+      - --no-gpg-sign on any commit
+      - git add -A, git add ., git add docs/, git add src/, or any
+        non-specific git add path
+      - git rebase or git rebase -i
+      - git filter-branch, git filter-repo
+      - editing or deleting any file under plans/
+
+      ON ANY FAILURE: stop immediately. Write a one-page status to
+      docs/v2-status.md naming the failed step, the verbatim error, and
+      the current git state (`git status`, `git log -3 --oneline`,
+      `git stash list`). Do not improvise; do not partially recover.
+    key_files:
+      - .gitignore
+      - tasks.yaml
+      - docs/migration-v2.md
+    commit_message: "chore: track project config and clean working tree"
+    depends_on: [19, 20]
