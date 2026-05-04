@@ -9,9 +9,9 @@ defaults:
   invariants_file: docs/invariants.yaml
   gates: [tests, lint]
   task_class_models:
-    refactor:  { model: opus, effort: max }
-    feature:   { model: opus, effort: max }
-    polish:    { model: sonnet, effort: medium }
+    feature: { model: opus,   effort: max }
+    polish:  { model: sonnet, effort: medium }
+    docs:    { model: sonnet, effort: medium }
   caps:
     max_minutes_per_phase: 60
     max_review_rounds: 3
@@ -20,479 +20,966 @@ defaults:
   on_max_review_rounds: fail
 
 phases:
-  - id: split
-    title: "Package split"
-    defaults: { task_class: refactor }
-  - id: config
-    title: "Configuration overhaul"
+  - id: foundation
+    title: "Rate-limit retry + token observability"
     defaults: { task_class: feature }
-  - id: prompts
-    title: "Persona, decisions, failure context"
+  - id: ergonomics
+    title: "Small ergonomic primitives"
     defaults: { task_class: feature }
-  - id: failure
-    title: "Failure capture and resume"
+  - id: progress-resume
+    title: "WIP-commit + diff precomputation"
     defaults: { task_class: feature }
-  - id: gates
-    title: "Gate Registry and built-in gates"
+  - id: services-and-branches
+    title: "Services + branch_per_task"
     defaults: { task_class: feature }
-  - id: dashboard
-    title: "Dashboard surfaces and polish"
-    defaults: { task_class: polish }
+  - id: human-and-aggregation
+    title: "Human gate + cross-task aggregation"
+    defaults: { task_class: feature }
+  - id: parallelism
+    title: "Parallel task execution"
+    defaults: { task_class: feature }
+  - id: documentation
+    title: "v0.3 release docs + recipes"
+    defaults: { task_class: docs }
 
 tasks:
-  # ── Phase: split ─────────────────────────────────────────────────────────
+  # ── Phase: foundation ────────────────────────────────────────────────────
   - id: 1
-    phase: split
-    title: "Bootstrap package skeleton"
+    phase: foundation
+    title: "feat: rate-limit retry with exponential backoff"
     description: |
-      Create `pyproject.toml`, `src/claude_plan_execute/`, `bin/` shims. Move pure
-      helpers (color, status_color, validate_dependencies, find_tasks_file,
-      load_tasks_file, resolve, State) into modules with no behavior change. The
-      existing `claude-plan-execute` script imports from the package and shrinks but
-      remains executable. The `workflow-server.py` script unchanged in this task.
-      Add `pip install -e .` instructions to README. Tests added: `test_resolver.py`,
-      `test_state.py` covering the moved code.
+      Closes v0.3-scope §2.15. Detect Claude-API rate-limit errors in
+      subprocess stderr and retry with exponential backoff. Patterns to
+      match (case-insensitive): "rate_limit_error", "429", "Anthropic
+      API rate limit", "Retry-After".
+
+      Wrap claude.run_claude body in a retry loop bounded by
+      defaults.caps.max_rate_limit_retries (default 3) with
+      defaults.caps.rate_limit_base_backoff_seconds (default 60).
+      Backoff is base * 2^(attempt-1) — 60s / 120s / 240s for the
+      default 3 retries (~7 minutes total max wait).
+
+      Rate-limited retries are distinct from implementer_timeout. Add
+      "rate_limited" to state.FAILURE_CLASSES. Update runner so when
+      retries exhaust the task records a rate_limited FailureRecord
+      rather than a generic failure.
+
+      Schema: add Caps.max_rate_limit_retries: int | None and
+      Caps.rate_limit_base_backoff_seconds: int | None. Add to
+      KEYS_TO_AUDIT in config.py. Existing v0.2.0 task files load
+      with the hardcoded defaults — no breaking change.
+
+      Tests: cover (a) successful first-attempt path (no retry), (b)
+      one rate-limit then success, (c) all retries exhausted recording
+      rate_limited, (d) non-rate-limit failures NOT retried — a real
+      error stays a real error and does not consume the rate-limit
+      retry budget.
     key_files:
-      - claude-plan-execute
-      - pyproject.toml
-      - src/claude_plan_execute/__init__.py
+      - src/claude_plan_execute/claude.py
       - src/claude_plan_execute/state.py
+      - src/claude_plan_execute/schema.py
       - src/claude_plan_execute/config.py
-      - src/claude_plan_execute/loader.py
-      - src/claude_plan_execute/deps.py
+      - src/claude_plan_execute/runner.py
+      - tests/test_runner.py
+      - tests/test_schema.py
       - tests/test_resolver.py
-      - tests/test_state.py
-    commit_message: "refactor: bootstrap claude_plan_execute package"
+    commit_message: "feat: rate-limit retry with exponential backoff"
     depends_on: []
 
   - id: 2
-    phase: split
-    title: "Move runner + claude subprocess wrapper into modules"
+    phase: foundation
+    title: "feat: token usage observability per-task"
     description: |
-      Move execute_task, run_claude, _kill_child, _active_child, signal handling, and
-      the prompt builders (build_plan/review/revise/implement_prompt) into
-      `runner.py`, `claude.py`, `prompts.py`. The original `claude-plan-execute`
-      becomes a 30-line wrapper that calls `cli.main()`. Tests: `test_runner.py`
-      with subprocess fixtures.
+      Closes v0.3-scope §2.7 (observability slice; hard caps deferred
+      to v0.4 once we have data).
+
+      Capture token usage from the Claude CLI's JSON result event:
+      input_tokens, output_tokens, cache_read_input_tokens,
+      cache_creation_input_tokens. Set as side-channel on
+      claude.run_claude (analogous to _last_run_subtype).
+
+      Each run_claude call appends a row to
+      {plans_dir}/task-{id}/usage.jsonl:
+        {"timestamp": "...",
+         "phase": "plan|review|revise|implement|gate:<name>",
+         "model": "opus|sonnet|haiku",
+         "input": ..., "output": ...,
+         "cache_read": ..., "cache_create": ...,
+         "duration_seconds": ...}
+
+      JSONL not JSON: append-only writes survive interruption.
+
+      On task completion, sum into state.json under
+      tasks.<id>.usage_summary: { total_input_tokens,
+      total_output_tokens, total_cache_read, total_cache_create,
+      total_runs, duration_seconds }.
+
+      Phase 4 gate runners MUST also append rows. ShellGate has no
+      token data (its row records only duration); AgentGate captures
+      the full usage event.
+
+      Dashboard: add a Cost panel placeholder showing the rolled-up
+      numbers from state.json. Real visuals (bar chart, model
+      breakdown) are part of T13.
+
+      No caps enforced. Observability only.
+
+      Tests: assert usage.jsonl schema after a run; assert
+      state.json's usage_summary sums correctly across multiple runs;
+      assert no usage.jsonl is written when the CLI emits no usage
+      event (older CLI versions, dry-run, etc.) — robust to absence.
     key_files:
-      - claude-plan-execute
-      - src/claude_plan_execute/runner.py
       - src/claude_plan_execute/claude.py
-      - src/claude_plan_execute/prompts.py
-      - src/claude_plan_execute/cli.py
-      - tests/test_runner.py
-    commit_message: "refactor: move runner and claude wrapper into modules"
-    depends_on: [1]
-
-  - id: 3
-    phase: split
-    title: "Move server into package"
-    description: |
-      Convert `workflow-server.py` to `src/claude_plan_execute/server.py`. Drop the
-      re-implemented find_tasks_file/load_tasks/load_state — import from
-      claude_plan_execute.loader and claude_plan_execute.state. Move
-      `workflow-dashboard.html` to `src/claude_plan_execute/dashboard/index.html`.
-      The `/api/run` endpoint continues to shell out to `claude-plan-execute` for
-      v1 (process isolation). Tests: `test_server.py` with FastAPI TestClient.
-    key_files:
-      - workflow-server.py
-      - src/claude_plan_execute/server.py
-      - src/claude_plan_execute/dashboard/index.html
-      - bin/claude-workflow-dashboard
-      - tests/test_server.py
-    commit_message: "refactor: move dashboard server into package"
-    depends_on: [2]
-
-  # ── Phase: config ────────────────────────────────────────────────────────
-  - id: 4
-    phase: config
-    title: "Add `version: 2` schema with phases, task_class, and Pydantic validation"
-    description: |
-      Extend the loader to parse `phases:` blocks and `task_class_models` mapping.
-      Update the resolver to a 5-tier order: hardcoded → project → phase →
-      task_class_models[class] → task → CLI. Backward-compatible: `version: 1` files
-      load unchanged. Add `defaults.caps` block (max_minutes_per_phase,
-      max_review_rounds, max_implement_turns, max_attempts). Existing
-      `*_timeout_minutes` keys still work but get deprecation warning. Add Pydantic
-      v2 models for TasksFile, Phase, Task, Caps, TaskClassConfig — validation
-      runs on load with helpful errors (file path, key, suggested correction).
-    key_files:
-      - src/claude_plan_execute/config.py
-      - src/claude_plan_execute/loader.py
-      - src/claude_plan_execute/schema.py
-      - tests/test_resolver.py
-      - tests/test_schema.py
-      - tests/fixtures/tasks-v2.yaml
-    commit_message: "feat: phases, task_class, caps, and Pydantic schema for tasks.yaml v2"
-    depends_on: [1]
-
-  - id: 5
-    phase: config
-    title: "Write resolved-config.json audit artifact per task"
-    description: |
-      After `resolve_task_config()` runs for a task, write the result to
-      `plans/task-{id}/resolved-config.json` with provenance per key. Surface the
-      file in the dashboard's task panel.
-    key_files:
-      - src/claude_plan_execute/config.py
       - src/claude_plan_execute/runner.py
-      - src/claude_plan_execute/server.py
-      - src/claude_plan_execute/dashboard/index.html
-    commit_message: "feat: resolved-config.json audit artifact"
-    depends_on: [4]
-
-  - id: 6
-    phase: config
-    title: "Flip on_max_review_rounds to fail; version-aware default"
-    description: |
-      `version: 2` files default `on_max_review_rounds: fail`. `version: 1` files
-      keep the legacy `auto_approve` behavior with a warning at load. Surface the
-      setting in the resolved-config panel.
-    key_files:
-      - src/claude_plan_execute/config.py
-      - src/claude_plan_execute/runner.py
-      - tests/test_resolver.py
-    commit_message: "feat: on_max_review_rounds: fail default for v2"
-    depends_on: [4]
-
-  # ── Phase: prompts ───────────────────────────────────────────────────────
-  - id: 7
-    phase: prompts
-    title: "Persona prompt fragment loader"
-    description: |
-      Read `defaults.persona_file` (default `docs/persona.md`) on prompt build.
-      Concatenate into Plan, Review, Revise, Implement prompts under a
-      `## Project conventions` header. Refuse to load if over 800 lines (warning
-      and skip). Per-phase `phases[].persona_extra` is appended after the global
-      persona.
-    key_files:
-      - src/claude_plan_execute/prompts.py
-      - src/claude_plan_execute/loader.py
-      - tests/test_prompts.py
-    commit_message: "feat: persona.md auto-injection into Plan/Implement prompts"
-    depends_on: [4]
-
-  - id: 8
-    phase: prompts
-    title: "Decision log loader + index builder"
-    description: |
-      Read `decisions/*.md` files (frontmatter + body). Inject `decisions/index.md`
-      into Plan prompts under `## Architectural decisions on file`. Add
-      `claude-plan-execute decisions index` subcommand to rebuild the index from
-      frontmatter.
-    key_files:
-      - src/claude_plan_execute/loader.py
-      - src/claude_plan_execute/prompts.py
-      - src/claude_plan_execute/cli.py
-      - tests/test_decisions.py
-    commit_message: "feat: decisions/ auto-load + index subcommand"
-    depends_on: [4]
-
-  # ── Phase: failure ───────────────────────────────────────────────────────
-  - id: 9
-    phase: failure
-    title: "Failure record schema + writer (state.json v2)"
-    description: |
-      Bump state.json `schema_version: 2`. Add `attempts: list[FailureRecord]`,
-      `current_attempt: int` to per-task entries. Write FailureRecord on review-rounds
-      exhaustion (when on_max_review_rounds=fail), implement timeout, gate failure
-      (capability 2.1; gate writer ships in task 12, but the FailureRecord shape
-      already accounts for it), max-turns hit, manual stop. Backward compatible:
-      schema-1 reads default `attempts: []` and `current_attempt: 1`. Every write
-      from this task forward emits `schema_version: 2`, so the file self-heals on
-      first save. `hypothesis` is a free-form string field, populated manually for
-      v1; auto-fill is deferred to v1.5.
-    key_files:
       - src/claude_plan_execute/state.py
-      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/dashboard/index.html
+      - tests/test_runner.py
       - tests/test_state.py
-    commit_message: "feat: FailureRecord schema in state.json v2"
-    depends_on: [3, 6]
+    commit_message: "feat: token usage observability per task"
+    depends_on: [1]
 
-  - id: 10
-    phase: failure
-    title: "Resume-with-failure-context prompt block"
+  # ── Phase: ergonomics ────────────────────────────────────────────────────
+  - id: 3
+    phase: ergonomics
+    title: "feat: touches:<glob> when matcher with pathspec"
     description: |
-      `prompts.py` adds a `[FAILURE CONTEXT — previous attempt failed in phase: X]`
-      block prepended to Plan/Implement prompts when `attempts` is non-empty. Cap
-      verbatim at 4 KB; full block at 8 KB. The block lists prior attempts,
-      verbatim reason (last review or gate output), hypothesis (if set), and
-      artifact paths.
-    key_files:
-      - src/claude_plan_execute/prompts.py
-      - src/claude_plan_execute/runner.py
-      - tests/test_prompts.py
-    commit_message: "feat: resume injects failure context into prompts"
-    depends_on: [9]
+      Closes v0.3-scope §2.16. Implement the touches:<glob> matcher
+      in gates/__init__.py:_when_matches.
 
-  # ── Phase: gates ─────────────────────────────────────────────────────────
-  - id: 11
-    phase: gates
-    title: "Gate Registry foundation"
-    description: |
-      Add `gates/` module with `Gate` dataclass (kind, command, prompt_template,
-      model, effort, timeout_minutes, parallel_safe, on_failure, when), `ShellGate`,
-      `AgentGate`, `GateRegistry`, `run_gates()` parallel runner. Gates run after
-      implement; output captured to `plans/task-{id}/gates/{name}.txt`. On any
-      `on_failure: block` failure, the runner records the failure and does not mark
-      the task done.
+      IMPORTANT: stdlib fnmatch.fnmatch does NOT handle ** recursively
+      — it treats ** as a single-component *. Verified during design.
+      Add `pathspec` (MIT, no transitive deps) to pyproject.toml
+      install_requires; use pathspec.PathSpec.from_lines with
+      GitWildMatchPattern so gitignore-style **/foo/** globs work the
+      way users expect.
+
+      Match against task['key_files']. OR semantics: any pattern
+      matching any key_file passes. To get AND, declare multiple
+      gates each with one pattern.
+
+      Update _when_matches to support OR-of-touches AND OR-of-task_class
+      in the same `when` (a task matching ANY token in `when` passes).
+      Currently the matcher returns True on the first matching
+      predicate — preserve that and add the touches: branch alongside
+      task_class:.
+
+      Tests: cover (a) recursive ** match
+      (e.g., touches:**/auth/** matches frontend/src/auth/Login.tsx),
+      (b) single-component glob, (c) no key_files attribute, (d) empty
+      key_files, (e) mixed when=[task_class:..., touches:**/...] where
+      task_class match alone is sufficient, (f) negative match.
+      Specifically lock in the recursive ** behavior — that's the bug
+      the design caught.
     key_files:
       - src/claude_plan_execute/gates/__init__.py
-      - src/claude_plan_execute/gates/shell.py
-      - src/claude_plan_execute/gates/agent.py
-      - src/claude_plan_execute/runner.py
+      - pyproject.toml
       - tests/test_gates.py
-    commit_message: "feat: Gate Registry and parallel gate runner"
-    depends_on: [9]
+    commit_message: "feat: touches:<glob> when matcher"
+    depends_on: []
 
-  - id: 12
-    phase: gates
-    title: "Built-in gate: tests (relocate test_command)"
+  - id: 4
+    phase: ergonomics
+    title: "feat: per-task gates_extra"
     description: |
-      Move the existing `test_command` execution out of the implement prompt and
-      into a `tests` gate. The implement prompt no longer instructs the agent to
-      run tests — the gate runs them after implement, on the produced commit. v1
-      tasks.yaml files get a default `gates: [tests]`.
+      Closes v0.3-scope §2.21. Add gates_extra: list[str] | None = None
+      to the Task Pydantic model in schema.py.
+
+      Update runner.execute_task Phase 4 dispatch to concatenate:
+        gate_names = (file_defaults.gates or []) +
+                     (phase_dict.gates_extra or []) +
+                     (task.gates_extra or [])
+
+      Same additive convention as phase.defaults.gates_extra. Order
+      matters for serial gates only (parallel_safe gates run together
+      regardless).
+
+      No "remove" semantics. If a project wants a task to NOT run a
+      gate, restructure defaults rather than introduce subtraction —
+      override-vs-add ambiguity is a debugging tax.
+
+      Tests: cover task-only, task+phase, task+phase+project layering;
+      confirm extra="forbid" still catches typos like gate_extra (no
+      trailing s); confirm a typo in the gate name itself produces the
+      existing "Unknown gate(s) skipped" warning (not a hard error).
     key_files:
-      - src/claude_plan_execute/gates/builtin.py
+      - src/claude_plan_execute/schema.py
+      - src/claude_plan_execute/runner.py
+      - tests/test_schema.py
+      - tests/test_runner.py
+    commit_message: "feat: per-task gates_extra"
+    depends_on: [3]
+
+  - id: 5
+    phase: ergonomics
+    title: "feat: --explain TASK_ID for ops visibility"
+    description: |
+      Closes v0.3-scope §2.20. Add --explain TASK_ID to cli.py.
+
+      Walks the same resolver + registry path execute_task uses,
+      but reports instead of running:
+        - Task title
+        - Phase + class (with effective model/effort and source)
+        - Resolved gates list with kind and source attribution
+          (defaults / phase:<id> / task / registry-builtin /
+          invariants.yaml)
+        - For each gate, `when` evaluation: match (showing the
+          matched key_file or class) or skip (with reason)
+        - services_required list (project + phase + task overlay) —
+          T8 will add this; for now stub the section
+        - Caps: max_implement_turns, max_minutes_per_phase, etc.
+        - Effective branch (if branch_per_task is on, the rendered
+          branch name) — T9 will add this; for now stub the section
+
+      Format as readable multi-line output. Not JSON — operator
+      consumption.
+
+      Tests: verify the explainer reaches the same gate list the
+      runner would compute for the same task. Use
+      tests/fixtures/tasks-v2.yaml; assert specific gates appear /
+      do not appear given the touches/task_class filters.
+
+      Note: T8 and T9 will extend the explainer once those primitives
+      exist. This task ships the skeleton and the gate-list /
+      cap-display sections; the services and branch sections are
+      placeholder strings that read "(see T8/T9)" until those land.
+    key_files:
+      - src/claude_plan_execute/cli.py
+      - src/claude_plan_execute/runner.py
+      - tests/test_runner.py
+    commit_message: "feat: --explain TASK_ID for ops visibility"
+    depends_on: [4]
+
+  # ── Phase: progress-resume ───────────────────────────────────────────────
+  - id: 6
+    phase: progress-resume
+    title: "feat: WIP-commit + progress.md resume convention"
+    description: |
+      Closes v0.3-scope §2.11.
+
+      Modify prompts.build_implement_prompt to instruct chunk-sized
+      commits and progress.md updates:
+        1. Implement in commit-sized chunks. After each logically-
+           complete chunk, run `git add -A && git commit -m
+           "task-{id} WIP: <chunk-description>"`. Continue.
+        2. Maintain {plans_dir}/task-{id}/progress.md with a
+           checklist of items from the plan. Mark items [x] when
+           done, [~] when in progress, [ ] when not started.
+        3. If sensing turn budget low, commit current chunk, update
+           progress.md, and finish the session cleanly.
+
+      Add prompts.build_resume_prompt: skips Plan/Review and
+      continues from progress.md. The builder must:
+        - Read the existing progress.md and reproduce its checklist
+          in the prompt body.
+        - Run `git status --porcelain` and surface uncommitted hunks
+          to the implementer (told to either commit them as the next
+          chunk or revert with explanation). Without this dirty-tree
+          handling, resume can clobber unfinished edits.
+        - Reuse the same persona + decisions + failure-context
+          composition order as the normal implement prompt.
+
+      In runner.execute_task: detect existing
+      {plans_dir}/task-{id}/progress.md with [~] or [ ] entries
+      and route to the resume builder; skip Plan and Review phases
+      automatically (skip_to="implement" semantics on the next run).
+      All-[x] progress.md means done — log a notice and skip
+      entirely; the gate phase still runs to validate.
+
+      State entry tracks progress_path. Status stays "implementing"
+      during a resume; the existence of progress.md is enough signal
+      for routing. Do NOT add a "resuming" status — that complicates
+      the dashboard for marginal benefit.
+
+      Tests: (a) fresh attempt (no progress.md) builds normal prompt;
+      (b) resume attempt (progress.md mid-list) builds resume prompt
+      and skips earlier phases; (c) all-[x] progress means task done
+      pending gates; (d) dirty-tree detection surfaces uncommitted
+      hunks in the resume prompt body.
+    key_files:
       - src/claude_plan_execute/prompts.py
       - src/claude_plan_execute/runner.py
-    commit_message: "feat: tests gate replaces implement-prompt test command"
-    depends_on: [11]
+      - src/claude_plan_execute/state.py
+      - tests/test_prompts.py
+      - tests/test_runner.py
+    commit_message: "feat: WIP-commit + progress.md resume convention"
+    depends_on: []
 
-  - id: 13
-    phase: gates
-    title: "Built-in gate: lint"
+  - id: 7
+    phase: progress-resume
+    title: "feat: precomputed git diff for agent gates"
     description: |
-      Project-supplied lint command runs as a parallel gate after implement.
-      Configured via `defaults.lint_command` or per gate registration.
-    key_files:
-      - src/claude_plan_execute/gates/builtin.py
-      - tests/test_gates.py
-    commit_message: "feat: lint gate"
-    depends_on: [11]
+      Closes v0.3-scope §2.17.
 
-  - id: 14
-    phase: gates
-    title: "Built-in gate: invariant-grep + invariants.yaml loader"
-    description: |
-      Optional `docs/invariants.yaml` (`defaults.invariants_file`). Each entry is a
-      shell or agent gate registered at load time. Bayān-style entries: grep
-      assertions (regex must match / must not match) plus optional agent-judged
-      invariants. Output collected per gate name.
-    key_files:
-      - src/claude_plan_execute/gates/builtin.py
-      - src/claude_plan_execute/loader.py
-      - tests/test_invariants.py
-    commit_message: "feat: invariants.yaml + invariant-grep gate"
-    depends_on: [11]
+      After the implement phase, before Phase 4 gates, write the
+      implementation diff to {plans_dir}/task-{id}/diff.patch.
 
-  - id: 15
-    phase: gates
-    title: "Built-in gate: test-critique (agent gate)"
-    description: |
-      Sonnet/medium agent gate: reads the diff and the new tests, asks "would these
-      tests catch a regression in the actual contract?" Returns PASS/FAIL with
-      suggested cases. Flag-only — never auto-edits. On FAIL, the failure record's
-      next-attempt prompt sees the suggested cases.
+      Diff target:
+        - If branch_per_task is OFF (T9 not yet applied): use
+          `git diff HEAD~1..HEAD`.
+        - If branch_per_task is ON (after T9 lands and is enabled):
+          `git diff origin/{base_branch}...HEAD`.
+      For T7's initial implementation, compute against HEAD~1..HEAD;
+      T9 patches the runner to also pass the branch context once
+      branch_per_task is in scope.
+
+      Tail-cap output at 256 KB (head-truncate, like ShellGate's
+      _OUTPUT_CAP_BYTES pattern). On a no-op task (empty diff), write
+      an empty diff.patch — templates handle "diff is empty, read
+      source" branch.
+
+      Update the three agent-gate templates (test-critique,
+      security-auditor, design-fidelity) to reference {diff_path}.
+      AgentGate substitutes {diff_path} during _load_template the
+      same way it substitutes {persona} (template substitution via
+      .replace() on the body).
+
+      Tests: confirm diff.patch exists post-implement; confirm
+      template substitution; confirm tail-cap on huge synthesized
+      diffs; confirm empty diff handling.
     key_files:
-      - src/claude_plan_execute/gates/builtin.py
+      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/gates/agent.py
       - src/claude_plan_execute/gates/templates/test-critique.md
-    commit_message: "feat: test-critique agent gate"
-    depends_on: [11]
-
-  - id: 16
-    phase: gates
-    title: "Built-in gate: security-auditor (agent gate)"
-    description: |
-      Reuses the security-auditor subagent prompt. Opus/max budget. Scans the diff
-      for ACL bypasses, secrets, missing 403 paths, injection patterns. Block on
-      any found.
-    key_files:
-      - src/claude_plan_execute/gates/builtin.py
       - src/claude_plan_execute/gates/templates/security-auditor.md
-    commit_message: "feat: security-auditor agent gate"
-    depends_on: [11]
+      - src/claude_plan_execute/gates/templates/design-fidelity.md
+      - tests/test_gates.py
+    commit_message: "feat: precomputed diff for agent gates"
+    depends_on: []
 
-  - id: 17
-    phase: gates
-    title: "Built-in gate: untranslated-strings (project-supplied script)"
+  # ── Phase: services-and-branches ─────────────────────────────────────────
+  - id: 8
+    phase: services-and-branches
+    title: "feat: services: block + ServiceManager"
     description: |
-      Generic shell-gate variant that runs a project-supplied script. Documented as
-      the canonical place to enforce i18n discipline. No first-class i18n schema in
-      tasks.yaml.
-    key_files:
-      - src/claude_plan_execute/gates/builtin.py
-    commit_message: "feat: untranslated-strings gate hook"
-    depends_on: [11]
+      Closes v0.3-scope §2.3 (highest-priority confirmed gap).
+      Declarative dev-server lifecycle for unattended runs.
 
-  # ── Phase: dashboard ─────────────────────────────────────────────────────
-  - id: 18
-    phase: dashboard
-    title: "Dashboard panels: resolved config, gates, failure record"
-    description: |
-      Three new tabs/panels in the task detail view: (1) resolved-config.json
-      formatted with provenance; (2) gates list with per-gate output collapsible;
-      (3) failure record with attempts timeline and hypothesis. WebSocket already
-      broadcasts state; no protocol changes.
+      Schema additions:
+        Top-level: services: list[ServiceSpec]
+          ServiceSpec(name, command, cwd?, env={}, ready_check,
+                      ready_timeout_seconds=60,
+                      lifetime="run"|"phase"|"task"|"gate"
+                        (default "run"),
+                      log_file?, depends_on=[])
+          ReadyCheck(kind="http"|"tcp"|"shell",
+                     url? (for http), port? (for tcp),
+                     command? (for shell))
+        Defaults additions:
+          services_required: list[str] | None = None
+        Task additions:
+          services_required_extra: list[str] | None = None
+        Phase.defaults stays loose — phase-level
+          services_required_extra works without further schema work,
+          same convention as gates_extra.
+
+      Implement src/claude_plan_execute/services.py with ServiceManager:
+        - start(name) → spawn subprocess.Popen, run ready check up to
+          ready_timeout_seconds (poll every 1s), raise on failure.
+          Pipe stdout/stderr to log_file. Set process group via
+          os.setsid so SIGTERM takes down child workers.
+        - stop(name) → SIGTERM, then SIGKILL after 5s grace.
+        - ensure(required: list[str]) → bring up listed services not
+          already running, raise on any failure.
+        - tear_down_for_scope(scope) → stop services whose lifetime
+          matches.
+        - poll_health() → check liveness; auto-restart once on crash;
+          emit service_unstable after 3 consecutive crashes.
+
+      Ready-check implementations:
+        - http: GET URL, accept 2xx/3xx within timeout.
+        - tcp: socket.connect((host or 127.0.0.1, port)) within timeout.
+        - shell: subprocess.run(command), accept exit 0 within timeout.
+
+      Add to FAILURE_CLASSES: service_unavailable, service_crashed,
+      service_unstable.
+
+      Runner integration:
+        - cli.main() instantiates ServiceManager after loading tasks
+          and computing the union of services_required across all
+          tasks.
+        - Before task loop: ensure(<services with lifetime=run>).
+        - Inside execute_task before Phase 4: ensure(<gate-scoped>).
+        - After each task / phase / run: tear_down_for_scope(...).
+        - Service-startup failure → service_unavailable
+          FailureRecord on the dependent task; task status="blocked".
+
+      Server: GET /api/services returns list with status + last 200
+      log lines. POST /api/services/<name>/restart restarts.
+      Dashboard: new Services panel with status badges, log tail,
+      restart button.
+
+      Extend --explain (T5) to show services_required for the task —
+      the section was a stub in T5.
+
+      Tests: (a) ready-check kind=http success/timeout, (b) kind=tcp
+      success/timeout, (c) kind=shell exit-0/non-zero, (d) start →
+      stop → start, (e) ensure with missing service raises, (f)
+      crash auto-restart, (g) lifetime=task tear-down at task end,
+      (h) services_required_extra overlay (defaults ∪ phase ∪ task).
     key_files:
-      - src/claude_plan_execute/dashboard/index.html
+      - src/claude_plan_execute/schema.py
+      - src/claude_plan_execute/services.py
+      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/cli.py
+      - src/claude_plan_execute/state.py
       - src/claude_plan_execute/server.py
-    commit_message: "feat: dashboard panels for config, gates, failures"
-    depends_on: [5, 9, 11]
+      - src/claude_plan_execute/dashboard/index.html
+      - tests/test_services.py
+      - tests/test_schema.py
+    commit_message: "feat: services: block + ServiceManager"
+    depends_on: [1]
 
-  - id: 19
-    phase: dashboard
-    title: "README + migration guide"
+  - id: 9
+    phase: services-and-branches
+    title: "feat: branch_per_task + auto_pr + auto_merge"
     description: |
-      Update README for `pip install -e .` install, `version: 2` schema,
-      capability summary, link to migration notes. Add `docs/migration-v2.md`
-      with side-by-side v1 → v2 examples for tasks.yaml and a note on the
-      state.json schema_version: 2 self-heal on first save.
+      Closes v0.3-scope §2.12. Per-task branches with optional PR
+      creation and merge.
+
+      Schema additions to Defaults:
+        branch_per_task: bool = False (backward-compat default)
+        base_branch: str = "main"
+        task_branch_template: str = "task/{id}-{slug}"
+        auto_pr: bool = False
+        auto_merge: bool = False
+        pr_body_template: str | None = None
+
+      Slug generation: lowercase task['title'], replace non-
+      alphanumeric with '-', collapse repeats. Truncate slug body to
+      ~30 chars to keep branch names readable.
+
+      Runner integration in execute_task:
+
+      BEFORE Phase 1:
+        if branch_per_task:
+          subprocess.run(["git", "fetch", "origin", base_branch])
+          parent_branch = (
+            <branch of latest done dependency>
+            if depends_on with branch_per_task tasks exist
+            else f"origin/{base_branch}"
+          )
+          # Idempotent: re-checkout if branch exists; create otherwise.
+          if branch exists locally: git checkout branch
+          else: git checkout -b branch parent_branch
+          state.set_status(tid, ..., branch=branch)
+
+      AFTER Phase 4 (gates pass):
+        if auto_pr:
+          git push -u origin branch
+          gh pr create --base base_branch \\
+            --title task['title'] \\
+            --body <rendered template>
+          # Idempotent against an existing PR — gh returns the
+          # existing URL.
+          state.set_status(tid, ..., pr_url=...)
+        if auto_merge:
+          gh pr merge --auto --squash
+
+      Operator hygiene (DOCS, not enforcement, in v0.3): do NOT
+      merge a parent task's PR while a dependent task is in-flight
+      on its branch — the dependent loses its parent base. The
+      dashboard surfaces in-flight branches so the operator can see
+      what to leave alone. Document in T13.
+
+      State entry gains: branch (str), pr_url (str | None).
+
+      Patch T7's diff target now that branch_per_task is in scope:
+      when branch_per_task is on, use
+      `git diff origin/{base_branch}...HEAD`. Tests in T7 file
+      cover both branches; this task adjusts the runner code.
+
+      Extend --explain (T5) to show the resolved branch name when
+      branch_per_task is on.
+
+      Dashboard: per-task panel shows branch + PR link when set.
+
+      Decisions:
+        - gh CLI required when auto_pr=true. Document install + auth
+          prerequisites in T13.
+        - GitLab/Forgejo deferred to v0.4.
+        - Why default false? Backward compat with existing v0.2.0
+          users.
+        - Idempotent gh pr create: if a PR already exists, gh
+          returns the existing URL with exit 0. We capture stdout to
+          extract the URL.
+
+      Tests: (a) branch_per_task=false: behavior unchanged from v0.2.0,
+      (b) true: branch created from origin/main, (c) dependent task
+      creates branch from parent's branch (parent must have branch
+      attribute), (d) auto_pr opens PR via gh (mock the gh
+      subprocess), (e) auto_merge runs the correct gh pr merge,
+      (f) state entry tracks branch + pr_url, (g) idempotent
+      checkout-or-create.
+    key_files:
+      - src/claude_plan_execute/schema.py
+      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/cli.py
+      - src/claude_plan_execute/state.py
+      - src/claude_plan_execute/dashboard/index.html
+      - tests/test_runner.py
+      - tests/test_schema.py
+    commit_message: "feat: branch_per_task + auto_pr + auto_merge"
+    depends_on: [8]
+
+  # ── Phase: human-and-aggregation ─────────────────────────────────────────
+  - id: 10
+    phase: human-and-aggregation
+    title: "feat: kind: human gate primitive"
+    description: |
+      Closes v0.3-scope §2.4. Human-in-the-loop gate kind. Pauses
+      the runner, surfaces a review prompt, resumes on operator
+      decision.
+
+      Schema (TWO Pydantic Literals must change, not one — without
+      both extensions, project YAML registrations of human gates
+      fail validation at load):
+        - Gate.kind: Literal["shell", "agent", "human"] in
+          gates/__init__.py.
+        - InvariantEntry.kind: Literal["shell", "agent", "human"] in
+          gates/invariants.py.
+        - Gate gains sentinel_path: str | None (default
+          plans/task-<id>/gates/<name>.approval).
+        - Default Gate.timeout_minutes for human is 1440 (24h);
+          keep 10 default for shell/agent.
+
+      REUSE the existing prompt_template field for the human-facing
+      request body — same dual path/inline semantics AgentGate
+      already uses (see gates/agent.py:_load_template). Do NOT add
+      a new prompt field; one field, two consumers, no drift.
+
+      Compile-entry update in gates/invariants.py:
+        - Add a 'human' branch to compile_entry that produces
+          Gate(kind="human", prompt_template=entry.prompt_template,
+               sentinel_path=..., timeout_minutes=...,
+               parallel_safe=False, on_failure=...).
+        - Split or relax _check_shell_specifiers so human entries
+          with only prompt_template validate without tripping the
+          shell-specifier guard.
+
+      Implement src/claude_plan_execute/gates/human.py:
+        HumanGate(name, gate, task, task_dir).run() →
+          1. Load body from prompt_template (path or inline).
+          2. Render to {task_dir}/gates/{name}.request.md with
+             context (task title, plan path, gates dir, diff path
+             from T7).
+          3. Poll for {task_dir}/gates/{name}.approval (PASS) or
+             .rejection (FAIL) every 10s up to timeout_minutes.
+          4. Sentinel content (the user's note) becomes
+             GateResult.output.
+          5. Timeout → human_gate_timeout failure_class.
+
+      Add 'awaiting_human' status to STATUSES; state.set_status
+      while polling. Dashboard's existing per-task status badge
+      surfaces this.
+
+      parallel_safe=False for human gates — human attention is a
+      serial resource; interleaving prompts confuses operators.
+
+      Server endpoint: POST /api/gates/<task_id>/<name>/decision
+      with body {decision: "approve"|"reject", note: str}. Touches
+      the appropriate sentinel file with the note as content.
+
+      Dashboard: when state shows awaiting_human, render
+      Approve/Reject buttons in the gate-results panel that POST
+      to the new endpoint.
+
+      CLI subcommands:
+        - claude-plan-execute approve TASK_ID GATE_NAME --note "..."
+        - claude-plan-execute reject TASK_ID GATE_NAME --note "..."
+      Both write the sentinel file directly (no server round-trip),
+      so they work even with the dashboard down.
+
+      Tests: (a) approval before timeout: passed=True, output
+      contains note; (b) rejection: passed=False, output contains
+      note; (c) timeout: passed=False, error="human_gate_timeout";
+      (d) Pydantic compile_entry accepts kind=human with
+      prompt_template only; (e) compile_entry rejects kind=human
+      WITHOUT prompt_template; (f) server endpoint writes correct
+      sentinel; (g) CLI approve/reject subcommands write sentinel.
+    key_files:
+      - src/claude_plan_execute/gates/__init__.py
+      - src/claude_plan_execute/gates/invariants.py
+      - src/claude_plan_execute/gates/human.py
+      - src/claude_plan_execute/state.py
+      - src/claude_plan_execute/server.py
+      - src/claude_plan_execute/cli.py
+      - src/claude_plan_execute/dashboard/index.html
+      - tests/test_gates.py
+      - tests/test_server.py
+    commit_message: "feat: kind: human gate primitive"
+    depends_on: [4]
+
+  - id: 11
+    phase: human-and-aggregation
+    title: "feat: structured findings JSON output for agent gates"
+    description: |
+      Closes v0.3-scope §2.18. Allow agent-gate templates to emit a
+      structured findings appendix the runner extracts and stores as
+      a sidecar .json file. Optional emission — gates that don't emit
+      it keep working unchanged.
+
+      RISK MITIGATION (the reason this was originally out-of-scope):
+      schema lock-in. The build-tool source must stay gate-agnostic
+      so it doesn't grow when new gates ship with new finding shapes.
+      Three rules enforce this:
+
+        1. Permissive top-level schema. Build-tool only requires:
+             a) the appendix parses as JSON;
+             b) after parse, normalize to {findings: list[dict]}:
+                - bare array → wrap as {findings: [...]}
+                - object with `findings: list` → use as-is
+                - anything else (scalar, null, list-of-non-dicts) →
+                  store {findings: [], _raw: <raw string>} and
+                  log warning. Don't fail the gate.
+        2. NO required inner keys. NO enum constraints. NO
+           type-checks beyond "is each finding a dict?".
+        3. Templates own their inner shape. Per-template schema is
+           documented INLINE in the template prompt — never in
+           build-tool source. A new gate (project-supplied via
+           invariants.yaml) emits whatever its template instructs;
+           the build tool extracts whatever appears.
+
+      Marker syntax in template output (HTML comments — invisible if
+      the response is rendered as markdown):
+        <!-- BEGIN_FINDINGS_JSON -->
+        [ ... JSON ... ]
+        <!-- END_FINDINGS_JSON -->
+
+      Extraction in gates/agent.py:
+        - After run_claude returns, regex-search the output text for
+          the marker pair (greedy multiline match, only the first
+          appendix is honored).
+        - If absent → findings=None, no .json written. Existing v0.2
+          gate templates still work.
+        - If present → slice the body, json.loads it, apply the
+          normalization rules above.
+        - On json.loads failure: log yellow warning ("malformed
+          findings JSON in <gate>; gate verdict unchanged") and
+          proceed with findings=None. The text VERDICT remains the
+          source of truth for pass/fail. Don't fail the gate on
+          appendix problems.
+
+      Storage:
+        - {task_dir}/gates/<name>.txt: unchanged (full response).
+        - NEW {task_dir}/gates/<name>.json: pretty-printed
+          (indent=2) when extraction succeeds. Absent when no
+          markers, when parse fails, or when the gate is shell-kind
+          (only agent gates can emit; ShellGate doesn't extract).
+
+      GateResult enrichment:
+        - Add findings: list[dict] | None = None to the frozen
+          dataclass.
+        - Populated by AgentGate when extraction succeeds; None
+          otherwise. Re-construction in run_gates (for
+          output_path patching) must preserve findings.
+
+      Update three built-in templates to emit appendices with
+      per-template schemas documented in the prompt. Keep markdown
+      verdict sections unchanged — appendix is additive:
+        - gates/templates/security-auditor.md: emit
+          {category, severity, file, line, evidence, suggested_fix}.
+          Severity: free-form string; common values critical/high/
+          medium/low documented in template but not enforced.
+        - gates/templates/test-critique.md: emit
+          {missing_test_for, contract, suggested_test_name}.
+        - gates/templates/design-fidelity.md: emit
+          {finding_letter, viewport, selectors, risk}. finding_letter
+          is the A–F category from the existing template body.
+
+      Each template's "## Output format" section gains a
+      "Structured findings appendix (recommended)" subsection with
+      the schema and one concrete example. Templates explicitly say:
+      "If you cannot produce structured findings — e.g., the failure
+      is a single-line cause — emit an empty `[]` or omit the
+      appendix entirely. The text verdict is what blocks; the
+      appendix is for aggregation."
+
+      Schema evolution path (the lock-in escape hatch):
+        - A project changes its template to add a new field (e.g.,
+          confidence: float). Old gate runs don't have it. Old
+          aggregations against the new field bucket missing values
+          as "(unknown)" — no crash. The project updates its
+          aggregations.yaml to query the new field. Done. Build-tool
+          source untouched.
+        - The build tool is permanently gate-agnostic.
+
+      No state.json schema_version bump — findings live in
+      sidecar .json, not in state.
+
+      Tests: (a) extraction of well-formed JSON appendix populates
+      findings; (b) bare array normalizes to {findings: [...]};
+      (c) malformed JSON logs warning, findings=None, gate verdict
+      unchanged; (d) missing markers → findings=None, no .json;
+      (e) shell gates never produce .json; (f) GateResult.findings
+      survives re-construction in run_gates; (g) non-dict elements
+      in findings list rejected with warning, normalized to empty.
+    key_files:
+      - src/claude_plan_execute/gates/agent.py
+      - src/claude_plan_execute/gates/__init__.py
+      - src/claude_plan_execute/gates/templates/security-auditor.md
+      - src/claude_plan_execute/gates/templates/test-critique.md
+      - src/claude_plan_execute/gates/templates/design-fidelity.md
+      - tests/test_gates.py
+      - tests/test_gates_design_fidelity.py
+    commit_message: "feat: structured findings JSON output for agent gates"
+    depends_on: []
+
+  - id: 12
+    phase: human-and-aggregation
+    title: "feat: cross-task gate-result aggregation panel"
+    description: |
+      Closes v0.3-scope §2.14. Dashboard panel showing tallies of
+      recurring gate findings across the slate. Read-only post-hoc —
+      re-runnable without re-running gates.
+
+      Two query modes — project picks per aggregation:
+
+      Mode A (regex over .txt — works on every gate):
+        - name: untranslated-by-locale
+          gate: untranslated-strings
+          extract: "(?im)missing key: (\\S+)"
+
+      Mode B (JSON field over .json — requires T11's structured
+      output; richer queries):
+        - name: security-by-severity
+          gate: security-auditor
+          field: severity              # extracts findings[].severity
+        - name: design-by-category
+          gate: design-fidelity
+          field: finding_letter
+        - name: security-by-category-and-severity
+          gate: security-auditor
+          fields: [category, severity] # composite key, joined with ":"
+
+      Mutual exclusivity: each aggregation entry sets exactly one of
+      {extract, field, fields}. Loader rejects "both" or "neither"
+      with a clear message.
+
+      Server endpoint: GET /api/aggregate/<aggregation-name>
+        - Walks {plans_dir}/task-*/gates/.
+        - Mode A: reads <gate>.txt, applies regex, captures group 1
+          (or full match if no group).
+        - Mode B (field/fields): reads <gate>.json, iterates
+          findings[], extracts the field(s). Missing field →
+          finding bucketed as "(unknown)". Findings without the
+          requested field count toward "(unknown)" but don't crash.
+        - Returns rows of {finding, total_count, per_task: {task_id:
+          count}} sorted by total_count descending.
+
+      aggregations.yaml lives outside the tasks-file schema —
+      dashboard-only. Server validates at request time. Bad regex
+      OR malformed yaml → 500 with helpful message. Missing
+      .json file (gate didn't emit appendix) → silently skip that
+      task in field-mode aggregation; the regex-mode fallback path
+      stays via .txt.
+
+      Dashboard: new Aggregations panel with one card per
+      configured aggregation. Each card shows top-N findings as a
+      bar list with task-id breakdown on hover. Sparkline of
+      finding count vs task ID (ascending) gives the trend.
+
+      Tests: (a) endpoint walks task dirs correctly, (b) Mode A
+      regex extracts from gate output text, (c) Mode B reads .json
+      and iterates findings[], (d) Mode B with missing field
+      buckets as "(unknown)", (e) Mode B composite `fields`
+      produces "ACL:critical"-style joined keys, (f) per-task count
+      and total align, (g) missing gate dir silently skipped, (h)
+      bad regex returns 500, (i) both extract and field set
+      returns 400.
+    key_files:
+      - src/claude_plan_execute/server.py
+      - src/claude_plan_execute/dashboard/index.html
+      - tests/test_server.py
+    commit_message: "feat: cross-task gate-result aggregation"
+    depends_on: [11]
+
+  # ── Phase: parallelism ───────────────────────────────────────────────────
+  - id: 13
+    phase: parallelism
+    title: "feat: parallel task execution with key_files contention guard"
+    description: |
+      Closes v0.3-scope §2.5. Allow multiple tasks to run
+      concurrently when independent AND not sharing key_files. Opt-in
+      via defaults.parallelism: int (default 1 = current behavior).
+
+      Schema additions:
+        Defaults.parallelism: int = 1
+
+      Schema-level interlock (loader-rejected, NOT runtime-rejected):
+        If defaults.parallelism > 1 AND defaults.branch_per_task is
+        false, raise a ValidationError at load time with a clear
+        message:
+          "parallelism > 1 requires branch_per_task: true; parallel
+           commits to a single branch race and lose work."
+        Implement in TasksFile model_validator(mode='after').
+
+      Eligibility predicate (in runner): a task is eligible to start
+      when ALL of:
+        - All depends_on tasks have status=done.
+        - No in-flight task shares any path in key_files.
+        - All required services for this task are up (T8 manager).
+
+      Scheduler: replace cli.main()'s sequential
+      `for task in ordered_tasks` with a worker pool.
+        - ThreadPoolExecutor(max_workers=parallelism).
+        - Workers loop: pick next eligible task, run execute_task,
+          repeat until no eligible tasks AND no in-flight tasks.
+        - State.save() must remain atomic (it already uses tempfile
+          + rename — preserve that).
+        - Eligibility re-checked after each task completion.
+
+      Branch isolation: parallel tasks each work on their own branch
+      (T9 branch_per_task). The interlock above enforces this.
+
+      Service contention:
+        - Services with lifetime=task: each parallel worker entering
+          a task starts its own instance. Project must use distinct
+          ports / dirs. T8's ServiceManager scopes log_file paths
+          per (service, task_id) when lifetime=task.
+        - Services with lifetime=run: shared across workers (the
+          ManagerEnsureRequest is idempotent — already-up = no-op).
+
+      Rate-limit contention: parallelism multiplies the rate at
+      which we hit Anthropic API caps. T1's retry wrapper absorbs
+      short bursts. Document the recommendation in T13: start with
+      parallelism=2, scale up only if rate-limit retries are rare
+      in observed runs.
+
+      Dashboard: change task panel from "single in-flight panel" to
+      "N concurrent panels" with separate log streams per worker.
+      WebSocket broadcast tags each event with worker_id. The
+      Services panel from T8 stays singular (services are shared).
+
+      Decisions:
+        - Why ThreadPoolExecutor not multiprocessing? Runner is
+          I/O-bound (subprocess + git + filesystem). Threads share
+          State + log multiplexing for free. Subprocess child
+          processes are isolated regardless.
+        - Why key_files contention check, not actual git diff?
+          Same as touches:<glob> rationale — declared intent beats
+          dynamic detection, and it's check-able BEFORE running the
+          task.
+        - Why interlock at load, not runtime? Better failure mode —
+          the user sees the error before any work runs.
+
+      Tests: (a) parallelism=1 behaves identically to v0.2.0,
+      (b) parallelism=2 runs two independent tasks concurrently,
+      (c) eligibility predicate blocks a third task when two share
+      key_files, (d) parallelism>1 + branch_per_task=false raises
+      ValidationError at load, (e) failure on one worker doesn't
+      kill others, (f) state.json updates atomically across workers
+      under contention (use threading.Lock around save() if not
+      already).
+    key_files:
+      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/cli.py
+      - src/claude_plan_execute/schema.py
+      - src/claude_plan_execute/loader.py
+      - src/claude_plan_execute/state.py
+      - src/claude_plan_execute/server.py
+      - src/claude_plan_execute/dashboard/index.html
+      - tests/test_runner.py
+      - tests/test_schema.py
+    commit_message: "feat: parallel task execution with key_files contention guard"
+    depends_on: [8, 9]
+
+  # ── Phase: documentation ─────────────────────────────────────────────────
+  - id: 14
+    phase: documentation
+    title: "docs: v0.3 release, migration, recipes"
+    description: |
+      Closes v0.3-scope §§2.1, 2.8, 2.9, 2.10 (already-handled
+      patterns made discoverable via recipes) plus complete
+      documentation for everything T1–T13 shipped.
+
+      Updates:
+        - README.md: new sections for services, branch_per_task,
+          --explain, kind: human gate, parallel execution, token
+          observability. Bump version mentions to 0.3.0.
+        - pyproject.toml: bump to 0.3.0. Confirm pathspec is in
+          install_requires (T3 added it; this verifies).
+        - docs/migration-v2.md: add a banner pointing to v3
+          migration; keep content for v1→v2 path.
+
+      New files:
+        - docs/migration-v3.md: side-by-side v0.2 → v0.3 examples
+          per primitive. Explicitly call out backward compat (every
+          new primitive opt-in; no v0.2.0 task file breaks).
+
+      docs/recipes/ — make existing capabilities discoverable:
+        - custom-agent-gates.md (closes §2.1): the invariants.yaml
+          mechanism with rename emphasis from "invariants" to
+          "custom gates / invariants". Worked example: registering
+          a domain-flow validator without editing build-tool source.
+        - multi-suite-tests.md (closes §2.8): registering
+          tests-backend, tests-frontend, tests-worker as separate
+          shell gates. Failure semantics, output isolation per
+          gate file.
+        - persona-vs-claude-md.md (closes §2.9): precedence and
+          intended use. CLAUDE.md auto-loaded by Claude CLI for
+          repo-wide conventions; persona.md injected by build tool
+          for per-phase prompt overlay; decisions/ for ADR-style
+          rationales surfaced at plan time; failure-context for
+          per-attempt prior failure summaries. When each layer is
+          right.
+        - migration-via-task-implementer.md (closes §2.10): the
+          implicit pattern — task that ships a schema migration
+          also runs the migration in its implement phase, and its
+          tests gate exercises the post-migration DB. With the
+          services: block (T8), the DB is up; the implementer
+          handles apply.
+
+      docs/recipes/ — new primitives shipped in v0.3:
+        - services.md (T8): the services: block — postgres, redis,
+          dev-server, log inspection, restart from dashboard.
+          Lifetime semantics. Ready-check kinds.
+        - branch-per-task.md (T9): enabling branch_per_task,
+          operator hygiene re: mid-run merges, gh CLI install + auth
+          prerequisites, GitLab/Forgejo not supported in v0.3.
+        - human-checkpoint.md (T10): registering human-checkpoint
+          gates in invariants.yaml; phase-end checkpoint patterns;
+          dashboard Approve/Reject UX; CLI approve/reject
+          subcommands.
+        - parallelism.md (T13): enabling parallelism>1 (requires
+          branch_per_task=true), key_files contention semantics,
+          rate-limit considerations, recommended starting value of 2.
+        - structured-findings.md (T11): the
+          <!-- BEGIN_FINDINGS_JSON --> appendix; per-template
+          schemas (security-auditor, test-critique, design-fidelity);
+          how to add an appendix to a project-supplied custom gate
+          (in invariants.yaml); the lock-in escape hatch (templates
+          own schemas; runner stays gate-agnostic; missing fields
+          bucket to "(unknown)").
+        - aggregation.md (T12): writing aggregations.yaml — both
+          regex (mode A, works on any gate) and JSON field (mode B,
+          requires structured findings from T11). When to pick which.
+          Composite `fields:` joining. Dashboard panel surfaces.
+        - resume-on-context-fill.md (T6): the WIP-commit +
+          progress.md convention; how dirty-tree resume works; what
+          NOT to do (manually edit progress.md mid-run).
+        - rate-limit-and-tokens.md (T1, T2): rate-limit retry
+          tuning; reading usage.jsonl; sum logic; what hard caps
+          would look like in v0.4.
+
+      No source tests changed in this task. The slate's existing
+      test gate runs; this task's only gate change is "tests +
+      lint" (the project default).
     key_files:
       - README.md
+      - pyproject.toml
       - docs/migration-v2.md
-    commit_message: "docs: README + v2 migration guide"
-    depends_on: [3, 4, 6, 9, 11]
-
-  - id: 20
-    phase: gates
-    title: "Built-in gate: design-fidelity (Playwright MCP agent gate)"
-    description: |
-      Sonnet/medium agent gate that uses the preconfigured Playwright MCP to drive
-      a real browser against the project's running dev server. Verifies semantic
-      design properties at multiple viewports (320, 768, 1280): no horizontal
-      scroll, semantic structure (headings, landmarks), interactive element sizes
-      (touch targets >=44px on mobile), focus-visible rings, contrast ratios,
-      no overflow on the key flows declared in docs/persona.md. Reads design
-      rules from docs/persona.md (auto-injected by the persona loader from
-      task 7). Returns PASS/FAIL with itemized findings.
-
-      Flag-only — never auto-edits the implementation. On FAIL, the gate writes
-      its findings to plans/task-{id}/gates/design-fidelity.txt; the next
-      implement attempt sees the verbatim findings under [FAILURE CONTEXT]
-      (task 10) and is asked to address them. This is the same loop as
-      test-critique (task 15), just driven by browser observation instead of
-      static diff reading.
-
-      Gate registration in gates/builtin.py:
-        - kind: agent
-        - prompt_template: src/claude_plan_execute/gates/templates/design-fidelity.md
-        - model: sonnet, effort: medium
-        - on_failure: block
-        - parallel_safe: false  (assumes exclusive use of the running dev server)
-        - when: ["task_class:ui"]  (only runs on UI tasks; non-UI tasks skip it)
-
-      The Playwright MCP is preconfigured at the agent runtime — no --mcp-config
-      plumbing is required in the runner. The prompt template tells the agent to
-      use the Playwright MCP tools (browser_navigate, browser_snapshot,
-      browser_resize, browser_evaluate, etc.). The dev server URL is read from
-      defaults.dev_server_url in tasks.yaml (fallback http://localhost:5173).
-      The dev server is the project's responsibility to start before the run;
-      the gate does not orchestrate it.
-
-      Tests: tests/test_gates_design_fidelity.py with a mocked agent run
-      verifying registration, the when-filter behavior, and that PASS/FAIL
-      output is captured to the gate output file. No live browser in tests.
-    key_files:
-      - src/claude_plan_execute/gates/builtin.py
-      - src/claude_plan_execute/gates/templates/design-fidelity.md
-      - tests/test_gates_design_fidelity.py
-    commit_message: "feat: design-fidelity Playwright MCP agent gate"
-    depends_on: [11]
-
-  - id: 21
-    task_class: refactor
-    title: "Clean working tree, verify green, merge to trunk"
-    description: |
-      Final task. Make the repo shippable, verify it, and merge the feature
-      branch (feat/v2-enhancement-slate) into the trunk branch (main if it
-      exists, else master).
-
-      PRECONDITIONS:
-      - All prior tasks (1..20) are status: done in plans/state.json.
-      - The current branch is feat/v2-enhancement-slate.
-      - Two git stashes exist (stash@{0}, stash@{1}) holding the user's
-        pre-slate modifications to workflow-dashboard.html and
-        workflow-server.py. DO NOT touch the stashes — that is user data
-        the user will integrate manually post-merge.
-
-      STEPS (execute in this exact order; verify each before continuing):
-
-      1. Update .gitignore to include (if not already present): plans/,
-         .idea/, *.egg-info, src/*.egg-info, __pycache__/, .DS_Store. After
-         editing, run `git status` — confirm no previously-tracked file has
-         been moved to ignored. If any was, abort.
-
-      2. Track project-config files that should be committed but currently
-         are not. The expected set is exactly:
-           - tasks.yaml at repo root (the slate's input config)
-           - docs/enhancement-plan.md (the v2 strategy document; was
-             intentionally untracked at slate-start, must be committed
-             now so the strategy travels with the merge)
-           - docs/migration-v2.md (was added by task 19; check tracked
-             status — if already tracked from task 19's commit, omit)
-         Stage them with specific paths only:
-            git add .gitignore tasks.yaml docs/enhancement-plan.md
-         DO NOT use `git add -A`, `git add .`, or `git add docs/` — those
-         risk sweeping up user-only files. If docs/enhancement-plan.md
-         is missing, abort and report.
-
-      3. Run `pytest -q`. The output must report 0 failures. If any test
-         fails, abort.
-
-      4. Run `./claude-plan-execute --list`. Must list 21 tasks (1..21)
-         and exit 0.
-
-      5. Run `./claude-plan-execute --task 1 --dry-run`. Must exit 0 and
-         print a prompt (the v1 fast-path that proves prompt composition
-         and config resolution work end-to-end).
-
-      6. Commit the staged changes from steps 1–2 with the commit message
-         from this task's commit_message field. This is task 21's commit
-         on feat/v2-enhancement-slate.
-
-      7. Determine the trunk branch:
-            git show-ref --verify --quiet refs/heads/main && echo main || echo master
-         Capture into shell variable TRUNK.
-
-      8. Run `git checkout $TRUNK`. Verify with `git status` that the
-         working tree is clean (no modified, no staged, untracked only
-         the gitignored set). If not clean, abort.
-
-      9. Merge the feature branch with an explicit merge commit (NOT
-         fast-forward). Use this exact command:
-            git merge --no-ff feat/v2-enhancement-slate -m "Merge v2 enhancement slate (20 tasks + fix-ups)"
-
-      10. Run `pytest -q` on the merged trunk. The output must report 0
-          failures.
-
-      11. Run `git log --oneline -5` to display the merge commit and
-          recent history. Print: "v2 slate merged to $TRUNK. Push when
-          ready: git push origin $TRUNK"
-
-      FORBIDDEN OPERATIONS (the agent must refuse these even if it
-      believes they would help):
-      - git push (any flavor)
-      - git push --force or --force-with-lease
-      - git reset --hard (anything)
-      - git stash drop, git stash pop, git stash clear
-      - git branch -D, git branch -d on feat/v2-enhancement-slate
-      - --no-verify on any commit
-      - --no-gpg-sign on any commit
-      - git add -A, git add ., git add docs/, git add src/, or any
-        non-specific git add path
-      - git rebase or git rebase -i
-      - git filter-branch, git filter-repo
-      - editing or deleting any file under plans/
-
-      ON ANY FAILURE: stop immediately. Write a one-page status to
-      docs/v2-status.md naming the failed step, the verbatim error, and
-      the current git state (`git status`, `git log -3 --oneline`,
-      `git stash list`). Do not improvise; do not partially recover.
-    key_files:
-      - .gitignore
-      - tasks.yaml
-      - docs/migration-v2.md
-    commit_message: "chore: track project config and clean working tree"
-    depends_on: [19, 20]
+      - docs/migration-v3.md
+      - docs/recipes/custom-agent-gates.md
+      - docs/recipes/multi-suite-tests.md
+      - docs/recipes/persona-vs-claude-md.md
+      - docs/recipes/migration-via-task-implementer.md
+      - docs/recipes/services.md
+      - docs/recipes/branch-per-task.md
+      - docs/recipes/human-checkpoint.md
+      - docs/recipes/parallelism.md
+      - docs/recipes/aggregation.md
+      - docs/recipes/structured-findings.md
+      - docs/recipes/resume-on-context-fill.md
+      - docs/recipes/rate-limit-and-tokens.md
+    commit_message: "docs: v0.3 release notes, migration, recipes"
+    depends_on: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
