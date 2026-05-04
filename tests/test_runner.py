@@ -184,10 +184,11 @@ def test_implement_prompt_includes_commit_message_verbatim():
 
 
 def test_implement_prompt_byte_length_matches_baseline():
+    # Task 6 v0.3 §D1: WIP-commit + progress.md instructions added.
     out = build_implement_prompt(
         {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 350
+    assert len(out) == 1129
 
 
 # ---------------------------------------------------------------------------
@@ -5221,3 +5222,421 @@ def test_execute_task_design_fidelity_skipped_when_implementer_timed_out(
     assert gate_called == []
     assert state.get(1)["status"] == "blocked"
     assert state.get(1)["block_reason"] == "implementer_timeout"
+
+
+# ---------------------------------------------------------------------------
+# V. progress.md resume routing (task 6 v0.3)
+# ---------------------------------------------------------------------------
+
+
+def _seed_progress(tmp_path, tid, body):
+    task_dir = tmp_path / f"task-{tid}"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "progress.md").write_text(body, encoding="utf-8")
+    # plan.md must also exist so the resume route can reference it
+    # without the runner short-circuiting on missing plan.
+    (task_dir / "plan.md").write_text("placeholder plan")
+
+
+# V1. Fresh: no progress.md → normal flow
+
+
+def test_execute_task_no_progress_md_uses_implement_builder(monkeypatch, tmp_path):
+    """Pin §D4: with no progress.md present, the runner uses
+    build_implement_prompt (not build_resume_prompt) at the
+    Phase-3 call site."""
+    captured: dict = {}
+    real_build_impl = runner.build_implement_prompt
+
+    def spy_impl(*args, **kwargs):
+        captured["impl"] = True
+        return real_build_impl(*args, **kwargs)
+
+    def spy_resume(*args, **kwargs):
+        captured["resume"] = True
+        return ""  # never called; assert this
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_implement_prompt", spy_impl)
+    monkeypatch.setattr("claude_plan_execute.runner.build_resume_prompt", spy_resume)
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert captured.get("impl") is True
+    assert captured.get("resume") is None
+
+
+def test_execute_task_no_progress_md_records_progress_path_anyway(
+    monkeypatch, tmp_path,
+):
+    """Pin §D6: progress_path is tracked on the entry even when the
+    file doesn't exist yet (so the dashboard knows where to look)."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["progress_path"].endswith("task-1/progress.md")
+
+
+# V2. Mid-list resume: [~] / [ ] present
+
+
+def test_execute_task_mid_list_progress_uses_resume_builder(monkeypatch, tmp_path):
+    """Pin §D4.3: progress.md with [~] or [ ] items routes to
+    build_resume_prompt and skips build_implement_prompt."""
+    captured: dict = {}
+    real_build_resume = runner.build_resume_prompt
+
+    def spy_resume(*args, **kwargs):
+        captured["resume"] = True
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_build_resume(*args, **kwargs)
+
+    def spy_impl(*args, **kwargs):
+        captured["impl"] = True
+        return ""
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_resume_prompt", spy_resume)
+    monkeypatch.setattr("claude_plan_execute.runner.build_implement_prompt", spy_impl)
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    _seed_progress(tmp_path, 1, "- [x] step a\n- [~] step b\n- [ ] step c")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},  # No skip_to — progress.md should force resume route.
+    )
+    assert captured.get("resume") is True
+    assert captured.get("impl") is None
+
+
+def test_execute_task_mid_list_skips_plan_and_review(monkeypatch, tmp_path):
+    """Pin §D4.1 / §D4.2: progress.md mid-list forces skip of Phase 1
+    and Phase 2 even when --skip-to is unset (i.e., the default flow
+    that would otherwise plan + review)."""
+    called = []
+
+    def stub(prompt, **kwargs):
+        called.append(kwargs)
+        claude._last_run_subtype = "success"
+        claude._last_run_timed_out = False
+        return 0, "ok"
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    _seed_progress(tmp_path, 1, "- [~] step b\n- [ ] step c")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},  # No skip_to: would normally plan + review + implement.
+    )
+    # Expect EXACTLY one run_claude call (the resume Implement). The
+    # plan and review calls would push this above 1.
+    assert len(called) == 1
+
+
+def test_execute_task_mid_list_passes_progress_text_to_builder(
+    monkeypatch, tmp_path,
+):
+    """Pin §D2: the runner passes the on-disk progress.md content
+    verbatim into the resume builder."""
+    captured: dict = {}
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        return "PROMPT"
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_resume_prompt", spy)
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    body = "- [x] done step\n- [~] mid step\n- [ ] todo"
+    _seed_progress(tmp_path, 1, body)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    # build_resume_prompt(task, plan_path, progress_path,
+    #                     progress_md_text, dirty_porcelain, commit_msg, ...)
+    args = captured["args"]
+    assert args[3] == body  # progress_md_text
+
+
+# V3. Dirty-tree porcelain capture
+
+
+def test_execute_task_mid_list_runs_git_status_porcelain(monkeypatch, tmp_path):
+    """Pin §D5: the runner shells out `git status --porcelain` on
+    the resume route. Stub subprocess.run; assert the cmd."""
+    invocations = []
+
+    def fake_run(cmd, **kwargs):
+        invocations.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = " M src/foo.py\n"
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+    _seed_progress(tmp_path, 1, "- [~] step")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    assert ["git", "status", "--porcelain"] in invocations
+
+
+def test_execute_task_mid_list_surfaces_porcelain_into_resume_prompt(
+    monkeypatch, tmp_path,
+):
+    """Pin §D2: the porcelain output reaches the resume prompt
+    body via the dirty_tree_porcelain kwarg."""
+    captured: dict = {}
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        return "PROMPT"
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_resume_prompt", spy)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "?? new_file.py\n"
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+    _seed_progress(tmp_path, 1, "- [~] step")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    # build_resume_prompt(task, plan_path, progress_path,
+    #                     progress_md_text, dirty_porcelain, ...)
+    assert "?? new_file.py" in captured["args"][4]
+
+
+def test_execute_task_mid_list_git_failure_yields_empty_porcelain(
+    monkeypatch, tmp_path,
+):
+    """Pin §D5: defensive — git binary missing / non-repo / timeout
+    → empty porcelain string, builder's clean-tree branch fires."""
+    captured: dict = {}
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        return "PROMPT"
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_resume_prompt", spy)
+
+    def boom(*args, **kwargs):
+        raise FileNotFoundError("git not installed")
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", boom,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+    _seed_progress(tmp_path, 1, "- [~] step")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    assert captured["args"][4] == ""
+
+
+# V4. All-[x] route: skip Phase 3, run Phase 4 only
+
+
+def test_execute_task_all_done_progress_skips_implement(monkeypatch, tmp_path):
+    """Pin §D4.3: all-[x] progress.md → Phase 3 is skipped entirely;
+    no run_claude invocation; runner falls through to Phase 4."""
+    called = []
+
+    def stub(prompt, **kwargs):
+        called.append(kwargs)
+        claude._last_run_subtype = "success"
+        return 0, "ok"
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    _seed_progress(tmp_path, 1, "- [x] one\n- [x] two\n- [x] three")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    # Zero run_claude calls — Plan + Review + Implement all skipped.
+    assert called == []
+
+
+def test_execute_task_all_done_progress_still_runs_gates(
+    monkeypatch, tmp_path,
+):
+    """Pin §D7: Phase 4 fires even when Implement was skipped."""
+    invoked = []
+
+    def fake_run(cmd, **kwargs):
+        invoked.append(list(cmd))
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    # The capture-porcelain helper also routes through subprocess.run
+    # — but only on the mid-list route, not all-[x]. Stub it here too
+    # to be safe.
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+
+    _seed_progress(tmp_path, 1, "- [x] all done")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests"],
+            "test_command": "pytest -q",
+        },
+        cli={},
+    )
+    # The tests gate ran:
+    assert ["bash", "-c", "pytest -q"] in invoked
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_all_done_progress_does_NOT_call_resume_builder(
+    monkeypatch, tmp_path,
+):
+    """Pin §D4.3: all-[x] route does NOT call build_resume_prompt."""
+    captured: dict = {}
+
+    def spy(*args, **kwargs):
+        captured["resume"] = True
+        return ""
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_resume_prompt", spy)
+    _seed_progress(tmp_path, 1, "- [x] one\n- [x] two")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    assert captured.get("resume") is None
+
+
+# V5. Edge cases
+
+
+def test_execute_task_empty_progress_md_treated_as_fresh(
+    monkeypatch, tmp_path,
+):
+    """Pin §D4: empty file (no checklist items) → fresh route."""
+    captured: dict = {}
+    real_build_impl = runner.build_implement_prompt
+
+    def spy_impl(*args, **kwargs):
+        captured["impl"] = True
+        return real_build_impl(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_implement_prompt", spy_impl)
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    _seed_progress(tmp_path, 1, "")  # empty file
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert captured.get("impl") is True
+
+
+def test_execute_task_progress_md_with_no_items_treated_as_fresh(
+    monkeypatch, tmp_path,
+):
+    """Pin: a progress.md that has paragraphs but no checklist items
+    → fresh route (no_done == 0, no_active == 0)."""
+    captured: dict = {}
+    real_build_impl = runner.build_implement_prompt
+
+    def spy_impl(*args, **kwargs):
+        captured["impl"] = True
+        return real_build_impl(*args, **kwargs)
+
+    monkeypatch.setattr("claude_plan_execute.runner.build_implement_prompt", spy_impl)
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    _seed_progress(
+        tmp_path, 1,
+        "# Progress\n\nSome notes without a checklist.\n",
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert captured.get("impl") is True
+
+
+def test_execute_task_status_stays_implementing_during_resume(
+    monkeypatch, tmp_path,
+):
+    """Pin §D8: resume run sets status to 'implementing' (no
+    'resuming' status added). On success, transitions to 'done'."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _seed_progress(tmp_path, 1, "- [~] step")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    # Final state after a successful resume run: done.
+    # No 'resuming' enum value should ever appear in STATUSES.
+    from claude_plan_execute.state import STATUSES
+    assert "resuming" not in STATUSES
+    assert state.get(1)["status"] == "done"

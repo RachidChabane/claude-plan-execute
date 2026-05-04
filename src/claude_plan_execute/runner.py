@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,8 +27,10 @@ from claude_plan_execute.prompts import (
     build_implement_prompt,
     build_persona_section,
     build_plan_prompt,
+    build_resume_prompt,
     build_review_prompt,
     build_revise_prompt,
+    parse_progress_status,
 )
 from claude_plan_execute.state import State, make_failure_record
 
@@ -107,6 +110,28 @@ def execute_task(
     prior_attempts = list(entry.get("attempts", []))
     failure_context_section = build_failure_context_section(prior_attempts)
 
+    # Resume routing (task 6 v0.3 §D4). progress.md is the sidecar
+    # checklist the implementer maintains across chunks. Existence +
+    # at-least-one-active-item ([~] or [ ]) → "resume in progress;
+    # skip Plan + Review and use the resume builder for Implement."
+    # Existence + zero-active-items + at-least-one-done → "all work
+    # done pending gates" — skip Plan + Review + Implement and fall to
+    # Phase 4. No file (or empty checklist) → fresh run.
+    progress_path = task_dir / "progress.md"
+    progress_text = _read_progress_text(progress_path)
+    n_done, n_in_progress, n_pending = parse_progress_status(progress_text)
+    has_active = n_in_progress > 0 or n_pending > 0
+    if not progress_text or (n_done == 0 and not has_active):
+        resume_mode = "fresh"
+    elif has_active:
+        resume_mode = "mid_list"
+    else:
+        resume_mode = "all_done"
+    state.set_status(
+        tid, state.get(tid)["status"],
+        progress_path=str(progress_path),
+    )
+
     plan_path = task_dir / "plan.md"
 
     model = resolved["model"]["value"]
@@ -163,7 +188,7 @@ def execute_task(
     )
 
     # --- PHASE 1: PLAN ---
-    if skip_to not in ("review", "implement"):
+    if skip_to not in ("review", "implement") and resume_mode == "fresh":
         _current_phase = "plan"
         print(f"\n{bold('--- Phase 1: Planning ---')}")
         state.set_status(tid, "planning", plan_path=str(plan_path))
@@ -192,7 +217,7 @@ def execute_task(
             return
 
     # --- PHASE 2: REVIEW LOOP ---
-    if skip_to != "implement":
+    if skip_to != "implement" and resume_mode == "fresh":
         _current_phase = "review"
         print(f"\n{bold('--- Phase 2: Review Loop ---')}")
         prev_feedback = ""
@@ -289,60 +314,74 @@ def execute_task(
 
     # --- PHASE 3: IMPLEMENT ---
     _current_phase = "implement"
-    print(f"\n{bold('--- Phase 3: Implementation ---')}")
-    state.set_status(tid, "implementing")
-
-    prompt = build_implement_prompt(
-        task, str(plan_path), commit_msg,
-        persona=persona_section,
-        failure_context=failure_context_section,
-    )
-    if dry_run:
-        print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
-        return
-
-    run_claude(prompt, max_turns=impl_turns, timeout_minutes=impl_timeout, **run_kwargs)
-
-    if claude._last_run_rate_limited:
-        _record_rate_limited_and_block(
-            state, tid, phase="implement", plan_path=plan_path,
-            max_rate_limit_retries=max_rate_limit_retries,
-        )
-        return
-
-    if claude._last_run_timed_out:
-        state.set_status(
-            tid, "blocked",
-            block_reason="implementer_timeout",
-        )
-        state.record_failure(tid, make_failure_record(
-            failure_class="implementer_timeout",
-            phase="implement",
-            reason=(
-                f"Implementer exceeded the {impl_timeout}-minute "
-                f"wall-clock timeout."
-            ),
-            artifacts={"plan": str(plan_path)},
+    if resume_mode == "all_done":
+        print(f"\n{bold('--- Phase 3: Implementation (skipped) ---')}")
+        print(green(
+            f"  All progress.md items marked [x]; gates will validate."
         ))
-        print(red(f"\n  Task {tid} blocked: implementer timeout."))
-        return
+    else:
+        print(f"\n{bold('--- Phase 3: Implementation ---')}")
+        state.set_status(tid, "implementing")
+        if resume_mode == "mid_list":
+            porcelain = _capture_git_porcelain()
+            prompt = build_resume_prompt(
+                task, str(plan_path), str(progress_path),
+                progress_text, porcelain, commit_msg,
+                persona=persona_section,
+                failure_context=failure_context_section,
+            )
+        else:  # "fresh"
+            prompt = build_implement_prompt(
+                task, str(plan_path), commit_msg,
+                persona=persona_section,
+                failure_context=failure_context_section,
+            )
+        if dry_run:
+            print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
+            return
 
-    if claude._last_run_subtype == "error_max_turns":
-        state.set_status(
-            tid, "blocked",
-            block_reason="implementer_max_turns",
-        )
-        state.record_failure(tid, make_failure_record(
-            failure_class="implementer_max_turns",
-            phase="implement",
-            reason=(
-                f"Implementer hit the {impl_turns}-turn cap "
-                f"(CLI subtype 'error_max_turns')."
-            ),
-            artifacts={"plan": str(plan_path)},
-        ))
-        print(red(f"\n  Task {tid} blocked: implementer max-turns."))
-        return
+        run_claude(prompt, max_turns=impl_turns, timeout_minutes=impl_timeout, **run_kwargs)
+
+        if claude._last_run_rate_limited:
+            _record_rate_limited_and_block(
+                state, tid, phase="implement", plan_path=plan_path,
+                max_rate_limit_retries=max_rate_limit_retries,
+            )
+            return
+
+        if claude._last_run_timed_out:
+            state.set_status(
+                tid, "blocked",
+                block_reason="implementer_timeout",
+            )
+            state.record_failure(tid, make_failure_record(
+                failure_class="implementer_timeout",
+                phase="implement",
+                reason=(
+                    f"Implementer exceeded the {impl_timeout}-minute "
+                    f"wall-clock timeout."
+                ),
+                artifacts={"plan": str(plan_path)},
+            ))
+            print(red(f"\n  Task {tid} blocked: implementer timeout."))
+            return
+
+        if claude._last_run_subtype == "error_max_turns":
+            state.set_status(
+                tid, "blocked",
+                block_reason="implementer_max_turns",
+            )
+            state.record_failure(tid, make_failure_record(
+                failure_class="implementer_max_turns",
+                phase="implement",
+                reason=(
+                    f"Implementer hit the {impl_turns}-turn cap "
+                    f"(CLI subtype 'error_max_turns')."
+                ),
+                artifacts={"plan": str(plan_path)},
+            ))
+            print(red(f"\n  Task {tid} blocked: implementer max-turns."))
+            return
 
     # --- PHASE 4: GATES (task 11) ---
     # `defaults.gates` (project-level list of names) + `phases[i].
@@ -493,6 +532,40 @@ def _record_rate_limited_and_block(
         artifacts=artifacts,
     ))
     print(red(f"\n  Task {tid} blocked: rate-limit retries exhausted."))
+
+
+def _read_progress_text(progress_path: Path) -> str:
+    """Read progress.md if present, else return ''.
+
+    Defensive against transient I/O errors so a stat-race doesn't crash
+    routing.
+    """
+    if not progress_path.is_file():
+        return ""
+    try:
+        return progress_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _capture_git_porcelain() -> str:
+    """Run `git status --porcelain` and return stdout (or '' on any failure).
+
+    Only called from the resume route. Failures are silent — a non-git
+    working tree, a missing git binary, or a permissions error all yield
+    '' and the resume prompt's clean-tree branch fires. Bounded timeout
+    because the runner must not hang here.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
 
 
 def handle_sigint(signum, frame):

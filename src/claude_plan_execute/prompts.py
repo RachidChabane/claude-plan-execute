@@ -5,6 +5,8 @@ string sent to the `claude` CLI as the `-p` argument.
 """
 from __future__ import annotations
 
+import re
+
 
 # Per-attempt verbatim is already capped at 4 KB by `make_failure_record`
 # at write time. Block-level cap applies to the whole rendered failure-
@@ -261,15 +263,125 @@ def build_revise_prompt(task: dict, plan_path: str, review_path: str,
 def build_implement_prompt(task: dict, plan_path: str,
                            commit_message: str, *, persona: str = "",
                            failure_context: str = "") -> str:
+    tid = task["id"]
+    progress_path = f"plans/task-{tid}/progress.md"
     return failure_context + persona + (
         f"You are implementing a validated plan.\n"
         f"The plan has been reviewed and approved. Follow it precisely.\n\n"
-        f"TASK {task['id']}: {task['title']}\n\n"
+        f"TASK {tid}: {task['title']}\n\n"
         f"Read the validated plan at: {plan_path}\n\n"
         f"INSTRUCTIONS:\n"
         f"1. Read the plan completely before starting.\n"
         f"2. Implement every item in the plan, in order.\n"
-        f"3. Commit with message:\n"
+        f"3. Work in commit-sized chunks. After each logically-complete\n"
+        f"   chunk, run:\n"
+        f"     git add -A && git commit -m \"task-{tid} WIP: <chunk-description>\"\n"
+        f"   Continue with the next chunk.\n"
+        f"4. Maintain a checklist at {progress_path} with one item per\n"
+        f"   plan step. Mark items as you go:\n"
+        f"     [ ] not started\n"
+        f"     [~] in progress\n"
+        f"     [x] done\n"
+        f"   Update the file BEFORE each commit so the on-disk state matches\n"
+        f"   what's committed.\n"
+        f"5. If you sense the turn budget is running low, commit the current\n"
+        f"   chunk, update {progress_path}, and finish the session cleanly\n"
+        f"   (do NOT start a new chunk you can't finish). The runner detects\n"
+        f"   the partial progress and resumes on the next invocation.\n"
+        f"6. After every chunk is committed and the checklist reads all\n"
+        f"   [x], create the final commit with message:\n"
         f"   {commit_message}\n\n"
         f"Do not skip any part of the plan. Do not add unplanned features.\n"
     )
+
+
+def build_resume_prompt(
+    task: dict,
+    plan_path: str,
+    progress_path: str,
+    progress_md_text: str,
+    dirty_tree_porcelain: str,
+    commit_message: str,
+    *,
+    persona: str = "",
+    failure_context: str = "",
+) -> str:
+    """Build the Implement-phase prompt for a resume run.
+
+    Pure: no I/O. The runner pre-reads `progress.md` and runs
+    `git status --porcelain`, passing both as strings. Composition order
+    matches `build_implement_prompt`: `failure_context + persona + body`.
+    `dirty_tree_porcelain` may be the empty string when the working
+    tree is clean — the builder renders a clean-tree section in that
+    case.
+    """
+    tid = task["id"]
+    if dirty_tree_porcelain.strip():
+        dirty_section = (
+            f"## Uncommitted hunks detected\n\n"
+            f"`git status --porcelain` reports the following uncommitted\n"
+            f"changes from the prior session:\n\n"
+            f"```\n{dirty_tree_porcelain.rstrip()}\n```\n\n"
+            f"Before continuing the next chunk, choose ONE:\n"
+            f"  (a) Commit them as the next chunk:\n"
+            f"      git add -A && git commit -m \"task-{tid} WIP: <chunk-description>\"\n"
+            f"  (b) Revert them with a brief explanation in your reply\n"
+            f"      (`git restore -SW .` for tracked changes; `git clean\n"
+            f"      -fd` for untracked).\n"
+            f"Do NOT begin new work while uncommitted hunks remain — they\n"
+            f"will be lost or conflated with the next chunk's diff.\n\n"
+        )
+    else:
+        dirty_section = (
+            f"## Working tree is clean\n\n"
+            f"`git status --porcelain` reports no uncommitted changes.\n"
+            f"Continue with the next [~] or [ ] item below.\n\n"
+        )
+    return failure_context + persona + (
+        f"You are RESUMING an in-progress implementation.\n"
+        f"A prior session was interrupted (turn budget, timeout, or\n"
+        f"manual stop). The plan has already been reviewed and approved;\n"
+        f"earlier chunks have been committed as `task-{tid} WIP: ...`.\n\n"
+        f"TASK {tid}: {task['title']}\n\n"
+        f"Read the validated plan at: {plan_path}\n"
+        f"Read the existing checklist at: {progress_path}\n\n"
+        f"## Current checklist (from {progress_path})\n\n"
+        f"```\n{progress_md_text.rstrip()}\n```\n\n"
+        f"{dirty_section}"
+        f"INSTRUCTIONS:\n"
+        f"1. Re-read the plan and the checklist to orient.\n"
+        f"2. Continue with the FIRST item marked [~] (in progress) or\n"
+        f"   [ ] (not started). Do not redo items already marked [x].\n"
+        f"3. Work in commit-sized chunks. After each logically-complete\n"
+        f"   chunk, run:\n"
+        f"     git add -A && git commit -m \"task-{tid} WIP: <chunk-description>\"\n"
+        f"4. Update {progress_path} BEFORE each commit so the on-disk\n"
+        f"   state matches what's committed.\n"
+        f"5. If you sense the turn budget is running low, commit the\n"
+        f"   current chunk, update {progress_path}, and finish cleanly.\n"
+        f"6. After every checklist item reads [x], create the final\n"
+        f"   commit with message:\n"
+        f"   {commit_message}\n\n"
+        f"Do not re-plan. Do not add unplanned features. Treat the\n"
+        f"existing plan as authoritative; flag any discovered gaps in\n"
+        f"a follow-up but do not expand scope here.\n"
+    )
+
+
+_PROGRESS_ITEM_RE = re.compile(r"^\s*[-*+]\s*\[([ x~])\]", re.MULTILINE)
+
+
+def parse_progress_status(text: str) -> tuple[int, int, int]:
+    """Count [x] / [~] / [ ] markers in a progress.md body.
+
+    Returns (n_done, n_in_progress, n_pending). Markers must appear at
+    the start of a list item (-, *, or +) optionally preceded by
+    whitespace. Other markdown (headings, paragraphs, fenced blocks)
+    is ignored. Capital `X` is NOT recognized — the prompt mandates
+    lowercase. Pure: no I/O.
+    """
+    matches = _PROGRESS_ITEM_RE.findall(text)
+    n_done = sum(1 for m in matches if m == "x")
+    n_in_progress = sum(1 for m in matches if m == "~")
+    n_pending = sum(1 for m in matches if m == " ")
+    return n_done, n_in_progress, n_pending

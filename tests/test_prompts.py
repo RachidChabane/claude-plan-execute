@@ -274,12 +274,14 @@ def test_implement_prompt_prepends_persona_when_supplied():
 
 
 def test_implement_prompt_byte_length_unchanged_when_persona_empty():
-    """Pin (D7): with persona='', the prompt has the post-task-12
-    baseline byte count (test_command line removed)."""
+    """Pin: post-task-6-v0.3 baseline preserved when persona defaults to ''.
+
+    Task 6 v0.3 §D1 added the WIP-commit / progress.md instruction block.
+    """
     out = build_implement_prompt(
         {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 350
+    assert len(out) == 1129
 
 
 def test_implement_prompt_no_longer_mentions_tests():
@@ -293,16 +295,58 @@ def test_implement_prompt_no_longer_mentions_tests():
     assert "pytest" not in out
 
 
-def test_implement_prompt_step_3_is_commit():
-    """Renumbered: step 3 was 'Run tests', is now 'Commit'. Pin the
-    new shape so a future format change is intentional."""
+def test_implement_prompt_final_commit_is_step_6():
+    """Renumbered: task 6 v0.3 §D1 added WIP-commit + progress.md
+    instructions. Step 3 is now WIP commit chunks; step 4 is checklist
+    maintenance; step 5 is clean-stop on low turn budget; step 6 is
+    the final commit. Pin the new shape so a future format change is
+    intentional."""
     out = build_implement_prompt(
         {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert "3. Commit with message:" in out
-    # The old steps 4 and 5 must be gone.
-    assert "4. " not in out
-    assert "5. " not in out
+    assert "6. After every chunk is committed and the checklist reads all" in out
+    # Step 7 must NOT exist (the prompt ends with step 6).
+    assert "7. " not in out
+
+
+def test_implement_prompt_includes_wip_commit_instruction():
+    """Task 6 v0.3 §D1: the WIP commit message format is
+    `task-{id} WIP: <chunk>`."""
+    out = build_implement_prompt(
+        {"id": 7, "title": "T", "description": "D"}, "p.md", "msg",
+    )
+    assert "task-7 WIP:" in out
+    assert "git add -A && git commit -m" in out
+
+
+def test_implement_prompt_includes_progress_md_path():
+    """Task 6 v0.3 §D1: the prompt references the per-task progress.md
+    sidecar path under plans/task-{id}/."""
+    out = build_implement_prompt(
+        {"id": 42, "title": "T", "description": "D"}, "p.md", "msg",
+    )
+    assert "plans/task-42/progress.md" in out
+
+
+def test_implement_prompt_includes_low_turn_budget_clean_stop():
+    """Task 6 v0.3 §D1: the prompt instructs the agent to stop cleanly
+    when the turn budget is running low (so the runner can resume)."""
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
+    )
+    assert "turn budget" in out
+    assert "finish the session cleanly" in out
+
+
+def test_implement_prompt_includes_progress_marker_legend():
+    """Task 6 v0.3 §D1: the three states the runner relies on for
+    routing are explicitly enumerated."""
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
+    )
+    assert "[ ] not started" in out
+    assert "[~] in progress" in out
+    assert "[x] done" in out
 
 
 def test_implement_prompt_signature_does_not_accept_test_command():
@@ -799,8 +843,207 @@ def test_implement_prompt_failure_context_keyword_only():
 
 
 def test_implement_prompt_byte_length_unchanged_when_failure_context_empty():
-    """Pin: post-task-12 baseline preserved when failure_context defaults to ''."""
+    """Pin: post-task-6-v0.3 baseline preserved when failure_context defaults to ''.
+
+    Task 6 v0.3 §D1 added the WIP-commit / progress.md instruction block.
+    """
     out = build_implement_prompt(
         {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 350
+    assert len(out) == 1129
+
+
+# ---------------------------------------------------------------------------
+# F. build_resume_prompt + parse_progress_status (task 6 v0.3)
+# ---------------------------------------------------------------------------
+
+from claude_plan_execute.prompts import (
+    build_resume_prompt,
+    parse_progress_status,
+)
+
+
+# F1. parse_progress_status
+
+def test_parse_progress_status_empty_string_returns_zeros():
+    assert parse_progress_status("") == (0, 0, 0)
+
+
+def test_parse_progress_status_no_list_items_returns_zeros():
+    assert parse_progress_status("# Heading\n\nA paragraph.") == (0, 0, 0)
+
+
+def test_parse_progress_status_counts_done():
+    assert parse_progress_status("- [x] one\n- [x] two") == (2, 0, 0)
+
+
+def test_parse_progress_status_counts_in_progress():
+    assert parse_progress_status("- [~] one\n- [~] two") == (0, 2, 0)
+
+
+def test_parse_progress_status_counts_pending():
+    assert parse_progress_status("- [ ] one\n- [ ] two") == (0, 0, 2)
+
+
+def test_parse_progress_status_mixed_buckets():
+    text = "- [x] done\n- [~] mid\n- [ ] todo\n- [x] also-done"
+    assert parse_progress_status(text) == (2, 1, 1)
+
+
+def test_parse_progress_status_accepts_indentation():
+    assert parse_progress_status("    - [x] indented") == (1, 0, 0)
+
+
+def test_parse_progress_status_accepts_star_and_plus_bullets():
+    text = "* [x] one\n+ [ ] two"
+    assert parse_progress_status(text) == (1, 0, 1)
+
+
+def test_parse_progress_status_capital_X_is_NOT_counted():
+    """Pin §D3: capital `X` is not recognized; the prompt mandates lower-case."""
+    assert parse_progress_status("- [X] not counted") == (0, 0, 0)
+
+
+def test_parse_progress_status_unknown_marker_not_counted():
+    assert parse_progress_status("- [?] huh\n- [-] partial") == (0, 0, 0)
+
+
+# F2. build_resume_prompt — basic shape
+
+def test_resume_prompt_includes_task_id_and_title():
+    out = build_resume_prompt(
+        {"id": 7, "title": "Refactor", "description": "D"},
+        "p.md", "prog.md", "- [~] item\n- [ ] item2", "", "msg",
+    )
+    assert "TASK 7: Refactor" in out
+
+
+def test_resume_prompt_embeds_checklist_verbatim():
+    progress = "- [x] step 1\n- [~] step 2\n- [ ] step 3"
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", progress, "", "msg",
+    )
+    assert progress in out
+
+
+def test_resume_prompt_embeds_progress_path():
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "plans/task-1/plan.md", "plans/task-1/progress.md",
+        "- [~] x", "", "msg",
+    )
+    assert "plans/task-1/progress.md" in out
+
+
+def test_resume_prompt_includes_commit_message():
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [ ] x", "", "feat: my message",
+    )
+    assert "feat: my message" in out
+
+
+# F3. build_resume_prompt — dirty-tree branch
+
+def test_resume_prompt_dirty_tree_renders_porcelain_block():
+    porcelain = " M src/foo.py\n?? new_file.py"
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", porcelain, "msg",
+    )
+    assert "Uncommitted hunks detected" in out
+    assert "src/foo.py" in out
+    assert "new_file.py" in out
+    assert "task-1 WIP:" in out          # the (a) commit-as-chunk hint
+    assert "git restore" in out          # the (b) revert hint
+
+
+def test_resume_prompt_clean_tree_renders_clean_block():
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", "", "msg",
+    )
+    assert "Working tree is clean" in out
+    assert "Uncommitted hunks detected" not in out
+
+
+def test_resume_prompt_whitespace_only_porcelain_treated_as_clean():
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", "  \n  ", "msg",
+    )
+    assert "Working tree is clean" in out
+
+
+# F4. build_resume_prompt — composition (persona + failure_context)
+
+def test_resume_prompt_default_persona_is_empty():
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", "", "msg",
+    )
+    assert "## Project conventions" not in out
+
+
+def test_resume_prompt_prepends_persona_when_supplied():
+    persona = "## Project conventions\n\nP_MARKER\n\n"
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", "", "msg",
+        persona=persona,
+    )
+    assert out.startswith("## Project conventions")
+    assert "P_MARKER" in out
+    assert "RESUMING" in out
+
+
+def test_resume_prompt_default_failure_context_is_empty():
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", "", "msg",
+    )
+    assert "[FAILURE CONTEXT" not in out
+
+
+def test_resume_prompt_prepends_failure_context_when_supplied():
+    fc = "FCMARKER\n\n"
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", "", "msg",
+        failure_context=fc,
+    )
+    assert out.startswith("FCMARKER")
+
+
+def test_resume_prompt_failure_context_appears_before_persona():
+    fc = "FCMARKER\n\n"
+    persona = "PMARKER\n\n"
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", "", "msg",
+        persona=persona, failure_context=fc,
+    )
+    assert out.index("FCMARKER") < out.index("PMARKER")
+
+
+def test_resume_prompt_persona_and_failure_context_are_keyword_only():
+    """The * separator forces both kwargs to keyword-only."""
+    with pytest.raises(TypeError):
+        build_resume_prompt(
+            {"id": 1, "title": "T", "description": "D"},
+            "p.md", "prog.md", "- [~] x", "", "msg",
+            "would-be-positional-persona",
+        )
+
+
+def test_resume_prompt_does_not_accept_decisions_kwarg():
+    """Pin §D9: resume builder does NOT accept `decisions=`. Same
+    decision path as build_implement_prompt; mirrors the
+    'decisions are Plan-only' regression."""
+    with pytest.raises(TypeError):
+        build_resume_prompt(
+            {"id": 1, "title": "T", "description": "D"},
+            "p.md", "prog.md", "- [~] x", "", "msg",
+            decisions="should not be accepted",
+        )
