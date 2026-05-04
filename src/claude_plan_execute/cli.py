@@ -21,7 +21,7 @@ from claude_plan_execute.loader import (
     render_decisions_index,
     scan_decisions,
 )
-from claude_plan_execute.runner import execute_task, handle_sigint
+from claude_plan_execute.runner import execute_task, explain_task, handle_sigint
 from claude_plan_execute.services import (
     ServiceManager,
     ServiceUnavailableError,
@@ -221,6 +221,9 @@ def main():
     parser.add_argument("--status", action="store_true", help="Show detailed execution state")
     parser.add_argument("--reset", nargs="?", const="all", metavar="TASK_ID",
                         help="Reset state for a task (or all tasks if no ID given)")
+    parser.add_argument("--explain", type=int, metavar="TASK_ID",
+                        help="Show what gates / services / caps would apply "
+                             "to a task without running it (read-only).")
     parser.add_argument("--model", type=str, help="Override model for all tasks")
     parser.add_argument("--effort", type=str, choices=["low", "medium", "high", "max"],
                         help="Override effort for all tasks")
@@ -335,6 +338,23 @@ def main():
                 extra += f", plan: {entry['plan_path']}"
             print(f"  Task {bold(str(t['id']).rjust(3))}: [{status_color(s)}]{dim(extra)}")
         print()
+        return
+
+    # T5 (v0.3 §2.20): --explain TASK_ID — read-only introspection.
+    # Short-circuits BEFORE the gh-PATH preflight (the operator may
+    # be on a machine without gh installed) and BEFORE the slate
+    # preflight (no service start, no preflight tests).
+    if args.explain is not None:
+        target = next((t for t in tasks if t["id"] == args.explain), None)
+        if target is None:
+            print(red(f"Error: Task {args.explain} not found"), file=sys.stderr)
+            sys.exit(1)
+        text = explain_task(
+            target, file_defaults, cli_overrides,
+            phases_by_id=phases_by_id,
+            task_class_models=task_class_models,
+        )
+        print(text, end="")
         return
 
     # T9 (v0.3 §2.12) §D11: gh CLI preflight + auto_pr/branch_per_task

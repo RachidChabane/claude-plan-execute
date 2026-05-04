@@ -12,6 +12,7 @@ from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
 from claude_plan_execute.gates import Gate, default_registry, run_gates
+from claude_plan_execute.gates import _when_matches as _gate_when_matches
 from claude_plan_execute.gates.shell import _tail_cap
 from claude_plan_execute.gates.builtin import (
     make_design_fidelity_gate,
@@ -52,6 +53,23 @@ from claude_plan_execute.state import (
 _DIFF_CAP_BYTES = 256 * 1024
 
 
+# T5 (v0.3 §2.20) — definition-origin lookup for explain_task.
+# Keep these sets in sync with gates/builtin.py:
+#   _BUILTIN_FACTORY_NAMES — names dispatched to make_*_gate factories
+#     in execute_task's Phase-4 loop (no pre-registration on the
+#     default registry).
+#   _BUILTIN_REGISTRY_NAMES — names registered on default_registry()
+#     at gates/builtin.py module-import time.
+# Future tasks that add new built-ins MUST patch the corresponding
+# set here as part of the same diff.
+_BUILTIN_FACTORY_NAMES: frozenset[str] = frozenset({
+    "tests", "lint", "untranslated-strings", "design-fidelity",
+})
+_BUILTIN_REGISTRY_NAMES: frozenset[str] = frozenset({
+    "test-critique", "security-auditor",
+})
+
+
 def check_verdict(review_path: Path) -> tuple[bool, str]:
     """Parse review file for APPROVED/NEEDS_REVISION verdict."""
     if not review_path.exists():
@@ -66,6 +84,78 @@ def check_verdict(review_path: Path) -> tuple[bool, str]:
 _current_state: State | None = None
 _current_task_id: int | str = 0
 _current_phase: str = "plan"
+
+
+def _resolve_gate_specs(
+    gate_names: list[str],
+    *,
+    test_command: str | None,
+    lint_command: str | None,
+    untranslated_strings_command: str | None,
+    dev_server_url: str,
+    persona_section: str,
+    invariant_names: list[str],
+    registry: "GateRegistry",
+) -> tuple[
+    list[tuple[str, "Gate"]],
+    list[str],
+    bool,
+    bool,
+]:
+    """Walk a gate-name list to (name, Gate) pairs.
+
+    Mirrors the inline dispatch in execute_task's Phase 4. The
+    explainer (`explain_task`) and `execute_task` BOTH call this
+    helper — the "same resolver + registry path" guarantee is
+    structural, not test-enforced. (Plan §D1.)
+
+    Pure: no I/O, no side effects, no logging.
+    """
+    resolved_gates: list[tuple[str, "Gate"]] = []
+    unknown_gates: list[str] = []
+    unconfigured_lint = False
+    unconfigured_untranslated_strings = False
+    for name in gate_names:
+        if name == "tests":
+            resolved_gates.append((name, make_tests_gate(test_command)))
+        elif name == "lint":
+            if lint_command is None:
+                unconfigured_lint = True
+            else:
+                resolved_gates.append((name, make_lint_gate(lint_command)))
+        elif name == "untranslated-strings":
+            if untranslated_strings_command is None:
+                unconfigured_untranslated_strings = True
+            else:
+                resolved_gates.append((
+                    name,
+                    make_untranslated_strings_gate(untranslated_strings_command),
+                ))
+        elif name == "design-fidelity":
+            resolved_gates.append((
+                name,
+                make_design_fidelity_gate(
+                    dev_server_url=dev_server_url,
+                    persona=persona_section,
+                ),
+            ))
+        elif name == "invariant-grep":
+            for inv_name in invariant_names:
+                g = registry.get(inv_name)
+                if g is not None:
+                    resolved_gates.append((inv_name, g))
+        else:
+            g = registry.get(name)
+            if g is None:
+                unknown_gates.append(name)
+            else:
+                resolved_gates.append((name, g))
+    return (
+        resolved_gates,
+        unknown_gates,
+        unconfigured_lint,
+        unconfigured_untranslated_strings,
+    )
 
 
 def execute_task(
@@ -622,47 +712,21 @@ def execute_task(
             from claude_plan_execute.gates.invariants import loaded_invariant_names
             invariant_names = loaded_invariant_names()
             registry = default_registry()
-            resolved_gates: list[tuple[str, Gate]] = []
-            unknown_gates: list[str] = []
-            unconfigured_lint = False
-            unconfigured_untranslated_strings = False
-            for name in gate_names:
-                if name == "tests":
-                    resolved_gates.append((name, make_tests_gate(test_command)))
-                elif name == "lint":
-                    if lint_command is None:
-                        unconfigured_lint = True
-                    else:
-                        resolved_gates.append((name, make_lint_gate(lint_command)))
-                elif name == "untranslated-strings":
-                    if untranslated_strings_command is None:
-                        unconfigured_untranslated_strings = True
-                    else:
-                        resolved_gates.append((
-                            name,
-                            make_untranslated_strings_gate(
-                                untranslated_strings_command,
-                            ),
-                        ))
-                elif name == "design-fidelity":
-                    resolved_gates.append((
-                        name,
-                        make_design_fidelity_gate(
-                            dev_server_url=dev_server_url,
-                            persona=persona_section,
-                        ),
-                    ))
-                elif name == "invariant-grep":
-                    for inv_name in invariant_names:
-                        g = registry.get(inv_name)
-                        if g is not None:
-                            resolved_gates.append((inv_name, g))
-                else:
-                    g = registry.get(name)
-                    if g is None:
-                        unknown_gates.append(name)
-                    else:
-                        resolved_gates.append((name, g))
+            (
+                resolved_gates,
+                unknown_gates,
+                unconfigured_lint,
+                unconfigured_untranslated_strings,
+            ) = _resolve_gate_specs(
+                gate_names,
+                test_command=test_command,
+                lint_command=lint_command,
+                untranslated_strings_command=untranslated_strings_command,
+                dev_server_url=dev_server_url,
+                persona_section=persona_section,
+                invariant_names=invariant_names,
+                registry=registry,
+            )
             if unconfigured_lint:
                 print(yellow(
                     "  Skipping gate 'lint': no defaults.lint_command configured."
@@ -1188,6 +1252,241 @@ def _service_teardown_after_task(
         return
     service_manager.tear_down_for_scope("gate")
     service_manager.tear_down_for_scope("task")
+
+
+# T5 (v0.3 §2.20) — explainer caps. Iterated in pinned order; see
+# plans/task-5/plan.md §"Format invariants" #7. Resolver keys (NOT
+# the YAML user-facing cap names — KEYS_TO_AUDIT labels).
+_EXPLAIN_CAPS_KEYS: tuple[str, ...] = (
+    "implement_max_turns",
+    "plan_timeout_minutes",
+    "review_timeout_minutes",
+    "implement_timeout_minutes",
+    "max_review_rounds",
+    "max_attempts",
+    "max_rate_limit_retries",
+    "rate_limit_base_backoff_seconds",
+)
+
+
+def _gate_definition_origin(
+    name: str, invariant_names: list[str],
+) -> str | None:
+    """Lookup-only origin label. None when the name is a plain
+    project-registered gate. (Plan §D4.)"""
+    if name in _BUILTIN_FACTORY_NAMES:
+        return "built-in factory"
+    if name in _BUILTIN_REGISTRY_NAMES:
+        return "built-in registry"
+    if name in invariant_names:
+        return "invariants.yaml"
+    return None
+
+
+def _render_when_part(
+    when_tuple: tuple[str, ...],
+    ok: bool,
+    reason: str,
+) -> str:
+    """Render the trailing `... -> RUN/SKIP (...)` clause for a gate
+    row. Format A (`always -> RUN/SKIP`) is reserved for `when=()` or
+    `when=("always",)`; otherwise the tokens are listed verbatim and
+    the reason is parenthesised. (Plan §"When-evaluation suffix".)"""
+    if not when_tuple or when_tuple == ("always",):
+        return "always -> RUN" if ok else f"always -> SKIP ({reason})"
+    tokens = ",".join(when_tuple)
+    verdict = "RUN" if ok else "SKIP"
+    return f"when={tokens} -> {verdict} ({reason})"
+
+
+def explain_task(
+    task: dict,
+    file_defaults: dict,
+    cli_overrides: dict,
+    *,
+    phases_by_id: dict[str, dict] | None = None,
+    task_class_models: dict[str, dict] | None = None,
+    registry: "GateRegistry | None" = None,
+    invariant_names: list[str] | None = None,
+) -> str:
+    """Build a multi-line, human-readable explanation of how `task`
+    would resolve under the same resolver + registry path
+    `execute_task` walks. Returns the entire string; caller decides
+    whether to print it.
+
+    See plans/task-5/plan.md §"Pinned output format" for the line-by-
+    line shape and §D2 for the signature contract.
+    """
+    if registry is None:
+        registry = default_registry()
+    if invariant_names is None:
+        from claude_plan_execute.gates.invariants import loaded_invariant_names
+        invariant_names = loaded_invariant_names()
+
+    # Mirror execute_task lines 87-108 verbatim for `phase_dict`,
+    # `task_class_*` and `resolve_task_config`. Same chain → same
+    # provenance. Additionally keep `phase_full` (the OUTER phase
+    # dict) — needed for the Phase-line title (per schema.py:142-150,
+    # `title` is a sibling of `defaults`, not a child).
+    phase_full: dict = {}
+    phase_dict: dict = {}
+    phase_id = task.get("phase")
+    if phases_by_id and phase_id and phase_id in phases_by_id:
+        phase_full = phases_by_id[phase_id]
+        phase_dict = dict(phase_full.get("defaults") or {})
+
+    task_class_dict: dict = {}
+    task_class_name = task.get("task_class") or phase_dict.get("task_class")
+    if task_class_models and task_class_name and task_class_name in task_class_models:
+        task_class_dict = dict(task_class_models[task_class_name])
+
+    resolved = resolve_task_config(
+        task, file_defaults, cli_overrides,
+        phase=phase_dict, task_class=task_class_dict,
+        phase_id=phase_id, task_class_name=task_class_name,
+    )
+
+    # Build gate_names paired with source layers (Plan §D7).
+    gate_names_with_layer: list[tuple[str, str]] = []
+    for n in (file_defaults.get("gates") or []):
+        gate_names_with_layer.append((n, "defaults"))
+    for n in (phase_dict.get("gates_extra") or []):
+        layer = f"phase:{phase_id}" if phase_id else "phase"
+        gate_names_with_layer.append((n, layer))
+    for n in (task.get("gates_extra") or []):
+        gate_names_with_layer.append((n, "task"))
+
+    # Same resolver + registry path execute_task uses (Plan §D1).
+    test_command = resolved["test_command"]["value"]
+    lint_command = resolved["lint_command"]["value"]
+    untranslated_strings_command = resolved["untranslated_strings_command"]["value"]
+    dev_server_url = resolved["dev_server_url"]["value"]
+    persona_section = ""  # explain doesn't compose a real prompt body
+
+    # Augment task dict so phase-inherited task_class is visible to
+    # gate `when` filters. Mirrors `task_for_gates` at runner.py's
+    # Phase-4 dispatch site. (Plan §D9.)
+    task_for_when = {**task, "task_class": task_class_name}
+
+    # Per-pair invocation (Plan §D11). Each input pair maps to its
+    # own subset of resolved gates so duplicate names across layers
+    # retain distinct source attribution and `invariant-grep`
+    # expansion is bounded to its own pair.
+    gate_lines: list[str] = []
+    verdicts: list[str] = []  # "RUN" or "SKIP" — parallel to gate_lines
+    unknown_with_layer: list[tuple[str, str]] = []
+
+    for input_name, layer in gate_names_with_layer:
+        sub_resolved, sub_unknown, sub_ucl, sub_ucu = _resolve_gate_specs(
+            [input_name],
+            test_command=test_command,
+            lint_command=lint_command,
+            untranslated_strings_command=untranslated_strings_command,
+            dev_server_url=dev_server_url,
+            persona_section=persona_section,
+            invariant_names=invariant_names,
+            registry=registry,
+        )
+        for resolved_name, gate in sub_resolved:
+            if input_name == "invariant-grep":
+                src = f"from {layer}; via invariant-grep:{resolved_name}"
+            else:
+                src = f"from {layer}"
+            origin = _gate_definition_origin(resolved_name, invariant_names)
+            if origin == "built-in factory" and gate.kind == "shell":
+                origin = None
+            origin_part = f"  ({origin})" if origin else ""
+            ok, reason = _gate_when_matches(gate.when, task_for_when)
+            when_part = _render_when_part(gate.when, ok, reason)
+            line = (
+                f"    {resolved_name}  [{gate.kind}]  "
+                f"{src}{origin_part}  {when_part}"
+            )
+            gate_lines.append(line)
+            verdicts.append("RUN" if ok else "SKIP")
+        if sub_ucl:
+            line = (
+                f"    lint  [shell]  from {layer}  "
+                f"always -> SKIP (lint_command not configured)"
+            )
+            gate_lines.append(line)
+            verdicts.append("SKIP")
+        if sub_ucu:
+            line = (
+                f"    untranslated-strings  [shell]  from {layer}  "
+                f"always -> SKIP (untranslated_strings_command not configured)"
+            )
+            gate_lines.append(line)
+            verdicts.append("SKIP")
+        for u in sub_unknown:
+            unknown_with_layer.append((u, layer))
+
+    # ------ assemble the output -------------------------------------
+    lines: list[str] = []
+    lines.append(f"Task {task['id']}: {task['title']}")
+
+    # Phase line
+    if phase_id:
+        title = phase_full.get("title") or phase_id
+        lines.append(f"  Phase: {title} (id={phase_id})")
+    else:
+        lines.append("  Phase: (none)")
+
+    # Class line
+    model_value = resolved["model"]["value"]
+    model_from = resolved["model"]["from"]
+    effort_value = resolved["effort"]["value"]
+    effort_from = resolved["effort"]["from"]
+    class_label = task_class_name if task_class_name else "(none)"
+    lines.append(
+        f"  Class: {class_label} "
+        f"(model={model_value} [from {model_from}], "
+        f"effort={effort_value} [from {effort_from}])"
+    )
+    lines.append("")
+
+    # Gates section
+    total = len(verdicts)
+    run_count = sum(1 for v in verdicts if v == "RUN")
+    skip_count = total - run_count
+    lines.append(
+        f"  Gates ({total} total; {run_count} will run, "
+        f"{skip_count} will skip):"
+    )
+    lines.extend(gate_lines)
+    if unknown_with_layer:
+        lines.append("")
+        lines.append("  Unknown gate names (will be skipped at runtime):")
+        for u, layer in unknown_with_layer:
+            lines.append(f"    {u}  (from {layer})")
+    lines.append("")
+
+    # Services stub (Plan §D8)
+    lines.append(
+        "  Services required: (see T8 — services_required + "
+        "services_required_extra union goes here once T5's stub is "
+        "filled in)"
+    )
+    lines.append("")
+
+    # Caps section
+    lines.append("  Caps:")
+    for key in _EXPLAIN_CAPS_KEYS:
+        entry = resolved.get(key)
+        if entry is None:
+            continue
+        lines.append(
+            f"    {key}: {entry['value']} [from {entry['from']}]"
+        )
+    lines.append("")
+
+    # Branch stub (Plan §D8)
+    lines.append(
+        "  Branch: (see T9 — rendered branch name + base_branch goes "
+        "here once T5's stub is filled in)"
+    )
+
+    return "\n".join(lines) + "\n"
 
 
 def handle_sigint(signum, frame):

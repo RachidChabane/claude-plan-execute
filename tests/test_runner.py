@@ -2632,6 +2632,7 @@ def test_execute_task_failure_context_persists_across_plan_to_implement(
 from claude_plan_execute.gates import (
     Gate,
     GateRegistry,
+    GateResult,
 )
 
 
@@ -8603,3 +8604,328 @@ def test_slate_preflight_audit_auto_merge_alone_triggers_needs_gh():
     assert needs_gh is True
     assert viol == [1]
 
+
+# ---------------------------------------------------------------------------
+# R. --explain (task 5 v0.3 §2.20)
+# ---------------------------------------------------------------------------
+
+def test_resolve_gate_specs_extraction_preserves_execute_task_behavior(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §"Documented design choice": the helper extraction is
+    behavior-preserving. A 2-layer (defaults + task) gate config
+    mixing a built-in factory ('tests') and a project-registered
+    shell gate produces the exact same gates/<name>.txt files as
+    the pre-T5 inline dispatch."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "g-task", Gate(kind="shell", command=("true",)),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P(); p.returncode = 0; p.stdout = ""; p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, gates_extra=["g-task"]), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["tests"],
+            "test_command": "echo ok",
+        },
+        cli={}, skip_to="implement",
+    )
+    gates_dir = tmp_path / "task-1" / "gates"
+    files = sorted(p.name for p in gates_dir.glob("*.txt"))
+    assert files == ["g-task.txt", "tests.txt"]
+    assert state.get(1)["status"] == "done"
+
+
+def test_resolve_gate_specs_invariant_grep_expands_to_loaded_names(
+    _clean_default_registry,
+):
+    """Pin §D7: invariant-grep expansion. One input name → many
+    resolved gates."""
+    from claude_plan_execute.runner import _resolve_gate_specs
+    _clean_default_registry.register(
+        "inv-foo", Gate(kind="shell", command=("true",)),
+    )
+    _clean_default_registry.register(
+        "inv-bar", Gate(kind="shell", command=("true",)),
+    )
+    resolved, unknown, ucl, ucu = _resolve_gate_specs(
+        ["invariant-grep"],
+        test_command="pytest",
+        lint_command=None,
+        untranslated_strings_command=None,
+        dev_server_url="http://x",
+        persona_section="",
+        invariant_names=["inv-foo", "inv-bar"],
+        registry=_clean_default_registry,
+    )
+    assert [n for (n, _) in resolved] == ["inv-foo", "inv-bar"]
+    assert unknown == []
+    assert ucl is False
+    assert ucu is False
+
+
+def test_resolve_gate_specs_unconfigured_lint_returns_flag(
+    _clean_default_registry,
+):
+    """Pin §D5: lint with lint_command=None returns the flag, not
+    a resolved gate."""
+    from claude_plan_execute.runner import _resolve_gate_specs
+    resolved, unknown, ucl, ucu = _resolve_gate_specs(
+        ["lint"],
+        test_command="pytest",
+        lint_command=None,
+        untranslated_strings_command=None,
+        dev_server_url="http://x",
+        persona_section="",
+        invariant_names=[],
+        registry=_clean_default_registry,
+    )
+    assert resolved == []
+    assert unknown == []
+    assert ucl is True
+    assert ucu is False
+
+
+def test_explain_task_header_lines_pin_format(_clean_default_registry):
+    """Pin §"Format invariants" #1-#3: Task line, Phase line, Class line.
+
+    The phases_by_id fixture sets `title="UI polish"` (≠ phase id) to
+    catch a regression where the renderer reads `title` from the
+    `defaults` sub-dict instead of the outer phase dict (per
+    schema.py:142-150 the title is a SIBLING of `defaults`, not a
+    child)."""
+    from claude_plan_execute.runner import explain_task
+    text = explain_task(
+        _make_task(id=17, title="feat: KB CRUD UI", phase="ui-polish",
+                   task_class="ui"),
+        file_defaults={"plans_dir": "plans", "model": "opus"},
+        cli_overrides={},
+        phases_by_id={"ui-polish": {"id": "ui-polish",
+                                     "title": "UI polish",
+                                     "defaults": {"task_class": "ui"}}},
+        task_class_models={"ui": {"model": "sonnet", "effort": "medium"}},
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    lines = text.splitlines()
+    assert lines[0] == "Task 17: feat: KB CRUD UI"
+    assert "Phase: UI polish" in lines[1]      # title from OUTER dict
+    assert "(id=ui-polish)" in lines[1]
+    assert "Class: ui" in lines[2]
+    assert "model=sonnet" in lines[2]
+    assert "from task_class:ui" in lines[2]
+
+
+def test_explain_task_gates_section_renders_run_skip_split(
+    _clean_default_registry,
+):
+    """Pin §"Format invariants" #4: Gates header counts.
+    A task_class:ui gate on a non-ui task is SKIP; an always gate
+    is RUN. Counts surface that 1+1, of which 1 RUN and 1 SKIP."""
+    from claude_plan_execute.runner import explain_task
+    _clean_default_registry.register(
+        "always-gate",
+        Gate(kind="shell", command=("true",), when=("always",)),
+    )
+    _clean_default_registry.register(
+        "ui-only",
+        Gate(kind="agent", prompt_template="x", when=("task_class:ui",)),
+    )
+    text = explain_task(
+        _make_task(id=1, task_class="schema"),
+        file_defaults={"plans_dir": "plans",
+                       "gates": ["always-gate", "ui-only"]},
+        cli_overrides={},
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    assert "Gates (2 total; 1 will run, 1 will skip):" in text
+    assert "always-gate" in text
+    assert "always -> RUN" in text
+    assert "ui-only" in text
+    assert "-> SKIP" in text
+    assert "task_class='schema' not in" in text
+
+
+def test_explain_task_renders_services_and_branch_stubs(
+    _clean_default_registry,
+):
+    """Pin §D8: services/branch sections are stubs in T5."""
+    from claude_plan_execute.runner import explain_task
+    text = explain_task(
+        _make_task(id=1),
+        file_defaults={"plans_dir": "plans"},
+        cli_overrides={},
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    assert "Services required: (see T8" in text
+    assert "Branch: (see T9" in text
+
+
+def test_explain_task_caps_section_renders_with_provenance(
+    _clean_default_registry,
+):
+    """Pin §"Format invariants" #7: caps each have a [from <source>]
+    provenance label."""
+    from claude_plan_execute.runner import explain_task
+    text = explain_task(
+        _make_task(id=1),
+        file_defaults={"plans_dir": "plans", "implement_max_turns": 250},
+        cli_overrides={},
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    assert "Caps:" in text
+    assert "implement_max_turns:" in text  # resolver key
+    assert "250" in text
+    assert "from project_defaults" in text
+    # max_attempts isn't set on file_defaults → comes from hardcoded
+    assert "max_attempts:" in text
+    assert "from hardcoded" in text
+
+
+def test_explain_task_uses_tasks_v2_fixture_with_phase_inherited_class(
+    _clean_default_registry,
+):
+    """Task description: 'Use tests/fixtures/tasks-v2.yaml; assert
+    specific gates appear / do not appear given the touches/task_class
+    filters.' Task 1 in the fixture has phase='foundation' which
+    inherits task_class='schema'. A gate with when=task_class:schema
+    must MATCH; with when=task_class:ui must SKIP."""
+    from claude_plan_execute import loader as L
+    from claude_plan_execute.runner import explain_task
+    FIXTURES = Path(__file__).parent / "fixtures"
+    tf = L.load_tasks_file(FIXTURES / "tasks-v2.yaml")
+    file_defaults = L.effective_defaults(tf)
+    file_defaults["gates"] = ["schema-only", "ui-only"]
+    tasks = [t.model_dump(exclude_none=True) for t in tf.tasks]
+    phases_by_id = {p.id: p.model_dump(exclude_none=True) for p in tf.phases}
+    task_class_models = {
+        name: cfg.model_dump(exclude_none=True)
+        for name, cfg in (tf.defaults.task_class_models or {}).items()
+    }
+
+    _clean_default_registry.register(
+        "schema-only",
+        Gate(kind="shell", command=("true",), when=("task_class:schema",)),
+    )
+    _clean_default_registry.register(
+        "ui-only",
+        Gate(kind="agent", prompt_template="x", when=("task_class:ui",)),
+    )
+
+    # Task 1 — phase='foundation' → task_class inherited as 'schema'.
+    text = explain_task(
+        tasks[0], file_defaults, {},
+        phases_by_id=phases_by_id,
+        task_class_models=task_class_models,
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    schema_line = next(l for l in text.splitlines() if "schema-only" in l)
+    ui_line = next(l for l in text.splitlines() if "ui-only" in l)
+    assert "RUN" in schema_line and "SKIP" not in schema_line
+    assert "SKIP" in ui_line and "RUN" not in ui_line
+
+
+def test_explain_task_touches_filter_evaluated_against_key_files(
+    _clean_default_registry,
+):
+    """Task description: '... given the touches/task_class filters.'
+    A gate with when=touches:**/auth/** must MATCH a task whose
+    key_files include 'src/auth/api.py' and SKIP a task whose
+    key_files don't."""
+    from claude_plan_execute.runner import explain_task
+    _clean_default_registry.register(
+        "auth-touched",
+        Gate(kind="shell", command=("true",), when=("touches:**/auth/**",)),
+    )
+
+    matched_text = explain_task(
+        _make_task(id=1, key_files=["src/auth/api.py"]),
+        file_defaults={"plans_dir": "plans", "gates": ["auth-touched"]},
+        cli_overrides={},
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    assert "auth-touched" in matched_text
+    matched_line = next(l for l in matched_text.splitlines()
+                        if "auth-touched" in l)
+    assert "RUN" in matched_line
+    assert "src/auth/api.py" in matched_text
+
+    skipped_text = explain_task(
+        _make_task(id=2, key_files=["docs/readme.md"]),
+        file_defaults={"plans_dir": "plans", "gates": ["auth-touched"]},
+        cli_overrides={},
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    skipped_line = next(l for l in skipped_text.splitlines()
+                        if "auth-touched" in l)
+    assert "SKIP" in skipped_line
+    assert "key_files=['docs/readme.md']" in skipped_text
+
+
+def test_explain_task_when_eval_uses_phase_inherited_task_class(
+    _clean_default_registry,
+):
+    """Pin §D9: a phase-inherited task_class must drive `when`
+    evaluation. Without `task_for_when = {**task, 'task_class':
+    task_class_name}`, a task whose class is set on the PHASE (not
+    the task) gets evaluated with task_class=None and the
+    task_class:ui filter falsely skips."""
+    from claude_plan_execute.runner import explain_task
+    _clean_default_registry.register(
+        "ui-gate",
+        Gate(kind="agent", prompt_template="x", when=("task_class:ui",)),
+    )
+    text = explain_task(
+        _make_task(id=1, phase="ui-shell"),
+        file_defaults={"plans_dir": "plans", "gates": ["ui-gate"]},
+        cli_overrides={},
+        phases_by_id={"ui-shell": {"id": "ui-shell",
+                                    "defaults": {"task_class": "ui"}}},
+        task_class_models={"ui": {"model": "sonnet"}},
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    ui_line = next(l for l in text.splitlines() if "ui-gate" in l)
+    assert "RUN" in ui_line
+    assert "task_class='ui'" in ui_line
+
+
+def test_explain_task_duplicate_gate_name_across_layers_attributed_per_layer(
+    monkeypatch, _clean_default_registry,
+):
+    """Pin §D11: when the same gate name appears in two layers
+    (defaults + task), the runner runs it twice and the explainer
+    must show TWO rows with distinct source labels."""
+    from claude_plan_execute.runner import explain_task
+    text = explain_task(
+        _make_task(id=1, gates_extra=["lint"]),
+        file_defaults={
+            "plans_dir": "plans",
+            "gates": ["lint"],
+            "lint_command": "ruff check",
+        },
+        cli_overrides={},
+        registry=_clean_default_registry,
+        invariant_names=[],
+    )
+    lint_lines = [l for l in text.splitlines()
+                  if "lint" in l and "[shell]" in l]
+    assert len(lint_lines) == 2
+    assert any("from defaults" in l for l in lint_lines)
+    assert any("from task" in l for l in lint_lines)
