@@ -1,6 +1,7 @@
 """Tests for claude_plan_execute.gates — Gate Registry foundation."""
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -15,6 +16,11 @@ from claude_plan_execute.gates import (
     _when_matches,
     default_registry,
     run_gates,
+)
+from claude_plan_execute.gates.agent import (
+    _FINDINGS_RE,
+    _RAW_CAP_BYTES,
+    _extract_findings,
 )
 from claude_plan_execute.gates.shell import _OUTPUT_CAP_BYTES, _tail_cap
 
@@ -1022,3 +1028,833 @@ def test_run_gates_diff_path_threading_does_NOT_affect_shell_gates(
 def test_output_cap_constant_is_100_kb():
     """Pin §D8: 100 KB cap matches enhancement plan §2.1."""
     assert _OUTPUT_CAP_BYTES == 100 * 1024
+
+
+# ---------------------------------------------------------------------------
+# I. Findings extraction & AgentGate findings-population (T11, v0.3)
+# ---------------------------------------------------------------------------
+#
+# Pure-helper tests for `_extract_findings`: the seven cases (a)-(g)
+# enumerated in the task description, plus corner cases pinning the
+# regex semantics, the case-5 `_raw` cap, and the warn-suppression
+# kwarg. AgentGate findings-population tests follow the helper unit
+# tests (same Section I).
+#
+# Markers are HTML comments; see plan §D2 / gates/agent.py:_FINDINGS_RE.
+# ---------------------------------------------------------------------------
+
+def _wrap_findings(body: str) -> str:
+    """Helper: wrap a JSON body in the appendix marker pair."""
+    return (
+        "VERDICT: PASS\nSome prose.\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        f"{body}\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+
+
+# --- (a) well-formed array populates findings -------------------------------
+
+def test_extract_findings_well_formed_array_populates_findings(capsys):
+    """Task description test (a): markers + a well-formed JSON list of
+    dicts → findings is the parsed list; sidecar wraps it under
+    `findings:` key. No warning printed."""
+    text = _wrap_findings('[{"k": "v"}, {"k": "w"}]')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == [{"k": "v"}, {"k": "w"}]
+    assert sidecar == {"findings": [{"k": "v"}, {"k": "w"}]}
+    out = capsys.readouterr().out
+    assert "malformed" not in out
+    assert "not a list[dict]" not in out
+
+
+# --- (b) bare array normalizes to {findings: [...]} -------------------------
+
+def test_extract_findings_bare_array_normalizes_to_findings_object(capsys):
+    """Task description test (b): bare JSON list inside markers
+    normalizes to `{"findings": [...]}` in the sidecar — NOT the raw
+    list. The dataclass `findings` is the bare list; the sidecar
+    wraps."""
+    text = _wrap_findings('[{"k": "v"}, {"k": "w"}]')
+    findings, sidecar = _extract_findings(text, "g")
+    assert isinstance(findings, list)
+    assert isinstance(sidecar, dict)
+    assert sidecar.get("findings") == findings
+    assert "findings" in sidecar
+
+
+# --- (c) malformed JSON warns, returns None, no sidecar ---------------------
+
+def test_extract_findings_malformed_json_warns_returns_None_no_sidecar(capsys):
+    """Task description test (c): markers present but body fails
+    json.loads → findings is None, sidecar is None, yellow warning
+    printed. Gate verdict is unaffected (caller's `passed` decision
+    derives only from `VERDICT: PASS` substring search)."""
+    text = _wrap_findings("{this is not valid json}")
+    findings, sidecar = _extract_findings(text, "secaudit")
+    assert findings is None
+    assert sidecar is None
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" in out
+    assert "secaudit" in out
+    assert "verdict unchanged" in out
+
+
+# --- (d) no markers → None, None, no warning --------------------------------
+
+def test_extract_findings_no_markers_returns_None_no_warning(capsys):
+    """Task description test (d): plain text without marker pair →
+    findings is None, sidecar is None, no warning."""
+    findings, sidecar = _extract_findings("VERDICT: PASS\nNothing here.", "g")
+    assert findings is None
+    assert sidecar is None
+    out = capsys.readouterr().out
+    assert "malformed" not in out
+    assert "not a list[dict]" not in out
+
+
+# --- (g) list with non-dict elements → empty + raw + warning ----------------
+
+def test_extract_findings_list_with_non_dict_elements_returns_empty_with_raw(capsys):
+    """Task description test (g): a list whose elements are not all
+    dicts → strict reject. findings == [] (NOT a partial list);
+    sidecar has `_raw` for debugging. Warning printed."""
+    text = _wrap_findings('[{"a": 1}, "bad", {"b": 2}]')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    assert sidecar["findings"] == []
+    assert "_raw" in sidecar
+    assert "bad" in sidecar["_raw"]
+    out = capsys.readouterr().out
+    assert "not a list[dict]" in out
+    assert "treating as empty" in out
+
+
+# --- additional helper-level tests -----------------------------------------
+
+def test_extract_findings_object_with_findings_list_returns_inner_list(capsys):
+    """Object form: `{"findings": [...]}` → findings is the inner list,
+    sidecar is the full object (with the `findings` key preserved)."""
+    text = _wrap_findings('{"findings": [{"a": 1}, {"b": 2}]}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == [{"a": 1}, {"b": 2}]
+    assert sidecar == {"findings": [{"a": 1}, {"b": 2}]}
+    out = capsys.readouterr().out
+    assert "malformed" not in out
+    assert "not a list[dict]" not in out
+
+
+def test_extract_findings_object_with_findings_list_preserves_extra_keys_in_sidecar(capsys):
+    """Pin §D1 case 4: an object with `findings: [...]` AND extra keys
+    (e.g., `summary`) preserves the extra keys verbatim in the sidecar.
+    Templates own their inner shape; the build tool is gate-agnostic."""
+    text = _wrap_findings('{"findings": [{"a": 1}], "summary": "1 critical"}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == [{"a": 1}]
+    assert sidecar == {"findings": [{"a": 1}], "summary": "1 critical"}
+
+
+def test_extract_findings_scalar_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (scalar): an integer between markers → findings is
+    [], sidecar has `_raw` with the raw body. Warning printed."""
+    text = _wrap_findings("42")
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar == {"findings": [], "_raw": "42"}
+    out = capsys.readouterr().out
+    assert "not a list[dict]" in out
+
+
+def test_extract_findings_null_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (null): JSON `null` → findings is [], sidecar has
+    `_raw == "null"`. Warning printed."""
+    text = _wrap_findings("null")
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar == {"findings": [], "_raw": "null"}
+
+
+def test_extract_findings_object_without_findings_key_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (object lacking `findings` key): `{"summary":
+    "ok"}` → findings is [], sidecar has `_raw` with the raw body
+    JSON. Warning printed. Templates that omit the `findings` key
+    are surfaced as malformed via the warning."""
+    text = _wrap_findings('{"summary": "ok"}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    assert sidecar["findings"] == []
+    assert sidecar["_raw"] == '{"summary": "ok"}'
+
+
+def test_extract_findings_object_with_non_list_findings_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (object with non-list `findings`): `{"findings":
+    "not a list"}` → findings is [], sidecar has `_raw`. Warning."""
+    text = _wrap_findings('{"findings": "not a list"}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    assert sidecar["findings"] == []
+    assert "not a list" in sidecar["_raw"]
+
+
+def test_extract_findings_object_with_findings_list_with_non_dict_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (object.findings list with a non-dict element):
+    strict reject at the inner-list layer too. Mirrors test (g) but
+    nested under the object form."""
+    text = _wrap_findings('{"findings": [{"a": 1}, "bad"]}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    assert sidecar["findings"] == []
+    assert "bad" in sidecar["_raw"]
+
+
+def test_extract_findings_first_appendix_wins(capsys):
+    """Pin §D2: `re.search` returns the FIRST match. With two
+    well-formed appendices in the text, the first body wins."""
+    text = (
+        "header\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"order": "first"}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+        "filler\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"order": "second"}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    findings, _ = _extract_findings(text, "g")
+    assert findings == [{"order": "first"}]
+
+
+def test_extract_findings_non_greedy_does_not_swallow_intermediate_markers(capsys):
+    """Pin §A: non-greedy `.*?` ensures BEGIN binds to the NEAREST END,
+    not the LAST END. With two marker pairs, the first BEGIN must
+    bind to the first END (not swallow the second BEGIN)."""
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"first": 1}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+        "interleaved text\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"second": 2}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    match = _FINDINGS_RE.search(text)
+    assert match is not None
+    body = match.group(1)
+    # Body is the FIRST appendix's JSON, not the swallowed-everything
+    # case where body would include the literal END marker.
+    assert "first" in body
+    assert "BEGIN_FINDINGS_JSON" not in body
+    assert "END_FINDINGS_JSON" not in body
+
+
+def test_extract_findings_regex_dotall_matches_across_newlines(capsys):
+    """Pin §A: `re.DOTALL` makes `.` match newlines so a multi-line
+    JSON body is captured intact."""
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        "[\n"
+        '  {"k": 1},\n'
+        '  {"k": 2}\n'
+        "]\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    findings, _ = _extract_findings(text, "g")
+    assert findings == [{"k": 1}, {"k": 2}]
+
+
+def test_extract_findings_strips_whitespace_around_body(capsys):
+    """Pin §D2: the regex's `\\s*` flanks strip surrounding whitespace
+    (newlines, spaces) so `json.loads` sees the raw JSON. An empty
+    list with extra whitespace inside the markers parses cleanly."""
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->  \n  []  \n  <!-- END_FINDINGS_JSON -->"
+    )
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar == {"findings": []}
+
+
+def test_extract_findings_empty_array_is_valid(capsys):
+    """Pin: an explicit empty list is case 3 (clean parse), NOT case 5
+    (malformed). Distinguishes intentional zero findings from absent
+    appendix or malformed body. NO warning."""
+    text = _wrap_findings("[]")
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar == {"findings": []}
+    out = capsys.readouterr().out
+    assert "malformed" not in out
+    assert "not a list[dict]" not in out
+
+
+def test_extract_findings_warn_false_silences_warnings(capsys):
+    """Pin §D5 / §6.2: `warn=False` suppresses the case-2 / case-5
+    warnings. `run_gates` uses `warn=False` on its second extraction
+    to avoid double-printing what AgentGate already printed."""
+    text = _wrap_findings("{not valid json}")
+    findings, sidecar = _extract_findings(text, "g", warn=False)
+    assert findings is None
+    assert sidecar is None
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" not in out
+
+
+def test_extract_findings_raw_text_is_capped_at_raw_cap_bytes(capsys):
+    """Pin §D8: `_RAW_CAP_BYTES = 16 KB` defensive cap on the case-5
+    `_raw` text. A 50KB JSON string scalar produces an oversized body
+    that gets tail-capped before stuffing into `_raw`. Read the
+    constant rather than hard-coding 16 KB so the test stays in sync
+    if the cap is ever tuned."""
+    big_string = "X" * 50000
+    body = json.dumps(big_string)  # JSON-encoded string scalar
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        f"{body}\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    raw_bytes = sidecar["_raw"].encode("utf-8")
+    # Cap + ~50-byte truncation marker overhead.
+    assert len(raw_bytes) <= _RAW_CAP_BYTES + 50
+    assert "[truncated:" in sidecar["_raw"]
+
+
+def test_raw_cap_constant_is_16_kb():
+    """Pin §D8: the cap is 16 KB."""
+    assert _RAW_CAP_BYTES == 16 * 1024
+
+
+# --- AgentGate findings-population (Section I sub-block) -------------------
+
+def test_agent_gate_populates_findings_when_appendix_present(monkeypatch):
+    """Pin §D5 site 1: AgentGate.run() threads the extracted findings
+    onto the returned GateResult."""
+    text = _wrap_findings('[{"category": "ACL", "severity": "high"}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="secaudit", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.findings == [{"category": "ACL", "severity": "high"}]
+
+
+def test_agent_gate_findings_is_None_when_no_appendix(monkeypatch):
+    """Pin §D1 case 1 + AgentGate wiring: text without markers →
+    findings is None on the result."""
+    _stub_run_claude(monkeypatch, text="VERDICT: PASS\nNo appendix here.\n")
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.findings is None
+
+
+def test_agent_gate_findings_is_None_on_malformed_appendix(monkeypatch, capsys):
+    """Pin §D1 case 2 + AgentGate wiring: malformed JSON → findings is
+    None; warning printed."""
+    _stub_run_claude(
+        monkeypatch,
+        text=_wrap_findings("{this is not json}"),
+    )
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.findings is None
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" in out
+
+
+def test_agent_gate_findings_default_value_in_dataclass_is_None(monkeypatch):
+    """Pin §D4: empty agent text yields `findings is None` (the
+    helper's case-1 return value flows onto the dataclass)."""
+    _stub_run_claude(monkeypatch, text="")
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.findings is None
+
+
+def test_agent_gate_passed_is_independent_of_findings_extraction_failure(
+    monkeypatch, capsys,
+):
+    """Pin §D7: a malformed appendix on a PASS verdict does NOT block
+    the gate. `passed` derives only from `verdict: pass` substring;
+    `findings` extraction failure surfaces via warning + None on the
+    dataclass field."""
+    _stub_run_claude(
+        monkeypatch,
+        text=(
+            "VERDICT: PASS\n"
+            "<!-- BEGIN_FINDINGS_JSON -->\ngarbage\n<!-- END_FINDINGS_JSON -->"
+        ),
+    )
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.passed is True
+    assert r.findings is None
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" in out
+
+
+def test_agent_gate_uses_capped_output_for_extraction(monkeypatch):
+    """Pin §6.1: AgentGate passes `output_capped` (post-tail-cap)
+    to `_extract_findings`, NOT the raw text. If the appendix lands
+    in the omitted-head portion of an oversized text, both AgentGate's
+    extraction AND run_gates' re-extraction return (None, None) —
+    they agree because they share the same input."""
+    # Layout: appendix appears at the head; ~200 KB of filler tail
+    # pushes the head past the 100 KB tail-cap window.
+    appendix = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n[{\"k\": 1}]\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    filler = "Z" * (_OUTPUT_CAP_BYTES + 50_000)
+    text = appendix + filler
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    # Markers were truncated out of `r.output` (the post-cap text);
+    # extraction sees no markers → findings is None.
+    assert "<!-- BEGIN_FINDINGS_JSON -->" not in r.output
+    assert r.findings is None
+
+
+# ---------------------------------------------------------------------------
+# J. run_gates sidecar `.json` write (T11, v0.3)
+# ---------------------------------------------------------------------------
+#
+# Integration tests at the run_gates layer. The .json file is written
+# next to <name>.txt under task_dir/gates/ when the agent populated
+# `findings`. Shell gates and skip-path results never trigger a write.
+# ---------------------------------------------------------------------------
+
+def test_run_gates_writes_json_sidecar_when_findings_present(
+    monkeypatch, tmp_path,
+):
+    """Pin task description test (a) at integration: a passing agent
+    gate with a well-formed appendix produces both <name>.txt and
+    <name>.json. The .json content parses cleanly and contains the
+    expected findings list."""
+    text = _wrap_findings('[{"category": "ACL", "severity": "high"}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("secaudit", g)],
+        task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    json_path = tmp_path / "gates" / "secaudit.json"
+    assert json_path.is_file()
+    sidecar = json.loads(json_path.read_text(encoding="utf-8"))
+    assert sidecar["findings"] == [{"category": "ACL", "severity": "high"}]
+
+
+def test_run_gates_json_sidecar_for_object_with_findings_keeps_extra_keys(
+    monkeypatch, tmp_path,
+):
+    """Pin §D1 case 4: object form with extra keys (e.g., `summary`)
+    keeps every key in the written sidecar. Belt-and-suspenders for
+    aggregator forward-compat."""
+    text = _wrap_findings('{"findings": [{"a": 1}], "summary": "S"}')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    sidecar = json.loads((tmp_path / "gates" / "g.json").read_text())
+    assert sidecar["findings"] == [{"a": 1}]
+    assert sidecar["summary"] == "S"
+
+
+def test_run_gates_json_sidecar_for_malformed_with_raw(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D1 case 5 at integration: a list with a non-dict element
+    produces a sidecar with `findings: []` and `_raw`."""
+    text = _wrap_findings('[{"a": 1}, "bad"]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    sidecar = json.loads((tmp_path / "gates" / "g.json").read_text())
+    assert sidecar["findings"] == []
+    assert "bad" in sidecar["_raw"]
+    out = capsys.readouterr().out
+    assert "not a list[dict]" in out
+
+
+def test_run_gates_does_NOT_write_json_when_no_markers(monkeypatch, tmp_path):
+    """Pin task description test (d): no markers → no .json file. The
+    .txt file IS written (gate output is always captured)."""
+    _stub_run_claude(monkeypatch, text="VERDICT: PASS\nNo findings here.")
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert (tmp_path / "gates" / "g.txt").is_file()
+    assert not (tmp_path / "gates" / "g.json").exists()
+
+
+def test_run_gates_does_NOT_write_json_on_malformed_parse(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin task description test (c) at integration: malformed JSON
+    inside markers → no .json file (case 2 is asymmetric vs. case 5).
+    Gate verdict (PASS) is unchanged. Warning printed."""
+    _stub_run_claude(
+        monkeypatch,
+        text=_wrap_findings("garbage"),
+    )
+    g = Gate(kind="agent", prompt_template="x")
+    results = run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert results[0].passed is True
+    assert not (tmp_path / "gates" / "g.json").exists()
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" in out
+
+
+def test_run_gates_does_NOT_write_json_for_shell_gate(monkeypatch, tmp_path):
+    """Pin task description test (e): shell gates NEVER produce a .json
+    sidecar even if the captured stdout literally contains valid
+    findings markers. The contract is "shell gates don't extract"
+    (predicate: `r.findings is not None`), NOT "shell stdout was
+    empty". A future regression that switched the predicate to scan
+    `r.output` for markers would pass with empty stdout but FAIL
+    here."""
+    stdout_with_markers = (
+        "shell ran\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n[{\"k\": \"v\"}]\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    _stub_subprocess_run_global(monkeypatch, stdout=stdout_with_markers)
+    g = Gate(kind="shell", command=("true",))
+    run_gates(
+        [("shellgate", g)],
+        task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    txt_body = (tmp_path / "gates" / "shellgate.txt").read_text()
+    assert "BEGIN_FINDINGS_JSON" in txt_body  # markers in stdout
+    assert not (tmp_path / "gates" / "shellgate.json").exists()
+
+
+def test_run_gates_findings_survive_reconstruction(monkeypatch, tmp_path):
+    """Pin task description test (f): the GateResult re-construction
+    in run_gates' write loop MUST thread `findings=r.findings`
+    explicitly. Without that line, the returned result silently drops
+    findings (default-None applies). This is the load-bearing
+    regression guard for the `findings=r.findings` line in §6.2 step
+    4. Production would be quietly broken; only this test catches
+    it."""
+    text = _wrap_findings('[{"a": 1}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    results = run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert results[0].findings == [{"a": 1}]
+
+
+def test_run_gates_json_pretty_printed_with_indent_2(monkeypatch, tmp_path):
+    """Pin §D6: sidecar JSON uses `json.dumps(..., indent=2)` so the
+    file is human-readable. Verify by checking for indented braces /
+    keys in the raw text."""
+    text = _wrap_findings('[{"k": "v"}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    raw = (tmp_path / "gates" / "g.json").read_text(encoding="utf-8")
+    # Indent=2 produces lines beginning with two spaces inside
+    # objects; key/value pairs land on their own lines.
+    assert "  \"findings\"" in raw
+    assert "\n" in raw  # multi-line
+
+
+def test_run_gates_json_sidecar_has_trailing_newline(monkeypatch, tmp_path):
+    """Pin §6.2 step 4: the .json file ends with a single trailing
+    newline (matches the .txt convention). `json.dumps` does NOT emit
+    a trailing newline; the implementation appends `+ "\\n"`."""
+    text = _wrap_findings('[{"k": "v"}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    raw_bytes = (tmp_path / "gates" / "g.json").read_bytes()
+    assert raw_bytes.endswith(b"\n")
+
+
+def test_run_gates_does_not_double_warn_on_malformed(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D5 / §6.2: the second extraction in run_gates uses
+    `warn=False` so the malformed-JSON warning is printed exactly
+    ONCE (from AgentGate.run's first call, not duplicated by
+    run_gates' second call). Counts canonical fragment occurrences."""
+    _stub_run_claude(monkeypatch, text=_wrap_findings("{bad json}"))
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    out = capsys.readouterr().out
+    # Exactly ONE occurrence — AgentGate's call site.
+    assert out.count("malformed findings JSON") == 1
+
+
+def test_run_gates_findings_None_when_skip_path_taken(monkeypatch, tmp_path):
+    """Pin §D4: a gate whose `when` filter rejects the task is skipped
+    via the passive-result path; the produced GateResult uses the
+    dataclass default → `findings is None`. No .json written."""
+    g = Gate(
+        kind="agent", prompt_template="x", when=("task_class:ui",),
+    )
+    results = run_gates(
+        [("ui-only", g)],
+        task={"id": 1, "title": "T", "description": "D",
+              "task_class": "schema"},
+        task_dir=tmp_path, cli={},
+    )
+    assert len(results) == 1
+    assert results[0].findings is None
+    assert not (tmp_path / "gates" / "ui-only.json").exists()
+
+
+def test_run_gates_findings_survive_exception_path(monkeypatch, tmp_path):
+    """Pin §D4: an exception inside the gate runner produces a fallback
+    GateResult; `findings` defaults to None. The reconstruction in
+    run_gates' write loop preserves the None (no .json written)."""
+    def boom(prompt, **kwargs):
+        raise RuntimeError("agent crashed")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", boom,
+    )
+    g = Gate(kind="agent", prompt_template="x")
+    results = run_gates(
+        [("crashy", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert results[0].findings is None
+    assert results[0].error is not None
+    assert "agent crashed" in (results[0].error or "")
+    assert not (tmp_path / "gates" / "crashy.json").exists()
+
+
+def test_run_gates_passes_when_findings_is_empty_list(monkeypatch, tmp_path):
+    """Pin §D3: an INTENTIONAL empty list (case 3 with `[]`) writes a
+    sidecar with `{"findings": []}` and is distinct from the
+    no-appendix path (case 1, no .json written). The predicate
+    `r.findings is not None` accepts `[]`."""
+    text = (
+        "VERDICT: PASS\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n[]\n<!-- END_FINDINGS_JSON -->\n"
+    )
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    results = run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert results[0].passed is True
+    assert results[0].findings == []
+    sidecar = json.loads((tmp_path / "gates" / "g.json").read_text())
+    assert sidecar == {"findings": []}
+
+
+# ---------------------------------------------------------------------------
+# K. GateResult `findings` field (T11, v0.3)
+# ---------------------------------------------------------------------------
+
+def test_gate_result_findings_default_is_None():
+    """Pin §D4: `findings` defaults to None so existing call sites
+    that omit the kwarg keep working. Backward-compat invariant."""
+    r = GateResult(
+        name="x", passed=True, output="", output_path=None,
+        duration_seconds=0.0, on_failure="block",
+    )
+    assert r.findings is None
+
+
+def test_gate_result_findings_field_present():
+    """Pin §D4: the field accepts a list[dict] and surfaces it via
+    attribute access."""
+    r = GateResult(
+        name="x", passed=True, output="", output_path=None,
+        duration_seconds=0.0, on_failure="block",
+        findings=[{"a": 1}],
+    )
+    assert r.findings == [{"a": 1}]
+
+
+def test_gate_result_field_order_includes_findings_last():
+    """Pin §D4: field order ends with `..., error, findings`. Frozen
+    dataclass field order is part of the public contract for
+    positional construction; tests pin it as a regression guard
+    against accidental reordering."""
+    fields = [f.name for f in GateResult.__dataclass_fields__.values()]
+    assert fields == [
+        "name", "passed", "output", "output_path",
+        "duration_seconds", "on_failure", "error", "findings",
+    ]
+
+
+def test_gate_result_is_still_frozen_after_findings_added():
+    """Pin §D4: frozen-dataclass invariant preserved post-T11.
+    Mutation raises."""
+    r = GateResult(
+        name="x", passed=True, output="", output_path=None,
+        duration_seconds=0.0, on_failure="block",
+    )
+    with pytest.raises(Exception):
+        r.findings = [{"k": "v"}]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# L. Built-in template content for security-auditor + test-critique (T11)
+# ---------------------------------------------------------------------------
+#
+# Pin: each template ships a "### Structured findings appendix
+# (recommended)" subsection with a concrete example, the per-finding
+# schema keys (backticked), the omit disclaimer, and the literal
+# HTML-comment markers. The example body is parseable JSON so a
+# template typo cannot ship invalid examples.
+#
+# (Design-fidelity template tests live in test_gates_design_fidelity.py
+# per the existing repo convention.)
+# ---------------------------------------------------------------------------
+
+_TEMPLATES_DIR = (
+    Path(__file__).parent.parent
+    / "src" / "claude_plan_execute" / "gates" / "templates"
+)
+
+
+def _read_template(name: str) -> str:
+    return (_TEMPLATES_DIR / name).read_text(encoding="utf-8")
+
+
+def _extract_template_example_block(body: str) -> str:
+    """Return the JSON body between the FIRST marker pair in `body`."""
+    match = _FINDINGS_RE.search(body)
+    assert match is not None, "template lacks findings marker pair"
+    return match.group(1)
+
+
+# --- security-auditor.md --------------------------------------------------
+
+def test_security_auditor_template_has_findings_appendix_section():
+    """Pin §D / §6.3: literal `### Structured findings appendix
+    (recommended)` heading present."""
+    body = _read_template("security-auditor.md")
+    assert "### Structured findings appendix (recommended)" in body
+
+
+def test_security_auditor_template_documents_per_finding_schema_keys():
+    """Pin §D10: the per-finding schema documents `category`,
+    `severity`, `file`, `line`, `evidence`, `suggested_fix` as
+    backticked field names."""
+    body = _read_template("security-auditor.md")
+    for key in (
+        "category", "severity", "file", "line", "evidence", "suggested_fix",
+    ):
+        assert f"`{key}`" in body, f"missing backticked key: {key}"
+
+
+def test_security_auditor_template_lists_common_severity_values_without_enforcing():
+    """Pin §D10 / §D11: severity is documented with common values but
+    explicitly NOT enforced. Pins the no-enum-constraints rule."""
+    body = _read_template("security-auditor.md")
+    for sev in ("critical", "high", "medium", "low"):
+        assert f"`{sev}`" in body
+    assert "NOT enforced" in body
+
+
+def test_security_auditor_template_has_html_comment_markers():
+    """Pin §D2: literal HTML-comment markers appear in the template
+    so the agent has the exact text to copy."""
+    body = _read_template("security-auditor.md")
+    assert "<!-- BEGIN_FINDINGS_JSON -->" in body
+    assert "<!-- END_FINDINGS_JSON -->" in body
+
+
+def test_security_auditor_template_has_omit_disclaimer():
+    """Pin §D10: each template instructs the agent that the appendix
+    is optional ("emit an empty `[]` or omit the appendix
+    entirely")."""
+    body = _read_template("security-auditor.md")
+    assert "emit an empty `[]` or omit the appendix entirely" in body
+
+
+# --- test-critique.md -----------------------------------------------------
+
+def test_test_critique_template_has_findings_appendix_section():
+    body = _read_template("test-critique.md")
+    assert "### Structured findings appendix (recommended)" in body
+
+
+def test_test_critique_template_documents_per_finding_schema_keys():
+    """Pin §D10: schema keys for test-critique."""
+    body = _read_template("test-critique.md")
+    for key in ("missing_test_for", "contract", "suggested_test_name"):
+        assert f"`{key}`" in body, f"missing backticked key: {key}"
+
+
+def test_test_critique_template_has_html_comment_markers():
+    body = _read_template("test-critique.md")
+    assert "<!-- BEGIN_FINDINGS_JSON -->" in body
+    assert "<!-- END_FINDINGS_JSON -->" in body
+
+
+def test_test_critique_template_has_omit_disclaimer():
+    body = _read_template("test-critique.md")
+    assert "emit an empty `[]` or omit the appendix entirely" in body
+
+
+# --- belt-and-suspenders: examples are valid extractable appendices -------
+
+def test_security_auditor_template_example_is_valid_findings_appendix():
+    """Pin: the JSON example in the template parses cleanly via the
+    same _extract_findings helper the build tool uses. Catches typos
+    at CI time before agents ever see them."""
+    body = _read_template("security-auditor.md")
+    findings, sidecar = _extract_findings(body, "security-auditor")
+    assert findings is not None, "template example failed extraction"
+    assert isinstance(findings, list)
+    assert all(isinstance(el, dict) for el in findings)
+    # Sidecar must be writable JSON (no _raw).
+    assert sidecar is not None
+    assert "_raw" not in sidecar
+
+
+def test_test_critique_template_example_is_valid_findings_appendix():
+    """Pin: ditto for test-critique."""
+    body = _read_template("test-critique.md")
+    findings, sidecar = _extract_findings(body, "test-critique")
+    assert findings is not None
+    assert all(isinstance(el, dict) for el in findings)
+    assert "_raw" not in (sidecar or {})

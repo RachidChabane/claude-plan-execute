@@ -168,3 +168,55 @@ Be precise. Block only on real, diff-introduced
 vulnerabilities. False positives waste implementer budget;
 false negatives ship security regressions. When in doubt about
 severity, surface it as Medium and let the implementer judge.
+
+### Structured findings appendix (recommended)
+
+After the markdown verdict and findings sections above, optionally
+emit a machine-readable findings appendix between these exact
+HTML-comment markers:
+
+<!-- BEGIN_FINDINGS_JSON -->
+[
+  {
+    "category": "ACL",
+    "severity": "critical",
+    "file": "src/api/works.py",
+    "line": 142,
+    "evidence": "db.get_doc(id) without owner check",
+    "suggested_fix": "Add `if doc.owner_id != user.id: raise Forbidden()`."
+  },
+  {
+    "category": "Secrets",
+    "severity": "high",
+    "file": "src/config.py",
+    "line": 88,
+    "evidence": "API_KEY = \"sk-...\"",
+    "suggested_fix": "Move to environment variable; remove from source."
+  }
+]
+<!-- END_FINDINGS_JSON -->
+
+Per-finding schema (each element is a JSON object):
+
+- `category`: short string. Common values: `ACL`, `Secrets`,
+  `Injection`, `PathTraversal`, `Deserialization`, `Crypto`, `CSRF`,
+  `DataExposure`, `Supply`. Free-form — use whichever category
+  letter from "## Categories to detect" your finding belongs to.
+- `severity`: free-form string. Common values: `critical`, `high`,
+  `medium`, `low`. NOT enforced — emit whichever value matches your
+  judgment.
+- `file`: project-relative path of the affected source file.
+- `line`: integer line number of the affected line in `file`.
+- `evidence`: one-line code excerpt or quoted snippet showing the
+  vulnerability.
+- `suggested_fix`: one-line remediation.
+
+Keep the markdown verdict sections — the appendix is additive.
+
+If you cannot produce structured findings — e.g., the failure is a
+single-line cause — emit an empty `[]` or omit the appendix entirely.
+The text verdict is what blocks; the appendix is for aggregation.
+
+The markers must appear EXACTLY as shown (HTML comments). They are
+invisible when the response is rendered as Markdown but extractable
+by the build tool.

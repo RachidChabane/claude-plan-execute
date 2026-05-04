@@ -16,6 +16,7 @@ are skipped (forward-compat with the staged rollout of built-ins).
 """
 from __future__ import annotations
 
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -57,6 +58,14 @@ class GateResult:
 
     `output_path` is set by `run_gates` after writing the captured
     output; the per-gate runners (ShellGate / AgentGate) leave it None.
+
+    `findings` is populated by AgentGate when the agent's response
+    contains a structured-findings appendix between
+    `<!-- BEGIN_FINDINGS_JSON -->` and `<!-- END_FINDINGS_JSON -->`
+    markers (T11, v0.3). None for shell gates, for agent gates with
+    no appendix, and for agent gates whose appendix failed
+    json.loads. See gates/agent.py:_extract_findings and plan §D1
+    for the five cases.
     """
     name: str
     passed: bool
@@ -65,6 +74,7 @@ class GateResult:
     duration_seconds: float
     on_failure: Literal["block", "warn"]
     error: str | None = None
+    findings: list[dict] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +143,7 @@ def default_registry() -> "GateRegistry":
 # ---------------------------------------------------------------------------
 
 from claude_plan_execute.gates.shell import ShellGate, _OUTPUT_CAP_BYTES, _tail_cap  # noqa: E402
-from claude_plan_execute.gates.agent import AgentGate  # noqa: E402
+from claude_plan_execute.gates.agent import AgentGate, _extract_findings  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +344,23 @@ def run_gates(
     for r in results:
         out_path = gates_dir / f"{r.name}.txt"
         out_path.write_text(r.output, encoding="utf-8")
+        # T11: write sidecar .json if the agent populated findings.
+        # Re-extract from the captured (post-tail-cap) output to
+        # recover the sidecar payload. AgentGate.run already saw the
+        # same text and produced r.findings; this second extraction
+        # is deterministic. `warn=False` avoids double-printing the
+        # malformed-appendix warning.
+        if r.findings is not None:
+            _, sidecar = _extract_findings(r.output, r.name, warn=False)
+            if sidecar is not None:
+                json_path = gates_dir / f"{r.name}.json"
+                json_path.write_text(
+                    json.dumps(sidecar, indent=2) + "\n",
+                    encoding="utf-8",
+                )
         # GateResult is frozen → reconstruct with output_path set.
+        # T11: also thread `findings` through (default-None would
+        # otherwise drop it).
         final_results.append(
             GateResult(
                 name=r.name,
@@ -344,6 +370,7 @@ def run_gates(
                 duration_seconds=r.duration_seconds,
                 on_failure=r.on_failure,
                 error=r.error,
+                findings=r.findings,
             )
         )
         verdict = "PASS" if r.passed else "FAIL"

@@ -104,3 +104,45 @@ Be precise. Block only when the tests would let real
 regressions through. False positives waste implementer budget;
 false negatives waste reviewer attention. Aim for the right
 verdict, not the safe one.
+
+### Structured findings appendix (recommended)
+
+After the markdown verdict and suggested-cases sections above,
+optionally emit a machine-readable findings appendix between these
+exact HTML-comment markers:
+
+<!-- BEGIN_FINDINGS_JSON -->
+[
+  {
+    "missing_test_for": "User cannot read another user's document",
+    "contract": "GET /docs/<id> returns 403 when user.id != doc.owner_id",
+    "suggested_test_name": "test_get_doc_returns_403_for_non_owner"
+  },
+  {
+    "missing_test_for": "Pagination boundary at end of list",
+    "contract": "page=N+1 returns empty list, not 404",
+    "suggested_test_name": "test_list_docs_page_past_end_returns_empty"
+  }
+]
+<!-- END_FINDINGS_JSON -->
+
+Per-finding schema (each element is a JSON object):
+
+- `missing_test_for`: one-line description of the contract or
+  behavior the existing tests do not exercise.
+- `contract`: one-line restatement of what the new behavior
+  promises (e.g., the input → output relationship that should be
+  pinned).
+- `suggested_test_name`: snake_case test name following the
+  project's existing convention (typically
+  `test_<unit>_<scenario>_<expected_outcome>`).
+
+Keep the markdown verdict sections — the appendix is additive.
+
+If you cannot produce structured findings — e.g., the failure is a
+single-line cause — emit an empty `[]` or omit the appendix entirely.
+The text verdict is what blocks; the appendix is for aggregation.
+
+The markers must appear EXACTLY as shown (HTML comments). They are
+invisible when the response is rendered as Markdown but extractable
+by the build tool.
