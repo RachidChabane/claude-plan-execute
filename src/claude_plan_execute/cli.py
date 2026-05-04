@@ -136,6 +136,83 @@ def cmd_decisions_index(args) -> int:
     return 0
 
 
+def _resolve_plans_dir(tasks_path_arg: str | None) -> str:
+    """Resolve the active plans_dir for the human-gate CLI subcommands.
+
+    Resolution order (highest priority first):
+      1. `--tasks` override → that file's `defaults.plans_dir`.
+      2. Auto-detected tasks file's `defaults.plans_dir`.
+      3. Hardcoded fallback `"plans"`.
+
+    Mirrors the `decisions_dir` resolution chain in
+    `cmd_decisions_index`. Errors reading the tasks file are
+    swallowed (warn-and-fallback) so a malformed tasks file does
+    not block an operator who needs to write a sentinel during an
+    incident.
+    """
+    tasks_path = Path(tasks_path_arg) if tasks_path_arg else find_tasks_file()
+    if tasks_path and tasks_path.exists():
+        try:
+            raw = load_tasks_data(tasks_path)
+            defaults = (raw or {}).get("defaults") or {}
+            plans_dir = defaults.get("plans_dir")
+            if plans_dir:
+                return plans_dir
+        except Exception as exc:
+            print(yellow(
+                f"Warning: could not read plans_dir from {tasks_path}: {exc}"
+            ))
+    return "plans"
+
+
+_HUMAN_GATE_NOTE_CAP_BYTES = 4096
+
+
+def _write_human_gate_sentinel(args, suffix: str) -> int:
+    """Write a `.{suffix}` sentinel for an operator-decision human gate.
+
+    Returns 0 on success; 1 on filesystem error. The note is
+    tail-capped at 4 KB UTF-8 bytes (mirrors the server cap so the
+    two paths produce identical sentinel content).
+    """
+    if args.dir:
+        os.chdir(args.dir)
+
+    plans_dir = _resolve_plans_dir(args.tasks)
+    gates_dir = Path(plans_dir) / f"task-{args.task_id}" / "gates"
+    try:
+        gates_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(red(f"Error: could not create gates dir {gates_dir}: {exc}"),
+              file=sys.stderr)
+        return 1
+
+    note = args.note or ""
+    note_capped = note.encode("utf-8")[:_HUMAN_GATE_NOTE_CAP_BYTES].decode(
+        "utf-8", errors="ignore",
+    )
+    sentinel = gates_dir / f"{args.gate_name}.{suffix}"
+    try:
+        sentinel.write_text(note_capped, encoding="utf-8")
+    except OSError as exc:
+        print(red(f"Error: could not write sentinel {sentinel}: {exc}"),
+              file=sys.stderr)
+        return 1
+
+    print(green(f"Wrote {suffix} to {sentinel}"))
+    return 0
+
+
+def cmd_approve(args) -> int:
+    """`claude-plan-execute approve TASK_ID GATE_NAME --note '...'`."""
+    return _write_human_gate_sentinel(args, "approval")
+
+
+def cmd_reject(args) -> int:
+    """`claude-plan-execute reject TASK_ID GATE_NAME --note '...'`."""
+    return _write_human_gate_sentinel(args, "rejection")
+
+
 def _slate_preflight_audit(
     tasks: list[dict],
     file_defaults: dict,
@@ -210,6 +287,47 @@ def main():
     index_parser.add_argument("--decisions-dir", type=str,
         help="Override decisions directory (otherwise resolved from tasks file)")
 
+    # T10 (v0.3 §2.4) — `approve` / `reject` subcommands write a
+    # human-gate sentinel directly without a server round-trip, so
+    # they work even when the dashboard is down.
+    approve_parser = subparsers.add_parser(
+        "approve",
+        help="Approve a pending human gate by writing its .approval sentinel.",
+    )
+    approve_parser.add_argument("task_id", type=str)
+    approve_parser.add_argument("gate_name", type=str)
+    approve_parser.add_argument(
+        "--note", type=str, default="",
+        help="Optional note attached to the approval (capped at 4 KB).",
+    )
+    approve_parser.add_argument(
+        "--tasks", type=str,
+        help="Path to tasks file (default: auto-detect).",
+    )
+    approve_parser.add_argument(
+        "--dir", type=str,
+        help="Working directory (default: cwd).",
+    )
+
+    reject_parser = subparsers.add_parser(
+        "reject",
+        help="Reject a pending human gate by writing its .rejection sentinel.",
+    )
+    reject_parser.add_argument("task_id", type=str)
+    reject_parser.add_argument("gate_name", type=str)
+    reject_parser.add_argument(
+        "--note", type=str, default="",
+        help="Optional note attached to the rejection (capped at 4 KB).",
+    )
+    reject_parser.add_argument(
+        "--tasks", type=str,
+        help="Path to tasks file (default: auto-detect).",
+    )
+    reject_parser.add_argument(
+        "--dir", type=str,
+        help="Working directory (default: cwd).",
+    )
+
     # Existing top-level flags. UNCHANGED.
     parser.add_argument("--tasks", type=str, help="Path to tasks file (default: auto-detect)")
     parser.add_argument("--dir", type=str, help="Working directory (default: cwd)")
@@ -244,6 +362,13 @@ def main():
     # sys.exit also matches main's other error branches.
     if args.command == "decisions" and args.action == "index":
         sys.exit(cmd_decisions_index(args))
+    # T10 (v0.3 §2.4) — approve / reject subcommands. Handlers
+    # `os.chdir` themselves so the post-dispatch chdir below does
+    # NOT double-fire.
+    if args.command == "approve":
+        sys.exit(cmd_approve(args))
+    if args.command == "reject":
+        sys.exit(cmd_reject(args))
 
     # Change working directory
     if args.dir:

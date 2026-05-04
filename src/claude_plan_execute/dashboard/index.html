@@ -488,7 +488,8 @@ body::before {
 .task-status-dot.pending { background: var(--text-tertiary); }
 .task-status-dot.planning,
 .task-status-dot.reviewing,
-.task-status-dot.revising {
+.task-status-dot.revising,
+.task-status-dot.awaiting_human {
   background: var(--accent-amber);
   box-shadow: 0 0 8px rgba(251,191,36,0.4);
   animation: pulse-amber 1.5s ease-in-out infinite;
@@ -583,7 +584,8 @@ body::before {
 .task-status-label.pending { color: var(--text-tertiary); background: transparent; }
 .task-status-label.planning,
 .task-status-label.reviewing,
-.task-status-label.revising { color: var(--accent-amber); background: var(--accent-amber-dim); }
+.task-status-label.revising,
+.task-status-label.awaiting_human { color: var(--accent-amber); background: var(--accent-amber-dim); }
 .task-status-label.approved { color: var(--accent-blue); background: var(--accent-blue-dim); }
 .task-status-label.implementing { color: var(--accent-violet); background: var(--accent-violet-dim); }
 .task-status-label.done { color: var(--accent-green); background: var(--accent-green-dim); }
@@ -1091,6 +1093,20 @@ body::before {
 }
 
 .gate-header:hover { background: var(--bg-hover); }
+
+/* T10: Approve / Reject buttons appear inline with the gate header
+   when status === 'awaiting_human'. Push them to the right of the
+   gate-name + gate-size to keep the toggle icon at the far right. */
+.gate-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+.gate-item.awaiting-human .gate-status-dot {
+  background: var(--accent-amber);
+  box-shadow: 0 0 8px rgba(251,191,36,0.4);
+  animation: pulse-amber 1.5s ease-in-out infinite;
+}
 
 .gate-status-dot {
   width: 7px; height: 7px;
@@ -1605,19 +1621,21 @@ function renderTasks() {
 
 function getPhases(status) {
   const map = {
-    pending:      { plan: '', review: '', impl: '' },
-    planning:     { plan: 'active', review: '', impl: '' },
-    reviewing:    { plan: 'complete', review: 'active', impl: '' },
-    revising:     { plan: 'complete', review: 'active', impl: '' },
-    approved:     { plan: 'complete', review: 'complete', impl: '' },
-    implementing: { plan: 'complete', review: 'complete', impl: 'active' },
-    done:         { plan: 'complete', review: 'complete', impl: 'complete' },
+    pending:        { plan: '', review: '', impl: '' },
+    planning:       { plan: 'active', review: '', impl: '' },
+    reviewing:      { plan: 'complete', review: 'active', impl: '' },
+    revising:       { plan: 'complete', review: 'active', impl: '' },
+    approved:       { plan: 'complete', review: 'complete', impl: '' },
+    implementing:   { plan: 'complete', review: 'complete', impl: 'active' },
+    awaiting_human: { plan: 'complete', review: 'complete', impl: 'active' },
+    done:           { plan: 'complete', review: 'complete', impl: 'complete' },
   };
   return map[status] || map.pending;
 }
 
 function isActive(status) {
-  return ['planning', 'reviewing', 'revising', 'implementing'].includes(status);
+  return ['planning', 'reviewing', 'revising', 'implementing',
+          'awaiting_human'].includes(status);
 }
 
 function fmtNum(n) {
@@ -1796,20 +1814,83 @@ async function loadGatesPanel(taskId, panelEl) {
     content.dataset.loaded = '1';
     return;
   }
-  const items = data.gates.map(g => `
-    <div class="gate-item" id="gate-${taskId}-${g.name}">
+  // T10 §D16: render Approve/Reject buttons inline with the named
+  // gate item when state.tasks[tid].status === 'awaiting_human' AND
+  // awaiting_gate_name matches. The kind=='awaiting_human' field on
+  // the gate listing entry is a secondary signal for client-side
+  // correctness when the list arrives before the state update.
+  const ts = state.tasks?.[String(taskId)] || {};
+  const items = data.gates.map(g => {
+    const isPending = (
+      (ts.status === 'awaiting_human' && ts.awaiting_gate_name === g.name)
+      || g.kind === 'awaiting_human'
+    );
+    const actions = isPending ? `
+      <div class="gate-actions">
+        <button class="btn btn-sm btn-primary"
+                onclick="event.stopPropagation(); approveGate(${taskId}, '${g.name}')">
+          Approve
+        </button>
+        <button class="btn btn-sm"
+                onclick="event.stopPropagation(); rejectGate(${taskId}, '${g.name}')">
+          Reject
+        </button>
+      </div>` : '';
+    const placeholder = isPending
+      ? `<pre><em>Awaiting decision…</em></pre>`
+      : `<pre><em>Loading…</em></pre>`;
+    return `
+    <div class="gate-item ${isPending ? 'awaiting-human' : ''}" id="gate-${taskId}-${g.name}">
       <div class="gate-header" onclick="toggleGate(${taskId}, '${g.name}')">
         <div class="gate-status-dot ${gateStatus(taskId, g.name)}"></div>
         <span class="gate-name">${esc(g.name)}</span>
         <span class="gate-size">${g.size}b</span>
+        ${actions}
         <span class="gate-expand-icon">&#x203A;</span>
       </div>
       <div class="gate-output" data-task-id="${taskId}" data-gate-name="${esc(g.name)}">
-        <pre><em>Loading…</em></pre>
+        ${placeholder}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   content.innerHTML = `<div class="gate-list">${items}</div>`;
   content.dataset.loaded = '1';
+}
+
+// T10 §D16: Approve / Reject helpers — POST to the new
+// /api/gates/{tid}/{name}/decision endpoint. The operator's note is
+// gathered via prompt(...); empty notes are allowed (the body sends
+// the empty string, server side caps to 4 KB).
+async function approveGate(taskId, gateName) {
+  const note = prompt(`Approve "${gateName}" — optional note:`) || '';
+  const r = await api(
+    `/api/gates/${encodeURIComponent(taskId)}/${encodeURIComponent(gateName)}/decision`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'approve', note }),
+    },
+  );
+  if (r && r.ok) {
+    addLog('success', `Approved ${gateName}${note ? `: ${note}` : ''}`);
+  } else {
+    addLog('error', `Failed to approve ${gateName}`);
+  }
+}
+
+async function rejectGate(taskId, gateName) {
+  const note = prompt(`Reject "${gateName}" — optional note:`) || '';
+  const r = await api(
+    `/api/gates/${encodeURIComponent(taskId)}/${encodeURIComponent(gateName)}/decision`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'reject', note }),
+    },
+  );
+  if (r && r.ok) {
+    addLog('warn', `Rejected ${gateName}${note ? `: ${note}` : ''}`);
+  } else {
+    addLog('error', `Failed to reject ${gateName}`);
+  }
 }
 
 function toggleGate(taskId, gateName) {

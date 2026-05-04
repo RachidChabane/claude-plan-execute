@@ -228,8 +228,16 @@ async def get_resolved_config(task_id: str):
 async def get_gates(task_id: str):
     """List gate output files for a task.
 
-    Returns {"gates": [{"name": str, "size": int}]}, sorted by name.
-    Empty list when the gates directory does not exist yet.
+    Returns {"gates": [{"name": str, "size": int, "kind": str}]},
+    sorted by name. Empty list when the gates directory does not
+    exist yet.
+
+    T10 §D17: pending human gates are surfaced via their
+    `<name>.request.md` file when neither `.approval` nor
+    `.rejection` companion exists yet. Completed gates (any kind)
+    are listed via their `<name>.txt` output. The `kind` field is
+    "awaiting_human" or "completed" so the dashboard can decide
+    which controls to render.
     """
     if not _SAFE_TASK_ID_RE.fullmatch(task_id):
         return JSONResponse({"error": "Invalid task id"}, status_code=400)
@@ -241,11 +249,41 @@ async def get_gates(task_id: str):
     if not gates_dir.exists():
         return JSONResponse({"gates": []})
 
-    gates = [
-        {"name": f.stem, "size": f.stat().st_size}
-        for f in sorted(gates_dir.glob("*.txt"))
-        if _SAFE_TASK_ID_RE.fullmatch(f.stem)
-    ]
+    gates: list[dict] = []
+    seen_names: set[str] = set()
+
+    # Completed gates — `*.txt` files (every kind writes one
+    # post-results).
+    for f in sorted(gates_dir.glob("*.txt")):
+        if not _SAFE_TASK_ID_RE.fullmatch(f.stem):
+            continue
+        gates.append({
+            "name": f.stem,
+            "size": f.stat().st_size,
+            "kind": "completed",
+        })
+        seen_names.add(f.stem)
+
+    # Pending human gates — `*.request.md` without a decision yet.
+    for f in sorted(gates_dir.glob("*.request.md")):
+        # Strip the `.request` suffix (Path.stem leaves `.md` part
+        # already gone, so f.stem is `<name>.request`).
+        name = f.stem[: -len(".request")] if f.stem.endswith(".request") else f.stem
+        if not _SAFE_TASK_ID_RE.fullmatch(name):
+            continue
+        if name in seen_names:
+            continue
+        approval = gates_dir / f"{name}.approval"
+        rejection = gates_dir / f"{name}.rejection"
+        if approval.exists() or rejection.exists():
+            continue
+        gates.append({
+            "name": name,
+            "size": f.stat().st_size,
+            "kind": "awaiting_human",
+        })
+
+    gates.sort(key=lambda g: g["name"])
     return JSONResponse({"gates": gates})
 
 
@@ -272,6 +310,60 @@ async def get_gate_output(task_id: str, gate_name: str):
         return JSONResponse({"content": gate_path.read_text(encoding="utf-8")})
     except OSError as exc:
         return JSONResponse({"error": f"Could not read file: {exc}"}, status_code=500)
+
+
+# T10 (v0.3 §2.4): write a sentinel for a pending human gate so the
+# runner's poll loop wakes up and the gate transitions to PASS / FAIL.
+# 4 KB note cap mirrors `state._VERBATIM_CAP_BYTES`. Path-traversal
+# guards on both `task_id` and `name` (same as the GET endpoints).
+# See plans/task-10/plan.md §D14.
+
+_HUMAN_GATE_NOTE_CAP_BYTES = 4096
+
+
+@app.post("/api/gates/{task_id}/{name}/decision")
+async def post_gate_decision(task_id: str, name: str, body: dict):
+    """Write a sentinel file for a pending human gate.
+
+    Body: `{"decision": "approve"|"reject", "note": str}`.
+    Path: `{plans_dir}/task-{task_id}/gates/{name}.{approval|rejection}`.
+    Returns 200 `{"ok": true, "path": "..."}` on success; 400 on
+    invalid decision / path-traversal; 500 on filesystem error.
+    """
+    if not _SAFE_TASK_ID_RE.fullmatch(task_id):
+        return JSONResponse({"error": "Invalid task id"}, status_code=400)
+    if not _SAFE_TASK_ID_RE.fullmatch(name):
+        return JSONResponse({"error": "Invalid gate name"}, status_code=400)
+    decision = body.get("decision") if isinstance(body, dict) else None
+    if decision not in ("approve", "reject"):
+        return JSONResponse(
+            {"error": "decision must be 'approve' or 'reject'"},
+            status_code=400,
+        )
+    # Defensive str() cast: a client sending {"note": 12} (int) would
+    # otherwise crash `.encode("utf-8")` with AttributeError. Cost is
+    # zero; coerces None / int / bool / list-via-str to text first.
+    raw_note = body.get("note") if isinstance(body, dict) else ""
+    note = str(raw_note) if raw_note is not None else ""
+    note_capped = note.encode("utf-8")[:_HUMAN_GATE_NOTE_CAP_BYTES].decode(
+        "utf-8", errors="ignore",
+    )
+
+    defaults = load_tasks().get("defaults", {})
+    plans_dir = defaults.get("plans_dir", "plans")
+    gates_dir = work_dir / plans_dir / f"task-{task_id}" / "gates"
+    gates_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix = "approval" if decision == "approve" else "rejection"
+    sentinel = gates_dir / f"{name}.{suffix}"
+    try:
+        sentinel.write_text(note_capped, encoding="utf-8")
+    except OSError as exc:
+        return JSONResponse(
+            {"error": f"Could not write sentinel: {exc}"},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, "path": str(sentinel)})
 
 
 # v0.3 task 12 (Plan §2.14): cross-task aggregation panel.

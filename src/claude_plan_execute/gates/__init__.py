@@ -40,8 +40,14 @@ class Gate:
     kind, command, prompt_template, model, effort, timeout_minutes,
     parallel_safe, on_failure, when. The registry key (`name`) is
     the dict key, NOT a Gate field — see §D1.
+
+    T10 (v0.3 §2.4) appends `sentinel_path` at the END of the field
+    tuple — see plans/task-10/plan.md §D1. `sentinel_path=None` means
+    "compute from convention `task_dir/gates/<name>.approval`" at
+    HumanGate.run() time. Custom paths are honored verbatim by
+    HumanGate; CLI / server use the convention path (§D8).
     """
-    kind: Literal["shell", "agent"]
+    kind: Literal["shell", "agent", "human"]
     command: tuple[str, ...] | None = None
     prompt_template: str | None = None
     model: str | None = None
@@ -50,6 +56,7 @@ class Gate:
     parallel_safe: bool = True
     on_failure: Literal["block", "warn"] = "block"
     when: tuple[str, ...] = ("always",)
+    sentinel_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +151,7 @@ def default_registry() -> "GateRegistry":
 
 from claude_plan_execute.gates.shell import ShellGate, _OUTPUT_CAP_BYTES, _tail_cap  # noqa: E402
 from claude_plan_execute.gates.agent import AgentGate, _extract_findings  # noqa: E402
+from claude_plan_execute.gates.human import HumanGate  # noqa: E402  T10
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +234,8 @@ def _run_one(
     name: str, gate: Gate, task: dict, cli: dict,
     diff_path: str | None = None,
     usage_jsonl_path: str | None = None,
+    task_dir: "Path | None" = None,
+    state: "object | None" = None,
 ) -> GateResult:
     """Execute one gate, returning a GateResult on success OR failure.
 
@@ -239,6 +249,14 @@ def _run_one(
     `run_gates` itself in the post-results loop, so this kwarg is
     not threaded into `ShellGate`.
 
+    `task_dir` and `state` (T10, v0.3 §2.4) are threaded into
+    `HumanGate` only — see plans/task-10/plan.md §D12. The two
+    optional kwargs are APPENDED at the end (POSITIONAL_OR_KEYWORD)
+    so the parallel pool's positional `submit(...)` call (which
+    forwards only the first six params) keeps working unmodified.
+    Human gates always run serial (parallel_safe=False hardcoded by
+    `compile_entry`), so the parallel-pool pathway never needs them.
+
     Exceptions are caught and reported; the gate-run loop never raises
     out of `run_gates`.
     """
@@ -251,6 +269,26 @@ def _run_one(
                 name=name, gate=gate, task=task, cli=cli,
                 diff_path=diff_path,
                 usage_jsonl_path=usage_jsonl_path,
+            ).run()
+        if gate.kind == "human":
+            if task_dir is None:
+                return GateResult(
+                    name=name, passed=False, output="",
+                    output_path=None,
+                    duration_seconds=time.time() - start,
+                    on_failure=gate.on_failure,
+                    error="kind=human requires task_dir",
+                )
+            # Late import (function-local) — see plan §D11. The
+            # sibling import at module bottom (next to ShellGate /
+            # AgentGate) covers the public API; this local import
+            # is a defensive duplicate so reordering of
+            # gates/__init__.py imports in the future does not
+            # silently break the dispatch.
+            from claude_plan_execute.gates.human import HumanGate
+            return HumanGate(
+                name=name, gate=gate, task=task,
+                task_dir=task_dir, state=state,
             ).run()
         return GateResult(
             name=name, passed=False, output="",
@@ -282,6 +320,7 @@ def run_gates(
     task_dir: Path,
     cli: dict,
     registry: "GateRegistry | None" = None,
+    state: "object | None" = None,
 ) -> list[GateResult]:
     """Run the given gates in serial-then-parallel order, capturing output.
 
@@ -295,6 +334,11 @@ def run_gates(
     (the resolution happens at the call site in runner.py); it's
     accepted for forward-compat with future call sites that defer
     resolution to here.
+
+    `state` (T10, v0.3 §2.4) is threaded into HumanGate only.
+    Forward-reference to `state.State`; typed as `object` to avoid
+    importing State at module load (no runtime cycle). When None,
+    HumanGate skips status updates — useful for unit tests.
     """
     gates_dir = task_dir / "gates"
     gates_dir.mkdir(parents=True, exist_ok=True)
@@ -342,6 +386,8 @@ def run_gates(
             name, gate, task, cli,
             diff_path=diff_path_str,
             usage_jsonl_path=usage_jsonl_path_str,
+            task_dir=task_dir,
+            state=state,
         ))
 
     # Then parallel.
@@ -417,5 +463,5 @@ def run_gates(
 __all__ = [
     "Gate", "GateResult", "GateRegistry",
     "default_registry", "run_gates",
-    "ShellGate", "AgentGate",
+    "ShellGate", "AgentGate", "HumanGate",
 ]

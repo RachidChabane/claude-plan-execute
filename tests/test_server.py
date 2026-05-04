@@ -890,6 +890,178 @@ tasks:
         assert r.json()["content"] == "ok\n"
 
 
+class TestGatesAPIHumanRequestExtension:
+    """T10 §D17 — list endpoint surfaces pending human gates via
+    `<name>.request.md` files when no decision sentinel exists.
+    """
+
+    def test_get_gates_lists_pending_human_gate_via_request_md(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        d = tmp_path / "plans" / "task-1" / "gates"
+        d.mkdir(parents=True)
+        (d / "review.request.md").write_text("# please review\n")
+        r = client.get("/api/gates/1")
+        assert r.status_code == 200
+        names = [g["name"] for g in r.json()["gates"]]
+        assert "review" in names
+        kinds = {g["name"]: g["kind"] for g in r.json()["gates"]}
+        assert kinds["review"] == "awaiting_human"
+
+    def test_get_gates_omits_human_gate_with_decision_in_place(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        d = tmp_path / "plans" / "task-1" / "gates"
+        d.mkdir(parents=True)
+        (d / "review.request.md").write_text("# please review\n")
+        (d / "review.approval").write_text("ok\n")
+        r = client.get("/api/gates/1")
+        assert r.status_code == 200
+        # The pending entry is suppressed; if a `.txt` exists it would
+        # show up as "completed", but we deliberately did not write
+        # one yet.
+        names = [g["name"] for g in r.json()["gates"]]
+        assert "review" not in names
+
+    def test_get_gates_existing_txt_listing_unchanged_for_completed_gates(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        d = tmp_path / "plans" / "task-1" / "gates"
+        d.mkdir(parents=True)
+        (d / "tests.txt").write_text("passed\n")
+        r = client.get("/api/gates/1")
+        assert r.status_code == 200
+        gates = r.json()["gates"]
+        assert len(gates) == 1
+        assert gates[0]["name"] == "tests"
+        assert gates[0]["kind"] == "completed"
+
+
+class TestGateDecisionAPI:
+    """T10 §D14 — POST /api/gates/{task_id}/{name}/decision."""
+
+    def test_post_decision_approve_writes_approval_sentinel(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        r = client.post(
+            "/api/gates/1/review/decision",
+            json={"decision": "approve", "note": "lgtm"},
+        )
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        sentinel = tmp_path / "plans" / "task-1" / "gates" / "review.approval"
+        assert sentinel.exists()
+        assert sentinel.read_text() == "lgtm"
+
+    def test_post_decision_reject_writes_rejection_sentinel(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        r = client.post(
+            "/api/gates/1/review/decision",
+            json={"decision": "reject", "note": "no go"},
+        )
+        assert r.status_code == 200
+        sentinel = tmp_path / "plans" / "task-1" / "gates" / "review.rejection"
+        assert sentinel.exists()
+        assert sentinel.read_text() == "no go"
+
+    def test_post_decision_invalid_decision_returns_400(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        r = client.post(
+            "/api/gates/1/review/decision",
+            json={"decision": "abstain", "note": ""},
+        )
+        assert r.status_code == 400
+
+    def test_post_decision_path_traversal_task_id_returns_400(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        r = client.post(
+            "/api/gates/bad.id/review/decision",
+            json={"decision": "approve", "note": ""},
+        )
+        assert r.status_code == 400
+
+    def test_post_decision_path_traversal_gate_name_returns_400(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        r = client.post(
+            "/api/gates/1/bad.name/decision",
+            json={"decision": "approve", "note": ""},
+        )
+        assert r.status_code == 400
+
+    def test_post_decision_caps_note_at_4kb(self, client, tmp_path):
+        _write_tasks_yaml(tmp_path)
+        big_note = "x" * (10 * 1024)  # 10 KB; cap is 4 KB
+        r = client.post(
+            "/api/gates/1/review/decision",
+            json={"decision": "approve", "note": big_note},
+        )
+        assert r.status_code == 200
+        sentinel = tmp_path / "plans" / "task-1" / "gates" / "review.approval"
+        encoded = sentinel.read_text().encode("utf-8")
+        assert len(encoded) == 4096
+
+    def test_post_decision_empty_body_writes_empty_sentinel(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        r = client.post(
+            "/api/gates/1/review/decision",
+            json={"decision": "approve"},  # no `note` key
+        )
+        assert r.status_code == 200
+        sentinel = tmp_path / "plans" / "task-1" / "gates" / "review.approval"
+        assert sentinel.exists()
+        assert sentinel.read_text() == ""
+
+    def test_post_decision_uses_custom_plans_dir(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path, """\
+version: 1
+defaults:
+  plans_dir: artifacts
+tasks:
+  - id: 1
+    title: T
+    description: D
+""")
+        r = client.post(
+            "/api/gates/1/review/decision",
+            json={"decision": "approve", "note": "ok"},
+        )
+        assert r.status_code == 200
+        sentinel = (
+            tmp_path / "artifacts" / "task-1" / "gates" / "review.approval"
+        )
+        assert sentinel.exists()
+
+    def test_post_decision_creates_gates_dir_if_missing(
+        self, client, tmp_path,
+    ):
+        _write_tasks_yaml(tmp_path)
+        # No plans/task-1 directory yet — endpoint should create it.
+        r = client.post(
+            "/api/gates/1/review/decision",
+            json={"decision": "approve", "note": "ok"},
+        )
+        assert r.status_code == 200
+        assert (
+            tmp_path / "plans" / "task-1" / "gates" / "review.approval"
+        ).exists()
+
+
 # ---------------------------------------------------------------------------
 # v0.3 task 8: services endpoints (Plan §D6 / §D10.6)
 # ---------------------------------------------------------------------------

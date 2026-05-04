@@ -751,12 +751,26 @@ def execute_task(
                     task=task_for_gates,
                     task_dir=task_dir,
                     cli=cli,
+                    state=state,
                 )
                 blocking = [
                     r for r in gate_results
                     if not r.passed and r.on_failure == "block"
                 ]
                 if blocking:
+                    # T10 §D19: differentiate human_gate_timeout from
+                    # generic gate_failed. BOTH `block_reason` (the
+                    # dashboard-visible chip) AND `failure_class`
+                    # (telemetry/audits) flip together via a single
+                    # `reason_class` local so they cannot drift.
+                    has_human_timeout = any(
+                        r.error == "human_gate_timeout" for r in blocking
+                    )
+                    reason_class = (
+                        "human_gate_timeout"
+                        if has_human_timeout
+                        else "gate_failed"
+                    )
                     verbatim = "\n\n".join(
                         f"--- {r.name} ---\n{r.output}"
                         for r in blocking
@@ -770,10 +784,10 @@ def execute_task(
                             artifacts[f"gate:{r.name}"] = r.output_path
                     state.set_status(
                         tid, "blocked",
-                        block_reason="gate_failed",
+                        block_reason=reason_class,
                     )
                     state.record_failure(tid, make_failure_record(
-                        failure_class="gate_failed",
+                        failure_class=reason_class,
                         phase="gate",
                         reason=(
                             f"{len(blocking)} gate(s) failed: "

@@ -136,11 +136,13 @@ def test_reset_all_on_empty_state_is_noop(tmp_path: Path):
 
 def test_statuses_constant_includes_known_values():
     # Pin: STATUSES documents the known status names. Task 6 added "blocked"
-    # for the on_max_review_rounds: fail path.
+    # for the on_max_review_rounds: fail path. T10 (v0.3 §2.4) added
+    # "awaiting_human" for human-gate pause.
     assert "pending" in STATUSES
     assert "done" in STATUSES
     assert "implementing" in STATUSES
     assert "blocked" in STATUSES
+    assert "awaiting_human" in STATUSES
 
 
 def test_use_color_propagates_to_loader_and_deps_via_module_global(monkeypatch, capsys):
@@ -526,6 +528,11 @@ def test_failure_classes_includes_v0_3_task_8_writes():
     assert "service_unavailable" in FAILURE_CLASSES
     assert "service_crashed" in FAILURE_CLASSES
     assert "service_unstable" in FAILURE_CLASSES
+
+
+def test_failure_classes_includes_v0_3_task_10_writes():
+    """v0.3 task 10 — human gate timeout class (§2.4)."""
+    assert "human_gate_timeout" in FAILURE_CLASSES
 
 
 def test_make_failure_record_does_not_validate_failure_class():

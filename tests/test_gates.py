@@ -50,12 +50,31 @@ def test_gate_field_order_matches_task_description():
     """Task 11 description names fields in this exact order:
     kind, command, prompt_template, model, effort, timeout_minutes,
     parallel_safe, on_failure, when. Pin field order as a regression
-    guard against accidental reordering."""
+    guard against accidental reordering. T10 (v0.3 §2.4) appends
+    `sentinel_path` at the end — see plans/task-10/plan.md §D1.
+    """
     fields = [f.name for f in Gate.__dataclass_fields__.values()]
     assert fields == [
         "kind", "command", "prompt_template", "model", "effort",
         "timeout_minutes", "parallel_safe", "on_failure", "when",
+        "sentinel_path",
     ]
+
+
+def test_gate_default_sentinel_path_is_None():
+    """T10 §D4 — sentinel_path default is None; HumanGate computes
+    the convention path at run() time when None.
+    """
+    g = Gate(kind="shell", command=("echo", "hi"))
+    assert g.sentinel_path is None
+
+
+def test_gate_kind_literal_accepts_human():
+    """T10 — Gate.kind extends to ['shell', 'agent', 'human'].
+    Constructing a Gate(kind='human', ...) does not raise.
+    """
+    g = Gate(kind="human", prompt_template="please review")
+    assert g.kind == "human"
 
 
 def test_gate_is_frozen():
@@ -1857,4 +1876,826 @@ def test_test_critique_template_example_is_valid_findings_appendix():
     findings, sidecar = _extract_findings(body, "test-critique")
     assert findings is not None
     assert all(isinstance(el, dict) for el in findings)
-    assert "_raw" not in (sidecar or {})
+
+
+# ---------------------------------------------------------------------------
+# K. Gate.kind=human surface (T10, v0.3 §2.4)
+# ---------------------------------------------------------------------------
+#
+# Pin §D12 — `_run_one` signature must keep `task_dir` and `state`
+# as POSITIONAL_OR_KEYWORD parameters APPENDED at the end. The
+# parallel pool's positional `submit(...)` call binds the first
+# six params positionally and ignores the new two; if a future
+# refactor inserts the new params before `diff_path` /
+# `usage_jsonl_path`, the parallel pool would silently mis-bind.
+# This pin catches that.
+
+def test_run_one_signature_field_order_after_t10():
+    """T10 §D12 — `_run_one` signature is exactly:
+    name, gate, task, cli, diff_path, usage_jsonl_path, task_dir, state.
+    All four optional params are POSITIONAL_OR_KEYWORD (NOT
+    KEYWORD_ONLY) so the parallel pool's positional submit() works.
+    """
+    import inspect
+
+    from claude_plan_execute.gates import _run_one
+
+    sig = inspect.signature(_run_one)
+    params = list(sig.parameters.values())
+    names = [p.name for p in params]
+    assert names == [
+        "name", "gate", "task", "cli",
+        "diff_path", "usage_jsonl_path",
+        "task_dir", "state",
+    ]
+    for p in params:
+        assert p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD, (
+            f"{p.name} is {p.kind!r}, expected POSITIONAL_OR_KEYWORD"
+        )
+
+
+def test_run_gates_parallel_pool_unchanged_for_shell_agent_gates(
+    monkeypatch, tmp_path,
+):
+    """T10 §D12 regression — parallel-safe shell + agent gates run
+    through the parallel pool unchanged after the _run_one signature
+    extension. The positional submit(...) tuple binds (n, g, task,
+    cli, diff_path_str, usage_jsonl_path_str) verbatim; new task_dir
+    / state kwargs default to None for the parallel branch.
+    """
+    _stub_subprocess_run_global(monkeypatch, stdout="ok\n")
+    g_shell = Gate(kind="shell", command=("true",), parallel_safe=True)
+    results = run_gates(
+        [("p1", g_shell), ("p2", g_shell)],
+        task={"id": 7, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert len(results) == 2
+    assert all(r.passed for r in results)
+
+
+# ---------------------------------------------------------------------------
+# L. HumanGate runner (T10, v0.3 §2.4)
+# ---------------------------------------------------------------------------
+#
+# HumanGate pauses the runner pending an operator decision via
+# filesystem sentinels. Tests use `poll_interval_seconds=0.01`
+# and seed sentinels from a `threading.Thread` that sleeps ~50 ms
+# before writing — total wall time per test < 200 ms. See plan
+# §D9 testability seam.
+
+import threading
+import time  # module-level for the tests below
+
+
+def _drop_sentinel_after(
+    path: Path, content: str, delay_seconds: float = 0.05,
+) -> threading.Thread:
+    """Spawn a daemon thread that writes `content` to `path` after a
+    short delay. Returns the thread handle (caller can `.join()` for
+    cleanliness, but daemon=True means tests will exit even if the
+    thread is forgotten).
+    """
+    def writer():
+        time.sleep(delay_seconds)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    return t
+
+
+def _make_task(tid: int = 10, **extra) -> dict:
+    return {
+        "id": tid,
+        "title": "T",
+        "description": "D",
+        **extra,
+    }
+
+
+# --- (a) approval before timeout ---------------------------------------------
+
+def test_human_gate_approval_before_timeout_passes_with_note(tmp_path):
+    """Test (a) — approval drops a `<name>.approval` sentinel; the
+    gate returns passed=True with the operator's note as output.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review", parallel_safe=False)
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    approval_path = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(approval_path, "lgtm — design ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    assert "lgtm" in result.output
+    assert result.error is None
+
+
+# --- (b) rejection -----------------------------------------------------------
+
+def test_human_gate_rejection_fails_with_note(tmp_path):
+    """Test (b) — rejection drops a `<name>.rejection` sentinel; the
+    gate returns passed=False with the operator's note as output.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    rejection_path = task_dir / "gates" / "review.rejection"
+    _drop_sentinel_after(rejection_path, "needs work — see comment\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is False
+    assert "needs work" in result.output
+    # Verdict-based failures use the existing gate_failed pathway, not
+    # human_gate_timeout.
+    assert result.error is None
+
+
+# --- (c) timeout -------------------------------------------------------------
+
+def test_human_gate_timeout_fails_with_human_gate_timeout_error(tmp_path):
+    """Test (c) — no decision before timeout deadline; result has
+    error='human_gate_timeout', passed=False.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    # 1 minute timeout but we'll fake elapsed time via a low poll
+    # interval and a deadline-reached check on each tick.
+    g = Gate(
+        kind="human", prompt_template="please review",
+        timeout_minutes=1,
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    # We monkey-patch time.time inside the human module to advance
+    # the clock past the deadline after one poll tick. Cleaner than
+    # actually waiting 60 seconds.
+    import claude_plan_execute.gates.human as human_mod
+
+    real_time = human_mod.time.time
+    base = real_time()
+    state = {"calls": 0}
+
+    def fake_time():
+        state["calls"] += 1
+        # First few calls (start, deadline, deadline-check) return real;
+        # subsequent calls (during poll) jump ahead by 999 seconds so
+        # `time.time() >= deadline` fires.
+        if state["calls"] >= 4:
+            return base + 9999
+        return base + state["calls"] * 0.01
+
+    import unittest.mock as mock
+    with mock.patch.object(human_mod.time, "time", fake_time):
+        hg = HumanGate(
+            name="review", gate=g, task=_make_task(), task_dir=task_dir,
+            poll_interval_seconds=0.01,
+        )
+        result = hg.run()
+
+    assert result.passed is False
+    assert result.error == "human_gate_timeout"
+
+
+# --- pre-clear stale sentinels (§D3) -----------------------------------------
+
+def test_human_gate_clears_stale_approval_sentinel_on_entry(tmp_path):
+    """§D3 — a stale `.approval` from a prior attempt must NOT cause
+    instant PASS on re-run. HumanGate.run() pre-clears both sentinels
+    before writing the request file.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    (task_dir / "gates").mkdir(parents=True)
+
+    stale = task_dir / "gates" / "review.approval"
+    stale.write_text("stale — should be cleared\n", encoding="utf-8")
+
+    # Drop a FRESH rejection mid-poll. The fresh sentinel must win;
+    # the stale approval must NOT.
+    fresh_reject = task_dir / "gates" / "review.rejection"
+    _drop_sentinel_after(fresh_reject, "fresh reject\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is False
+    assert "fresh reject" in result.output
+
+
+def test_human_gate_clears_stale_rejection_sentinel_on_entry(tmp_path):
+    """§D3 — a stale `.rejection` from a prior attempt must NOT cause
+    instant FAIL on re-run.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    (task_dir / "gates").mkdir(parents=True)
+
+    stale = task_dir / "gates" / "review.rejection"
+    stale.write_text("stale\n", encoding="utf-8")
+
+    fresh_approve = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh_approve, "fresh approve\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    assert "fresh approve" in result.output
+
+
+# --- request file write & header (§D6) ---------------------------------------
+
+def test_human_gate_writes_request_file_to_gates_dir(tmp_path):
+    """§D6 — HumanGate writes `<name>.request.md` into task_dir/gates/.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="REVIEW BODY")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    request_file = task_dir / "gates" / "review.request.md"
+    assert request_file.exists()
+    body = request_file.read_text()
+    assert "REVIEW BODY" in body
+
+
+def test_human_gate_request_file_contains_task_header_and_response_instructions(
+    tmp_path,
+):
+    """§D6 — request body has a task header (TASK <id>: <title> +
+    DESCRIPTION:) and a footer with response instructions (Approve /
+    Reject paths + CLI examples).
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review carefully")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g,
+        task=_make_task(tid=42, title="Add OAuth"),
+        task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    body = (task_dir / "gates" / "review.request.md").read_text()
+    assert "TASK 42: Add OAuth" in body
+    assert "DESCRIPTION:" in body
+    assert "How to respond" in body
+    assert "approve 42 review" in body
+    assert "reject 42 review" in body
+
+
+# --- placeholder substitution (§D5) ------------------------------------------
+
+def test_human_gate_substitutes_all_five_placeholders_in_body(tmp_path):
+    """§D5 — five placeholders {plan_path}, {gates_dir}, {diff_path},
+    {approval_path}, {rejection_path} substituted via str.replace.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    template = (
+        "Plan: {plan_path}\nGates: {gates_dir}\nDiff: {diff_path}\n"
+        "Approve: {approval_path}\nReject: {rejection_path}\n"
+    )
+    g = Gate(kind="human", prompt_template=template)
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    body = (task_dir / "gates" / "review.request.md").read_text()
+    assert str(task_dir / "plan.md") in body
+    assert str(task_dir / "gates") in body
+    assert str(task_dir / "diff.patch") in body
+    assert str(task_dir / "gates" / "review.approval") in body
+    assert str(task_dir / "gates" / "review.rejection") in body
+
+
+def test_human_gate_substitutes_diff_path_placeholder(tmp_path):
+    """§D5 — `{diff_path}` resolves to task_dir/diff.patch."""
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="see {diff_path}")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    body = (task_dir / "gates" / "review.request.md").read_text()
+    assert "{diff_path}" not in body
+    assert str(task_dir / "diff.patch") in body
+
+
+# --- custom sentinel_path (§D4) ---------------------------------------------
+
+def test_human_gate_custom_sentinel_path_is_respected(tmp_path):
+    """§D4 — a custom `Gate.sentinel_path` overrides the convention
+    path; the rejection path is derived by suffix swap.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    custom = tmp_path / "custom-dir" / "x.approval"
+    custom.parent.mkdir(parents=True)
+    g = Gate(
+        kind="human", prompt_template="please review",
+        sentinel_path=str(custom),
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    _drop_sentinel_after(custom, "lgtm\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    assert "lgtm" in result.output
+
+
+def test_human_gate_rejection_path_swaps_approval_for_rejection_suffix(tmp_path):
+    """§D4 — when sentinel_path ends in `.approval`, the rejection
+    path is the same with `.rejection` instead.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    custom_approve = tmp_path / "custom-dir" / "x.approval"
+    custom_approve.parent.mkdir(parents=True)
+    custom_reject = tmp_path / "custom-dir" / "x.rejection"
+
+    g = Gate(
+        kind="human", prompt_template="please review",
+        sentinel_path=str(custom_approve),
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    _drop_sentinel_after(custom_reject, "no go\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is False
+    assert "no go" in result.output
+
+
+def test_human_gate_sentinel_default_uses_convention_path(tmp_path):
+    """§D4 — when sentinel_path is None, HumanGate computes
+    `task_dir/gates/<name>.approval`.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    convention = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(convention, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+
+
+# --- approval-wins tiebreak (§D7) -------------------------------------------
+
+def test_human_gate_approval_wins_over_simultaneous_rejection(tmp_path):
+    """§D7 — if both .approval and .rejection exist at poll time,
+    PASS wins. Pre-seed both before the poll loop runs.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    (task_dir / "gates").mkdir(parents=True)
+
+    # Both must be dropped AFTER the pre-clear (which fires on
+    # run() entry). Use a tiny delay; the poll sees both at once.
+    approval = task_dir / "gates" / "review.approval"
+    rejection = task_dir / "gates" / "review.rejection"
+
+    def writer():
+        time.sleep(0.05)
+        approval.write_text("approve note\n", encoding="utf-8")
+        rejection.write_text("reject note\n", encoding="utf-8")
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    assert "approve note" in result.output
+
+
+# --- output tail-cap (§D18) --------------------------------------------------
+
+def test_human_gate_output_is_capped_note_content(tmp_path):
+    """§D18 — GateResult.output is the (tail-capped) sentinel
+    content. The 100 KB cap from gates.shell._tail_cap applies.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    huge_note = "x" * (200 * 1024)  # 200 KB, twice the 100 KB cap
+    approval = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(approval, huge_note, 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    # Truncation marker prepended; total length ≈ 100 KB (cap) +
+    # marker.
+    assert "[truncated:" in result.output
+    assert len(result.output.encode("utf-8")) < 200 * 1024
+
+
+# --- on_failure carry-through ------------------------------------------------
+
+def test_human_gate_carries_on_failure_warn_through_to_result(tmp_path):
+    """§: `on_failure="warn"` survives to the GateResult."""
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(
+        kind="human", prompt_template="please review", on_failure="warn",
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    rej = task_dir / "gates" / "review.rejection"
+    _drop_sentinel_after(rej, "no\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is False
+    assert result.on_failure == "warn"
+
+
+# --- missing prompt_template -------------------------------------------------
+
+def test_human_gate_missing_prompt_template_raises(tmp_path):
+    """HumanGate.run() raises ValueError when prompt_template is
+    missing. (compile_entry already enforces this; this is the
+    runtime defense for direct callers.)
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate.__new__(Gate)
+    object.__setattr__(g, "kind", "human")
+    object.__setattr__(g, "command", None)
+    object.__setattr__(g, "prompt_template", None)
+    object.__setattr__(g, "model", None)
+    object.__setattr__(g, "effort", None)
+    object.__setattr__(g, "timeout_minutes", 10)
+    object.__setattr__(g, "parallel_safe", False)
+    object.__setattr__(g, "on_failure", "block")
+    object.__setattr__(g, "when", ("always",))
+    object.__setattr__(g, "sentinel_path", None)
+
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    with pytest.raises(ValueError, match="prompt_template"):
+        hg.run()
+
+
+# --- state threading + awaiting_human lifecycle (§D10, §D12) -----------------
+
+def test_human_gate_sets_awaiting_human_status_during_poll(tmp_path):
+    """§D10 / §D12 — when state is threaded, HumanGate sets
+    status='awaiting_human' + awaiting_gate_name before polling and
+    restores 'implementing' (with awaiting_gate_name popped) when
+    the poll exits.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+    from claude_plan_execute.state import State
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    state = State(tmp_path / "state.json")
+    # Seed task.
+    state.set_status(10, "implementing")
+
+    captured = {}
+
+    def writer():
+        # Capture the status the gate set during poll.
+        time.sleep(0.05)
+        captured["mid_status"] = state.get(10).get("status")
+        captured["awaiting_gate_name"] = state.get(10).get(
+            "awaiting_gate_name",
+        )
+        approval = task_dir / "gates" / "review.approval"
+        approval.write_text("ok\n", encoding="utf-8")
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        state=state, poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+    t.join()
+
+    assert result.passed is True
+    assert captured["mid_status"] == "awaiting_human"
+    assert captured["awaiting_gate_name"] == "review"
+    # After run() returns, status restored + awaiting_gate_name popped.
+    final = state.get(10)
+    assert final["status"] == "implementing"
+    assert "awaiting_gate_name" not in final
+
+
+def test_human_gate_clears_awaiting_gate_name_on_pass(tmp_path):
+    """§D10 — awaiting_gate_name is popped on PASS exit."""
+    from claude_plan_execute.gates.human import HumanGate
+    from claude_plan_execute.state import State
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    state = State(tmp_path / "state.json")
+    state.set_status(10, "implementing")
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        state=state, poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    assert "awaiting_gate_name" not in state.get(10)
+
+
+def test_human_gate_clears_awaiting_gate_name_on_fail(tmp_path):
+    """§D10 — awaiting_gate_name is popped on rejection-FAIL exit."""
+    from claude_plan_execute.gates.human import HumanGate
+    from claude_plan_execute.state import State
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    state = State(tmp_path / "state.json")
+    state.set_status(10, "implementing")
+
+    fresh = task_dir / "gates" / "review.rejection"
+    _drop_sentinel_after(fresh, "no\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        state=state, poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    assert "awaiting_gate_name" not in state.get(10)
+
+
+def test_human_gate_clears_awaiting_gate_name_on_timeout(tmp_path):
+    """§D10 — awaiting_gate_name popped on timeout exit (finally block)."""
+    from claude_plan_execute.gates.human import HumanGate
+    from claude_plan_execute.state import State
+    import claude_plan_execute.gates.human as human_mod
+
+    g = Gate(
+        kind="human", prompt_template="please review", timeout_minutes=1,
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    state = State(tmp_path / "state.json")
+    state.set_status(10, "implementing")
+
+    base = human_mod.time.time()
+    state_d = {"calls": 0}
+
+    def fake_time():
+        state_d["calls"] += 1
+        if state_d["calls"] >= 4:
+            return base + 9999
+        return base + state_d["calls"] * 0.01
+
+    import unittest.mock as mock
+    with mock.patch.object(human_mod.time, "time", fake_time):
+        hg = HumanGate(
+            name="review", gate=g, task=_make_task(), task_dir=task_dir,
+            state=state, poll_interval_seconds=0.01,
+        )
+        result = hg.run()
+
+    assert result.error == "human_gate_timeout"
+    assert "awaiting_gate_name" not in state.get(10)
+
+
+def test_human_gate_skips_state_updates_when_state_is_None(tmp_path):
+    """When state is None (unit-test path), HumanGate does NOT
+    attempt status updates; the rest of the contract still applies.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        state=None, poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+
+
+# --- state threading via run_gates (§D12) -----------------------------------
+
+def test_run_gates_threads_state_into_human_gate_run(tmp_path, monkeypatch):
+    """§D12 — `run_gates(..., state=state)` forwards state through
+    `_run_one` into HumanGate.run(); the awaiting_human status fires.
+    """
+    from claude_plan_execute.state import State
+    import claude_plan_execute.gates.human as human_mod
+
+    # Speed-up: short-circuit the 10 s production sleep.
+    real_sleep = human_mod.time.sleep
+    monkeypatch.setattr(
+        human_mod.time, "sleep", lambda _s: real_sleep(0.01),
+    )
+
+    g = Gate(
+        kind="human", prompt_template="please review", parallel_safe=False,
+    )
+    state = State(tmp_path / "state.json")
+    state.set_status(10, "implementing")
+
+    captured = {}
+
+    def writer():
+        time.sleep(0.05)
+        captured["mid_status"] = state.get(10).get("status")
+        approval = tmp_path / "gates" / "review.approval"
+        approval.write_text("ok\n", encoding="utf-8")
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+
+    results = run_gates(
+        [("review", g)],
+        task=_make_task(),
+        task_dir=tmp_path,
+        cli={},
+        state=state,
+    )
+    t.join()
+
+    assert len(results) == 1
+    assert results[0].passed is True
+    assert captured["mid_status"] == "awaiting_human"
+
+
+def test_run_gates_threads_task_dir_into_human_gate_run(tmp_path, monkeypatch):
+    """§D12 — `task_dir` flows through to HumanGate; the request
+    file lands in the right place.
+    """
+    import claude_plan_execute.gates.human as human_mod
+
+    real_sleep = human_mod.time.sleep
+    monkeypatch.setattr(
+        human_mod.time, "sleep", lambda _s: real_sleep(0.01),
+    )
+
+    g = Gate(
+        kind="human", prompt_template="please review", parallel_safe=False,
+    )
+
+    fresh = tmp_path / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    results = run_gates(
+        [("review", g)],
+        task=_make_task(),
+        task_dir=tmp_path,
+        cli={},
+    )
+
+    request_file = tmp_path / "gates" / "review.request.md"
+    assert request_file.exists()
+    assert results[0].passed is True
+
+
+# --- SIGINT propagation (§D11) ----------------------------------------------
+
+def test_human_gate_propagates_keyboard_interrupt(tmp_path, monkeypatch):
+    """§D11 — KeyboardInterrupt during the poll bubbles out
+    unchanged. HumanGate does NOT add an `except KeyboardInterrupt`
+    branch.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+    import claude_plan_execute.gates.human as human_mod
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    def fake_sleep(_seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(human_mod.time, "sleep", fake_sleep)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        hg.run()

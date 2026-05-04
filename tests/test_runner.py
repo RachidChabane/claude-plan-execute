@@ -8929,3 +8929,138 @@ def test_explain_task_duplicate_gate_name_across_layers_attributed_per_layer(
     assert len(lint_lines) == 2
     assert any("from defaults" in l for l in lint_lines)
     assert any("from task" in l for l in lint_lines)
+
+
+# ---------------------------------------------------------------------------
+# T10 — runner failure-class + block-reason differentiation (§D19)
+# ---------------------------------------------------------------------------
+#
+# Three pins for the post-Phase-4 blocking-gate loop:
+#   - human_gate_timeout flips both block_reason AND failure_class.
+#   - the dashboard-visible block_reason field flips (separate pin
+#     because §D19 emphasizes the smoke-test-#3 dependency).
+#   - non-human blocking gates still get gate_failed (regression).
+
+def test_runner_classifies_human_gate_timeout_as_distinct_failure_class(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """§D19 pin (failure_class): a HumanGate that times out →
+    record_failure called with failure_class='human_gate_timeout'.
+    """
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    # Fast-mode: monkey-patch HumanGate so its run() returns a
+    # synthetic timeout result without polling.
+    from claude_plan_execute.gates import GateResult
+    import claude_plan_execute.gates.human as human_mod
+
+    def fake_run(self):
+        return GateResult(
+            name=self.name, passed=False, output="",
+            output_path=None, duration_seconds=0.0,
+            on_failure=self.gate.on_failure,
+            error="human_gate_timeout",
+        )
+    monkeypatch.setattr(human_mod.HumanGate, "run", fake_run)
+
+    _clean_default_registry.register(
+        "design-review",
+        Gate(
+            kind="human", prompt_template="please review",
+            parallel_safe=False, on_failure="block",
+        ),
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-review"],
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert len(entry["attempts"]) == 1
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "human_gate_timeout"
+
+
+def test_runner_sets_block_reason_to_human_gate_timeout_on_human_gate_timeout(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """§D19 pin (block_reason): the dashboard-visible block_reason
+    field flips to 'human_gate_timeout' alongside failure_class.
+    """
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    from claude_plan_execute.gates import GateResult
+    import claude_plan_execute.gates.human as human_mod
+
+    def fake_run(self):
+        return GateResult(
+            name=self.name, passed=False, output="",
+            output_path=None, duration_seconds=0.0,
+            on_failure=self.gate.on_failure,
+            error="human_gate_timeout",
+        )
+    monkeypatch.setattr(human_mod.HumanGate, "run", fake_run)
+
+    _clean_default_registry.register(
+        "design-review",
+        Gate(
+            kind="human", prompt_template="please review",
+            parallel_safe=False, on_failure="block",
+        ),
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["design-review"],
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "human_gate_timeout"
+
+
+def test_runner_keeps_block_reason_gate_failed_for_non_timeout_blocking_gates(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """§D19 regression: shell-gate failures still get
+    block_reason='gate_failed' and failure_class='gate_failed'.
+    """
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "bad-gate",
+        Gate(kind="shell", command=("false",), on_failure="block"),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 1
+        p.stdout = ""
+        p.stderr = "regular gate failed\n"
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["bad-gate"]},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "gate_failed"
+    rec = entry["attempts"][0]
+    assert rec["failure_class"] == "gate_failed"

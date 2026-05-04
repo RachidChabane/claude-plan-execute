@@ -24,6 +24,7 @@ _VERBATIM_CAP_BYTES = 4096
 STATUSES = (
     "pending", "planning", "reviewing", "revising",
     "approved", "implementing", "done", "blocked",
+    "awaiting_human",
 )
 
 # Documented set of failure_class strings used across the project. Not
@@ -37,6 +38,7 @@ FAILURE_CLASSES = (
     "gate_failed",                        # task 12 — gate registry (shape only in v1)
     "plan_not_written",                   # NOT written in task 9 (Non-goals)
     "test_failed",                        # subtype of gate_failed; task 12+
+    "human_gate_timeout",                 # v0.3 task 10 — human gate timeout (§2.4)
     "budget_exceeded",                    # NOT written in task 9 (max_attempts deferred)
     "rate_limited",                       # v0.3 task 1 — Claude-API rate-limit retries exhausted (§2.15)
     "service_unavailable",                # v0.3 task 8 — ServiceUnavailableError
