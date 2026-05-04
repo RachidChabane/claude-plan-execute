@@ -689,6 +689,7 @@ def main():
                     task, state, file_defaults, cli_overrides,
                     phases_by_id=phases_by_id,
                     task_class_models=task_class_models,
+                    skip_to=args.skip_to,
                     dry_run=args.dry_run,
                     service_manager=service_manager,
                     all_task_ids=all_task_ids,

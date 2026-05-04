@@ -14,7 +14,7 @@ defaults:
     docs:    { model: sonnet, effort: medium }
   caps:
     max_minutes_per_phase: 60
-    max_review_rounds: 3
+    max_review_rounds: 8
     max_implement_turns: 200
     max_attempts: 3
   on_max_review_rounds: fail
