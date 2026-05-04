@@ -57,6 +57,15 @@ def _reset_module_globals(monkeypatch, tmp_path_factory):
         "claude_plan_execute.runner.memory_dir_for_cwd",
         lambda _cwd: isolated_absent,
     )
+    # T16 §J.1: also stub the gates-side resolution. `run_gates`
+    # calls `memory_dir_for_cwd(Path.cwd())` to compute the
+    # `{memory_dir}` substitution; without this patch any
+    # integration test running an agent gate would resolve the
+    # operator's real ~/.claude/projects/... directory.
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.memory_dir_for_cwd",
+        lambda _cwd=None: isolated_absent,
+    )
 
     yield
     claude._active_child = None
@@ -9545,3 +9554,460 @@ def test_resolve_slate_id_skips_detached_HEAD(tmp_path, monkeypatch):
     monkeypatch.setattr("claude_plan_execute.cli.subprocess.run", fake_run)
     sid = _resolve_slate_id(state, tasks_path)
     assert sid.startswith("mtime-")
+
+
+# ---------------------------------------------------------------------------
+# DD. memory-curate threshold + post-process (T16)
+# ---------------------------------------------------------------------------
+
+
+def _seed_memory_files(memory_dir: Path, n: int) -> None:
+    """Write `n` per-memory files with valid frontmatter under
+    memory_dir, plus a MEMORY.md indexing them."""
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for i in range(n):
+        name = f"m{i}"
+        (memory_dir / f"{name}.md").write_text(
+            "---\n"
+            f"name: {name}\n"
+            "description: x\n"
+            "type: project\n"
+            "lifecycle: evergreen\n"
+            "citation_count: 0\n"
+            "---\n\nbody\n",
+            encoding="utf-8",
+        )
+        lines.append(f"- [{name}]({name}.md) — desc\n")
+    (memory_dir / "MEMORY.md").write_text("".join(lines), encoding="utf-8")
+
+
+def _stub_curate_agent(monkeypatch, agent_text: str) -> None:
+    """Stub run_claude inside gates.agent so memory-curate returns
+    `agent_text` verbatim. Combined with the runner-level
+    _patch_run_claude_simulating_success stub for non-gate phases."""
+    def stub(prompt, **kwargs):
+        return 0, agent_text
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", stub,
+    )
+
+
+def test_threshold_under_does_not_set_pending_flag(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    _patch_run_claude_simulating_success(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 29)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert not state.data.get("pending_memory_curate")
+
+
+def test_threshold_over_sets_pending_flag(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    _patch_run_claude_simulating_success(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 31)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.data.get("pending_memory_curate") is True
+
+
+def test_threshold_resolver_aware_per_task(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    _patch_run_claude_simulating_success(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 28)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, memory_curation_threshold=25), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.data.get("pending_memory_curate") is True
+
+
+def test_threshold_resolver_aware_per_phase(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    _patch_run_claude_simulating_success(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 35)
+
+    state = State(tmp_path / "state.json")
+    phases_by_id = {
+        "p1": {"id": "p1", "defaults": {"memory_curation_threshold": 50}},
+    }
+    execute_task(
+        _make_task(id=1, phase="p1"), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+        phases_by_id=phases_by_id,
+    )
+    assert not state.data.get("pending_memory_curate")
+
+
+def test_pending_curate_flag_appends_memory_curate_to_gates(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, "VERDICT: PASS\n")
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert (tmp_path / "task-1" / "gates" / "memory-curate.txt").is_file()
+
+
+def test_pending_curate_flag_cleared_after_gate_runs(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, "VERDICT: PASS\n")
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert not state.data.get("pending_memory_curate")
+
+
+def _curate_agent_text(findings):
+    return (
+        "VERDICT: PASS\n\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        f"{json.dumps(findings)}\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+
+
+def test_apply_findings_drops_memory_marked_drop(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+    # Add foo memory + index it.
+    (mem_dir / "foo.md").write_text(
+        "---\nname: foo\nlifecycle: evergreen\ncitation_count: 0\n"
+        "---\n\nbody\n", encoding="utf-8",
+    )
+    idx = mem_dir / "MEMORY.md"
+    idx.write_text(idx.read_text() + "- [foo](foo.md) — desc\n")
+
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, _curate_agent_text(
+        [{"memory": "foo", "verdict": "drop", "reason": "stale"}],
+    ))
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert not (mem_dir / "foo.md").exists()
+    assert "(foo.md)" not in (mem_dir / "MEMORY.md").read_text()
+
+
+def test_apply_findings_keeps_memory_marked_keep(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+    (mem_dir / "keepme.md").write_text(
+        "---\nname: keepme\nlifecycle: evergreen\ncitation_count: 0\n"
+        "---\n\nbody\n", encoding="utf-8",
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, _curate_agent_text(
+        [{"memory": "keepme", "verdict": "keep", "reason": "ok"}],
+    ))
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert (mem_dir / "keepme.md").exists()
+
+
+def test_apply_findings_records_merge_into_to_suggestions_file(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 0)
+    for n in ("foo", "bar"):
+        (mem_dir / f"{n}.md").write_text(
+            f"---\nname: {n}\nlifecycle: evergreen\ncitation_count: 0\n"
+            "---\n\nbody\n", encoding="utf-8",
+        )
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, _curate_agent_text(
+        [{"memory": "foo", "verdict": "merge_into:bar", "reason": "dupe"}],
+    ))
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    suggestions_path = tmp_path / "memory-merge-suggestions.json"
+    assert suggestions_path.is_file()
+    data = json.loads(suggestions_path.read_text())
+    assert len(data) == 1
+    assert data[0]["from"] == "foo"
+    assert data[0]["into"] == "bar"
+    # Both memories survive on disk.
+    assert (mem_dir / "foo.md").exists()
+    assert (mem_dir / "bar.md").exists()
+
+
+def test_apply_findings_skips_merge_into_with_missing_target(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §I.3(c): merge_into target absent → no suggestion added,
+    warning logged, task completes."""
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 0)
+    (mem_dir / "src.md").write_text(
+        "---\nname: src\nlifecycle: evergreen\ncitation_count: 0\n"
+        "---\n\nbody\n", encoding="utf-8",
+    )
+    # Note: no target.md — verdict references a missing target.
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, _curate_agent_text(
+        [{"memory": "src", "verdict": "merge_into:nope", "reason": "x"}],
+    ))
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    suggestions_path = tmp_path / "memory-merge-suggestions.json"
+    assert not suggestions_path.exists()
+    # Source file untouched.
+    assert (mem_dir / "src.md").exists()
+
+
+def test_apply_findings_drop_silently_no_op_on_missing_file(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §I.3(c): drop verdict for an already-missing file is a
+    silent no-op (the lifecycle prune may have eaten it earlier the
+    same task). No exception, task completes."""
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+    # Note: no ghost.md — drop targets a name that never existed.
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, _curate_agent_text(
+        [{"memory": "ghost", "verdict": "drop", "reason": "stale"}],
+    ))
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+
+
+def test_curate_gate_failure_does_not_block_task(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: on_failure=warn means an absent VERDICT does NOT block."""
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, "no verdict here\n")
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    # Flag still cleared (gate ran).
+    assert not state.data.get("pending_memory_curate")
+
+
+def test_malformed_findings_json_skips_application(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: malformed JSON between markers → findings=None → no
+    memories dropped, task still done."""
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+    (mem_dir / "x.md").write_text(
+        "---\nname: x\nlifecycle: evergreen\ncitation_count: 0\n"
+        "---\n\nbody\n", encoding="utf-8",
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch,
+        "VERDICT: PASS\n\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        "this is not json {{{\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    # x.md survives.
+    assert (mem_dir / "x.md").exists()
+
+
+def test_findings_none_branch_skips_application(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin: NO appendix markers → _extract_findings returns None
+    → r.findings or [] → []. Task still done; flag cleared."""
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch, "VERDICT: PASS\n\nNo appendix here.\n")
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    assert not state.data.get("pending_memory_curate")
+
+
+def test_findings_non_dict_list_reduced_to_empty_by_extractor(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §I.3(d): a non-dict list at the agent's output is
+    reduced to findings=[] by _extract_findings's case-5
+    fall-through. The runner's post-process step iterates zero
+    elements; the per-element `not isinstance(finding, dict)`
+    branch is NOT reachable through the runner."""
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _seed_memory_files(mem_dir, 1)
+    (mem_dir / "foo.md").write_text(
+        "---\nname: foo\nlifecycle: evergreen\ncitation_count: 0\n"
+        "---\n\nbody\n", encoding="utf-8",
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+    _stub_curate_agent(monkeypatch,
+        "VERDICT: PASS\n\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '["drop foo", "keep bar"]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    _clean_default_registry.register(
+        "memory-curate",
+        Gate(kind="agent", prompt_template="body",
+             parallel_safe=False, on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    state.data["pending_memory_curate"] = True
+    state.save()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    # foo survives (no verdicts applied).
+    assert (mem_dir / "foo.md").exists()
+    assert not state.data.get("pending_memory_curate")

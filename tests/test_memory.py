@@ -1,12 +1,16 @@
 """Unit tests for src/claude_plan_execute/memory.py (T15)."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 import yaml
 
 from claude_plan_execute.memory import (
+    _drop_memory_file,
+    apply_memory_curate_findings,
+    count_memory_entries,
     increment_citations_for_plan,
     memory_dir_for_cwd,
     parse_memory_frontmatter,
@@ -376,3 +380,185 @@ def test_prune_skips_MEMORY_md_when_iterating(tmp_path):
     )
     assert deleted == []
     assert (tmp_path / "MEMORY.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# F. count_memory_entries (T16)
+# ---------------------------------------------------------------------------
+
+
+def test_count_memory_entries_zero_for_missing_dir(tmp_path):
+    assert count_memory_entries(tmp_path / "absent") == 0
+
+
+def test_count_memory_entries_excludes_MEMORY_md(tmp_path):
+    (tmp_path / "MEMORY.md").write_text("# index\n")
+    assert count_memory_entries(tmp_path) == 0
+
+
+def test_count_memory_entries_counts_md_files_only(tmp_path):
+    (tmp_path / "MEMORY.md").write_text("# index\n")
+    (tmp_path / "a.md").write_text("a\n")
+    (tmp_path / "b.md").write_text("b\n")
+    (tmp_path / "ignored.txt").write_text("nope\n")
+    assert count_memory_entries(tmp_path) == 2
+
+
+# ---------------------------------------------------------------------------
+# G. _drop_memory_file (T16)
+# ---------------------------------------------------------------------------
+
+
+def _seed_for_drop(tmp_path: Path, name: str, body: str = "body") -> None:
+    """Create a per-memory file + ensure MEMORY.md indexes it."""
+    write_memory_with_frontmatter(
+        tmp_path / f"{name}.md",
+        {"name": name, "lifecycle": "evergreen", "citation_count": 0},
+        body,
+    )
+    idx = tmp_path / "MEMORY.md"
+    line = f"- [{name}]({name}.md) — desc\n"
+    if idx.is_file():
+        idx.write_text(idx.read_text() + line)
+    else:
+        idx.write_text(line)
+
+
+def test_drop_memory_file_unlinks_and_rewrites_index(tmp_path):
+    _seed_for_drop(tmp_path, "a")
+    _seed_for_drop(tmp_path, "b")
+    assert _drop_memory_file(tmp_path, "a") is True
+    assert not (tmp_path / "a.md").exists()
+    assert (tmp_path / "b.md").exists()
+    idx_text = (tmp_path / "MEMORY.md").read_text()
+    assert "(a.md)" not in idx_text
+    assert "(b.md)" in idx_text
+
+
+def test_drop_memory_file_silent_noop_on_missing_target(tmp_path):
+    (tmp_path / "MEMORY.md").write_text("(other.md)\n")
+    assert _drop_memory_file(tmp_path, "ghost") is False
+
+
+def test_drop_memory_file_silent_noop_on_missing_dir(tmp_path):
+    assert _drop_memory_file(tmp_path / "nonexistent", "anything") is False
+
+
+# ---------------------------------------------------------------------------
+# H. apply_memory_curate_findings (T16)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_findings_keep_drop_merge_counts_match(tmp_path):
+    _seed_for_drop(tmp_path, "k")
+    _seed_for_drop(tmp_path, "d")
+    _seed_for_drop(tmp_path, "m1")
+    _seed_for_drop(tmp_path, "m2")
+    suggestions = tmp_path / "memory-merge-suggestions.json"
+    findings = [
+        {"memory": "k", "verdict": "keep", "reason": "good"},
+        {"memory": "d", "verdict": "drop", "reason": "stale"},
+        {"memory": "m1", "verdict": "merge_into:m2", "reason": "dupe"},
+    ]
+    counts = apply_memory_curate_findings(
+        memory_dir=tmp_path,
+        findings=findings,
+        suggestions_path=suggestions,
+    )
+    assert counts == {"kept": 1, "dropped": 1, "merge_suggested": 1, "skipped": 0}
+    assert (tmp_path / "k.md").exists()
+    assert not (tmp_path / "d.md").exists()
+    assert (tmp_path / "m1.md").exists()
+    assert (tmp_path / "m2.md").exists()
+    data = json.loads(suggestions.read_text())
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["from"] == "m1"
+    assert data[0]["into"] == "m2"
+    assert data[0]["status"] == "pending"
+
+
+def test_apply_findings_idempotent_on_re_run(tmp_path):
+    _seed_for_drop(tmp_path, "m1")
+    _seed_for_drop(tmp_path, "m2")
+    suggestions = tmp_path / "memory-merge-suggestions.json"
+    findings = [{"memory": "m1", "verdict": "merge_into:m2", "reason": "x"}]
+    counts1 = apply_memory_curate_findings(
+        memory_dir=tmp_path, findings=findings, suggestions_path=suggestions,
+    )
+    counts2 = apply_memory_curate_findings(
+        memory_dir=tmp_path, findings=findings, suggestions_path=suggestions,
+    )
+    assert counts1["merge_suggested"] == 1
+    # Second run: deterministic id hits existing_ids → continue (not counted).
+    data = json.loads(suggestions.read_text())
+    assert len(data) == 1
+
+
+def test_apply_findings_skips_unknown_verdict_string(tmp_path):
+    _seed_for_drop(tmp_path, "x")
+    suggestions = tmp_path / "memory-merge-suggestions.json"
+    counts = apply_memory_curate_findings(
+        memory_dir=tmp_path,
+        findings=[{"memory": "x", "verdict": "Keep", "reason": "case"}],
+        suggestions_path=suggestions,
+    )
+    assert counts == {"kept": 0, "dropped": 0, "merge_suggested": 0, "skipped": 1}
+    assert (tmp_path / "x.md").exists()
+
+
+def test_apply_findings_handles_empty_list(tmp_path):
+    suggestions = tmp_path / "memory-merge-suggestions.json"
+    counts = apply_memory_curate_findings(
+        memory_dir=tmp_path, findings=[], suggestions_path=suggestions,
+    )
+    assert counts == {"kept": 0, "dropped": 0, "merge_suggested": 0, "skipped": 0}
+    assert not suggestions.exists()
+
+
+def test_apply_findings_skips_non_dict_list_elements(tmp_path):
+    """Pin per-element guard at HELPER layer (runner reduces to []
+    before the runner ever invokes the helper, so this branch is
+    not reachable through execute_task)."""
+    suggestions = tmp_path / "memory-merge-suggestions.json"
+    counts = apply_memory_curate_findings(
+        memory_dir=tmp_path,
+        findings=["drop foo", "keep bar"],
+        suggestions_path=suggestions,
+    )
+    assert counts == {"kept": 0, "dropped": 0, "merge_suggested": 0, "skipped": 2}
+
+
+def test_apply_findings_skips_finding_missing_memory_or_verdict_keys(tmp_path):
+    suggestions = tmp_path / "memory-merge-suggestions.json"
+    counts = apply_memory_curate_findings(
+        memory_dir=tmp_path,
+        findings=[{"memory": "foo"}, {"verdict": "keep"}],
+        suggestions_path=suggestions,
+    )
+    assert counts == {"kept": 0, "dropped": 0, "merge_suggested": 0, "skipped": 2}
+
+
+def test_apply_findings_skips_merge_into_with_missing_target(tmp_path):
+    _seed_for_drop(tmp_path, "src")
+    suggestions = tmp_path / "memory-merge-suggestions.json"
+    counts = apply_memory_curate_findings(
+        memory_dir=tmp_path,
+        findings=[{"memory": "src", "verdict": "merge_into:nope", "reason": "x"}],
+        suggestions_path=suggestions,
+    )
+    assert counts["skipped"] == 1
+    assert counts["merge_suggested"] == 0
+    assert not suggestions.exists()
+
+
+def test_apply_findings_drop_silently_noop_on_missing_file(tmp_path):
+    suggestions = tmp_path / "memory-merge-suggestions.json"
+    counts = apply_memory_curate_findings(
+        memory_dir=tmp_path,
+        findings=[{"memory": "ghost", "verdict": "drop", "reason": "x"}],
+        suggestions_path=suggestions,
+    )
+    # missing file → _drop_memory_file returns False → counts as skipped.
+    assert counts["dropped"] == 0
+    assert counts["skipped"] == 1

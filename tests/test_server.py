@@ -1690,3 +1690,228 @@ tasks:
         r = client.get("/api/aggregate/x")
         assert r.status_code == 200
         assert r.json()["rows"][0]["total_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# T16: memory merge-suggestions endpoints + memory file + gate findings
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _isolated_memory_dir(monkeypatch, tmp_path):
+    """Redirect memory_dir_for_cwd to tmp_path/memdir so tests do not
+    touch the operator's real ~/.claude/projects/.../memory directory.
+    Pin §G.0: this only works because server.py imports
+    memory_dir_for_cwd at module scope."""
+    mem = tmp_path / "memdir"
+    monkeypatch.setattr(
+        "claude_plan_execute.server.memory_dir_for_cwd",
+        lambda _cwd: mem,
+    )
+    return mem
+
+
+def test_server_module_exposes_memory_dir_for_cwd_attribute():
+    """Pin §G.0 / §N.20: server.py imports memory_dir_for_cwd,
+    _drop_memory_file, and parse_memory_frontmatter at MODULE
+    SCOPE so test fixtures can monkeypatch them."""
+    import claude_plan_execute.server as s
+    assert hasattr(s, "memory_dir_for_cwd")
+    assert hasattr(s, "_drop_memory_file")
+    assert hasattr(s, "parse_memory_frontmatter")
+
+
+def _seed_suggestions(tmp_path: Path, suggestions: list[dict]) -> Path:
+    plans = tmp_path / "plans"
+    plans.mkdir(exist_ok=True)
+    p = plans / "memory-merge-suggestions.json"
+    p.write_text(_json.dumps(suggestions, indent=2))
+    return p
+
+
+def test_get_merge_suggestions_returns_empty_when_file_absent(
+    tmp_path, client, _isolated_memory_dir,
+):
+    _write_tasks_yaml(tmp_path)
+    r = client.get("/api/memory/merge-suggestions")
+    assert r.status_code == 200
+    assert r.json() == {"suggestions": []}
+
+
+def test_get_merge_suggestions_returns_list_when_file_present(
+    tmp_path, client, _isolated_memory_dir,
+):
+    _write_tasks_yaml(tmp_path)
+    _seed_suggestions(tmp_path, [
+        {"id": "a-b-12345678", "from": "a", "into": "b",
+         "reason": "x", "status": "pending", "ts": "2026-01-01"},
+    ])
+    r = client.get("/api/memory/merge-suggestions")
+    assert r.status_code == 200
+    out = r.json()["suggestions"]
+    assert len(out) == 1
+    assert out[0]["from"] == "a"
+
+
+def test_post_accept_merge_deletes_from_memory_and_marks_accepted(
+    tmp_path, client, _isolated_memory_dir,
+):
+    _write_tasks_yaml(tmp_path)
+    mem = _isolated_memory_dir
+    mem.mkdir(parents=True, exist_ok=True)
+    (mem / "a.md").write_text(
+        "---\nname: a\nlifecycle: evergreen\ncitation_count: 0\n"
+        "---\n\nbody\n", encoding="utf-8",
+    )
+    (mem / "b.md").write_text(
+        "---\nname: b\nlifecycle: evergreen\ncitation_count: 0\n"
+        "---\n\nbody\n", encoding="utf-8",
+    )
+    (mem / "MEMORY.md").write_text(
+        "- [a](a.md) — desc\n- [b](b.md) — desc\n", encoding="utf-8",
+    )
+    sid = "a-b-12345678"
+    _seed_suggestions(tmp_path, [
+        {"id": sid, "from": "a", "into": "b",
+         "reason": "x", "status": "pending", "ts": "2026-01-01"},
+    ])
+    r = client.post(f"/api/memory/merge-suggestions/{sid}/accept")
+    assert r.status_code == 200
+    assert r.json()["status"] == "accepted"
+    assert not (mem / "a.md").exists()
+    assert (mem / "b.md").exists()
+    idx = (mem / "MEMORY.md").read_text()
+    assert "(a.md)" not in idx
+    assert "(b.md)" in idx
+    # Suggestions file updated.
+    data = _json.loads(
+        (tmp_path / "plans" / "memory-merge-suggestions.json").read_text()
+    )
+    assert data[0]["status"] == "accepted"
+
+
+def test_post_decline_merge_marks_declined_does_not_delete(
+    tmp_path, client, _isolated_memory_dir,
+):
+    _write_tasks_yaml(tmp_path)
+    mem = _isolated_memory_dir
+    mem.mkdir(parents=True, exist_ok=True)
+    (mem / "a.md").write_text("---\nname: a\n---\n", encoding="utf-8")
+    sid = "a-b-12345678"
+    _seed_suggestions(tmp_path, [
+        {"id": sid, "from": "a", "into": "b",
+         "reason": "x", "status": "pending", "ts": "2026-01-01"},
+    ])
+    r = client.post(f"/api/memory/merge-suggestions/{sid}/decline")
+    assert r.status_code == 200
+    assert r.json()["status"] == "declined"
+    assert (mem / "a.md").exists()
+
+
+def test_post_invalid_action_400(tmp_path, client, _isolated_memory_dir):
+    _write_tasks_yaml(tmp_path)
+    _seed_suggestions(tmp_path, [
+        {"id": "x-y-12345678", "from": "x", "into": "y",
+         "reason": "", "status": "pending", "ts": ""},
+    ])
+    r = client.post("/api/memory/merge-suggestions/x-y-12345678/explode")
+    assert r.status_code == 400
+
+
+def test_post_invalid_sid_400(tmp_path, client, _isolated_memory_dir):
+    _write_tasks_yaml(tmp_path)
+    r = client.post("/api/memory/merge-suggestions/..%2Fevil/accept")
+    # path-traversal — the regex rejects it; either 400 from the
+    # regex check OR 404 from FastAPI's path matcher.
+    assert r.status_code in (400, 404)
+
+
+def test_post_unknown_sid_404(tmp_path, client, _isolated_memory_dir):
+    _write_tasks_yaml(tmp_path)
+    _seed_suggestions(tmp_path, [
+        {"id": "real-id-12345678", "from": "x", "into": "y",
+         "reason": "", "status": "pending", "ts": ""},
+    ])
+    r = client.post("/api/memory/merge-suggestions/missing-id/accept")
+    assert r.status_code == 404
+
+
+def test_post_accept_already_accepted_409(
+    tmp_path, client, _isolated_memory_dir,
+):
+    _write_tasks_yaml(tmp_path)
+    sid = "x-y-12345678"
+    _seed_suggestions(tmp_path, [
+        {"id": sid, "from": "x", "into": "y",
+         "reason": "", "status": "accepted", "ts": ""},
+    ])
+    r = client.post(f"/api/memory/merge-suggestions/{sid}/accept")
+    assert r.status_code == 409
+
+
+def test_get_memory_file_returns_body_and_frontmatter(
+    tmp_path, client, _isolated_memory_dir,
+):
+    _write_tasks_yaml(tmp_path)
+    mem = _isolated_memory_dir
+    mem.mkdir(parents=True, exist_ok=True)
+    (mem / "foo.md").write_text(
+        "---\nname: foo\ntype: project\n---\n\nbody text\n",
+        encoding="utf-8",
+    )
+    r = client.get("/api/memory/file/foo")
+    assert r.status_code == 200
+    out = r.json()
+    assert "body text" in out["body"]
+    assert out["frontmatter"]["name"] == "foo"
+
+
+def test_get_memory_file_404_on_missing(tmp_path, client, _isolated_memory_dir):
+    _write_tasks_yaml(tmp_path)
+    r = client.get("/api/memory/file/ghost")
+    assert r.status_code == 404
+
+
+def test_get_memory_file_400_on_invalid_name(
+    tmp_path, client, _isolated_memory_dir,
+):
+    _write_tasks_yaml(tmp_path)
+    r = client.get("/api/memory/file/bad..name")
+    assert r.status_code in (400, 404)
+
+
+def test_get_memory_file_500_on_malformed_yaml_frontmatter(
+    tmp_path, client, _isolated_memory_dir,
+):
+    """Pin §G.3 / §N.23: a malformed YAML frontmatter raises
+    yaml.YAMLError; the except tuple includes it so the
+    endpoint returns 500 with structured JSON, not a stack trace."""
+    _write_tasks_yaml(tmp_path)
+    mem = _isolated_memory_dir
+    mem.mkdir(parents=True, exist_ok=True)
+    (mem / "bad.md").write_text(
+        "---\nname: bad\n  bad: indent: here\n---\nbody\n",
+        encoding="utf-8",
+    )
+    r = client.get("/api/memory/file/bad")
+    assert r.status_code == 500
+    assert "error" in r.json()
+
+
+def test_get_gate_findings_returns_sidecar_when_present(tmp_path, client):
+    _write_tasks_yaml(tmp_path)
+    gates_dir = tmp_path / "plans" / "task-1" / "gates"
+    gates_dir.mkdir(parents=True, exist_ok=True)
+    (gates_dir / "memory-curate.json").write_text(
+        _json.dumps({"findings": [{"memory": "x", "verdict": "keep"}]}),
+    )
+    r = client.get("/api/gates/1/memory-curate/findings")
+    assert r.status_code == 200
+    out = r.json()
+    assert out["findings"][0]["memory"] == "x"
+
+
+def test_get_gate_findings_404_when_absent(tmp_path, client):
+    _write_tasks_yaml(tmp_path)
+    r = client.get("/api/gates/1/memory-curate/findings")
+    assert r.status_code == 404

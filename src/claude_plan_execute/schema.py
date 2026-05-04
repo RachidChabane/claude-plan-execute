@@ -131,6 +131,9 @@ class Defaults(BaseModel):
     auto_merge: bool | None = None
     pr_body_template: str | None = None
 
+    # T16 (v0.3) — AI-driven memory pruning trigger.
+    memory_curation_threshold: int | None = None
+
     # Legacy v1 fields (still accepted; deprecation warning fires for v2 files)
     plan_timeout_minutes: int | None = None
     review_timeout_minutes: int | None = None
@@ -176,6 +179,9 @@ class Task(BaseModel):
     max_review_rounds: int | None = None
     services_required_extra: list[str] | None = None
     gates_extra: list[str] | None = None
+
+    # T16 (v0.3) — per-task override of the curation threshold.
+    memory_curation_threshold: int | None = None
 
 
 class TasksFile(BaseModel):

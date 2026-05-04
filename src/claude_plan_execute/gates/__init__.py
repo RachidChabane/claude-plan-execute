@@ -27,6 +27,7 @@ import pathspec
 from pathspec.patterns import GitWildMatchPattern
 
 from claude_plan_execute.colors import dim, red, yellow
+from claude_plan_execute.memory import memory_dir_for_cwd
 
 # ---------------------------------------------------------------------------
 # Dataclasses (defined FIRST per §D11 to avoid sibling-import cycles)
@@ -236,6 +237,7 @@ def _run_one(
     usage_jsonl_path: str | None = None,
     task_dir: "Path | None" = None,
     state: "object | None" = None,
+    memory_dir: str | None = None,
 ) -> GateResult:
     """Execute one gate, returning a GateResult on success OR failure.
 
@@ -269,6 +271,7 @@ def _run_one(
                 name=name, gate=gate, task=task, cli=cli,
                 diff_path=diff_path,
                 usage_jsonl_path=usage_jsonl_path,
+                memory_dir=memory_dir,
             ).run()
         if gate.kind == "human":
             if task_dir is None:
@@ -353,6 +356,14 @@ def run_gates(
     # forwards it to run_claude); shell-gate rows are written by this
     # function in the post-results loop below.
     usage_jsonl_path_str = str(task_dir / "usage.jsonl")
+    # T16: per-task memory dir, threaded into AgentGate so
+    # `memory-curate` template's {memory_dir} placeholder resolves.
+    # Other agent gates (test-critique, security-auditor) reference
+    # nothing in their templates, so the substitution is a no-op
+    # on their bodies. The lookup uses the module-level
+    # `memory_dir_for_cwd` symbol so test fixtures can monkeypatch
+    # `claude_plan_execute.gates.memory_dir_for_cwd` directly.
+    memory_dir_str = str(memory_dir_for_cwd(Path.cwd()))
     kind_by_name: dict[str, str] = {n: g.kind for (n, g) in gates}
 
     # Filter by `when` first; skipped gates produce passive results.
@@ -388,6 +399,7 @@ def run_gates(
             usage_jsonl_path=usage_jsonl_path_str,
             task_dir=task_dir,
             state=state,
+            memory_dir=memory_dir_str,
         ))
 
     # Then parallel.
@@ -397,7 +409,9 @@ def run_gates(
             futures = {
                 ex.submit(
                     _run_one, n, g, task, cli,
-                    diff_path_str, usage_jsonl_path_str,
+                    diff_path=diff_path_str,
+                    usage_jsonl_path=usage_jsonl_path_str,
+                    memory_dir=memory_dir_str,
                 ): n
                 for (n, g) in parallel
             }

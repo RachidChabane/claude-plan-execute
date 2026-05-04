@@ -408,8 +408,15 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "auto_pr",
         "auto_merge",
         "pr_body_template",
+        # T16 (v0.3) — memory-curate threshold.
+        "memory_curation_threshold",
     )
     assert KEYS_TO_AUDIT == expected
+
+
+def test_memory_curation_threshold_is_a_hardcoded_default():
+    assert HARDCODED_DEFAULTS["memory_curation_threshold"] == 30
+    assert resolve("memory_curation_threshold", {}, {}, {}) == 30
 
 
 def test_max_rate_limit_retries_is_a_hardcoded_default():

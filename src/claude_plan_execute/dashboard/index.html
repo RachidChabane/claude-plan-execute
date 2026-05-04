@@ -1039,6 +1039,58 @@ body::before {
   font-family: var(--font-mono); padding: 6px 0;
 }
 
+/* ── Memory merge-suggestions panel (T16) ── */
+.memory-panel {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 14px 18px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+}
+.memory-panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px;
+  color: var(--text-tertiary);
+}
+.merge-suggestion {
+  background: var(--bg-deep);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.merge-header {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono); font-size: 12px;
+  margin-bottom: 6px;
+}
+.merge-from { color: var(--accent-red); }
+.merge-into { color: var(--accent-blue); }
+.merge-arrow { color: var(--text-tertiary); }
+.merge-reason {
+  font-size: 11px; color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+.merge-bodies {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  margin-top: 6px;
+}
+.merge-body {
+  background: var(--bg-base);
+  padding: 8px; border-radius: 3px;
+  font-family: var(--font-mono); font-size: 10px;
+  max-height: 200px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+}
+.merge-counts-pill {
+  display: inline-block;
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--text-secondary);
+  padding: 2px 6px;
+  background: var(--bg-deep); border-radius: 3px;
+  margin: 4px 0;
+}
+
 /* ── Tab bar ── */
 .task-tabs {
   display: flex;
@@ -1451,6 +1503,18 @@ body::before {
         <span class="agg-card-meta" id="aggregationsCount">0</span>
       </div>
       <div id="aggregationsList"></div>
+    </div>
+
+    <!-- T16: memory merge-suggestions panel. Hidden when no
+         pending suggestions exist. Refreshed on init and after
+         accept/decline. -->
+    <div class="memory-panel fade-in" id="memoryPanel"
+         style="display:none">
+      <div class="memory-panel-header">
+        <span>Memory merge suggestions</span>
+        <span class="agg-card-meta" id="memorySuggestionsCount">0</span>
+      </div>
+      <div id="mergeSuggestionsList"></div>
     </div>
 
     <!-- Running banner -->
@@ -1909,7 +1973,25 @@ async function loadGateOutput(taskId, gateName, outputEl) {
     outputEl.innerHTML = '<pre><em>Could not load output.</em></pre>';
     return;
   }
-  outputEl.innerHTML = `<pre>${esc(data.content)}</pre>`;
+  // T16: surface keep/drop/merge tally for memory-curate.
+  let pill = '';
+  if (gateName === 'memory-curate') {
+    const findings = await api(
+      `/api/gates/${encodeURIComponent(taskId)}/${encodeURIComponent(gateName)}/findings`,
+    );
+    if (findings && Array.isArray(findings.findings)) {
+      let kept = 0, dropped = 0, merges = 0;
+      for (const f of findings.findings) {
+        if (f.verdict === 'keep') kept++;
+        else if (f.verdict === 'drop') dropped++;
+        else if (typeof f.verdict === 'string' && f.verdict.startsWith('merge_into:')) merges++;
+      }
+      pill = `<div class="merge-counts-pill">
+        ${kept} kept · ${dropped} dropped · ${merges} merge proposal(s)
+      </div>`;
+    }
+  }
+  outputEl.innerHTML = `${pill}<pre>${esc(data.content)}</pre>`;
   outputEl.dataset.loaded = '1';
 }
 
@@ -2240,6 +2322,95 @@ function renderSparkline(points) {
   </svg>`;
 }
 
+// ── Memory merge suggestions (T16) ──
+
+async function fetchMergeSuggestions() {
+  const data = await api('/api/memory/merge-suggestions');
+  const panel = document.getElementById('memoryPanel');
+  const listEl = document.getElementById('mergeSuggestionsList');
+  const count = document.getElementById('memorySuggestionsCount');
+  if (!data || !Array.isArray(data.suggestions)) {
+    panel.style.display = 'none';
+    return;
+  }
+  const pending = data.suggestions.filter(s => s.status === 'pending');
+  if (pending.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+  count.textContent = String(pending.length);
+  listEl.innerHTML = pending.map(s => renderSuggestion(s)).join('');
+  pending.forEach(s => loadSuggestionBodies(s));
+}
+
+function renderSuggestion(s) {
+  return `
+    <div class="merge-suggestion" data-sid="${esc(s.id)}">
+      <div class="merge-header">
+        <span class="merge-from">${esc(s.from)}</span>
+        <span class="merge-arrow">&rarr;</span>
+        <span class="merge-into">${esc(s.into)}</span>
+        <button class="btn btn-sm btn-primary"
+                onclick="acceptMerge('${esc(s.id)}')">Accept</button>
+        <button class="btn btn-sm"
+                onclick="declineMerge('${esc(s.id)}')">Decline</button>
+      </div>
+      <div class="merge-reason">${esc(s.reason || '')}</div>
+      <div class="merge-bodies">
+        <div class="merge-body" id="body-${esc(s.id)}-from">
+          <em>Loading…</em>
+        </div>
+        <div class="merge-body" id="body-${esc(s.id)}-into">
+          <em>Loading…</em>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function loadSuggestionBodies(s) {
+  const fromEl = document.getElementById(`body-${s.id}-from`);
+  const intoEl = document.getElementById(`body-${s.id}-into`);
+  const [fromData, intoData] = await Promise.all([
+    api(`/api/memory/file/${encodeURIComponent(s.from)}`),
+    api(`/api/memory/file/${encodeURIComponent(s.into)}`),
+  ]);
+  if (fromEl) {
+    fromEl.textContent = (fromData && fromData.body)
+      ? fromData.body : '(missing)';
+  }
+  if (intoEl) {
+    intoEl.textContent = (intoData && intoData.body)
+      ? intoData.body : '(missing)';
+  }
+}
+
+async function acceptMerge(sid) {
+  const r = await api(
+    `/api/memory/merge-suggestions/${encodeURIComponent(sid)}/accept`,
+    { method: 'POST' },
+  );
+  if (r && r.ok) {
+    addLog('success', `Accepted merge ${sid}`);
+    fetchMergeSuggestions();
+  } else {
+    addLog('error', `Failed to accept ${sid}`);
+  }
+}
+
+async function declineMerge(sid) {
+  const r = await api(
+    `/api/memory/merge-suggestions/${encodeURIComponent(sid)}/decline`,
+    { method: 'POST' },
+  );
+  if (r && r.ok) {
+    addLog('info', `Declined merge ${sid}`);
+    fetchMergeSuggestions();
+  } else {
+    addLog('error', `Failed to decline ${sid}`);
+  }
+}
+
 // ── Init ──
 
 async function init() {
@@ -2247,6 +2418,7 @@ async function init() {
   await fetchState();
   await fetchServices();
   await fetchAggregations();
+  await fetchMergeSuggestions();
   connectWS();
 
   // Poll state every 2s as fallback

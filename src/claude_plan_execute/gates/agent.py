@@ -143,6 +143,7 @@ class AgentGate:
     cli: dict
     diff_path: str | None = None
     usage_jsonl_path: str | None = None
+    memory_dir: str | None = None
 
     def run(self) -> GateResult:
         if self.gate.kind != "agent":
@@ -156,6 +157,7 @@ class AgentGate:
 
         body = _load_template(self.gate.prompt_template)
         body = body.replace("{diff_path}", self.diff_path or "")
+        body = body.replace("{memory_dir}", self.memory_dir or "")
         prompt = (
             f"You are running a post-implement gate for the "
             f"following task.\n\n"

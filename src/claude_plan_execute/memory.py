@@ -19,10 +19,12 @@ must NOT import from `runner` or `state`.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -299,3 +301,189 @@ def _atomic_write_text(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def count_memory_entries(memory_dir: Path) -> int:
+    """Count per-memory files in `memory_dir`, excluding MEMORY.md.
+
+    A "memory entry" is a `*.md` file whose name is not literally
+    `MEMORY.md`. Symbolic links are followed (they're memory
+    files too); non-`.md` files are ignored.
+
+    Returns 0 when `memory_dir` is missing — typical first run on
+    a fresh project. No I/O beyond the directory listing; no
+    frontmatter parsing.
+    """
+    if not memory_dir.is_dir():
+        return 0
+    return sum(
+        1 for p in memory_dir.glob("*.md")
+        if p.name != "MEMORY.md"
+    )
+
+
+def _drop_memory_file(memory_dir: Path, name: str) -> bool:
+    """Delete `<memory_dir>/<name>.md` and remove its line from
+    MEMORY.md. Returns True if the file was unlinked, False if
+    it was already missing or the directory was missing.
+
+    Mirrors the line-removal machinery in `prune_expired_memories`
+    (memory.py:267-273). The duplication is shallow (~10 lines)
+    and deliberately not factored into a shared helper.
+
+    Defensive: a missing target file is a silent no-op (the
+    lifecycle prune may have deleted it earlier the same task,
+    or the agent may have referenced a name that never existed).
+    File-permission errors warn and return False.
+    """
+    if not memory_dir.is_dir():
+        return False
+    path = memory_dir / f"{name}.md"
+    with _memory_lock:
+        if not path.is_file():
+            return False
+        try:
+            path.unlink()
+        except OSError as exc:
+            print(yellow(
+                f"  [memory] failed to unlink {path.name}: {exc}"
+            ))
+            return False
+        index_path = memory_dir / "MEMORY.md"
+        if index_path.is_file():
+            try:
+                index_text = index_path.read_text(encoding="utf-8")
+                needle = f"({name}.md)"
+                new_text = "".join(
+                    line for line in index_text.splitlines(keepends=True)
+                    if needle not in line
+                )
+                if new_text != index_text:
+                    _atomic_write_text(index_path, new_text)
+            except OSError as exc:
+                print(yellow(
+                    f"  [memory] failed to rewrite MEMORY.md "
+                    f"after dropping {name}: {exc}"
+                ))
+    return True
+
+
+_MERGE_INTO_RE = re.compile(r"^merge_into:([A-Za-z0-9_\-]+)$")
+
+
+def _suggestion_id(from_name: str, into_name: str) -> str:
+    """Deterministic id: `<from>-<into>-<sha1[:8]>`. Stable across
+    re-runs so re-applying the same agent output is idempotent."""
+    import hashlib
+    h = hashlib.sha1(
+        f"{from_name}->{into_name}".encode("utf-8")
+    ).hexdigest()[:8]
+    return f"{from_name}-{into_name}-{h}"
+
+
+def apply_memory_curate_findings(
+    *,
+    memory_dir: Path,
+    findings: list[dict],
+    suggestions_path: Path,
+) -> dict[str, int]:
+    """Apply the runner-actionable verdicts from a memory-curate
+    findings list and accumulate merge suggestions.
+
+    For each finding dict (the agent's per-memory verdict):
+      - `verdict == "keep"` -> no action.
+      - `verdict == "drop"` -> call `_drop_memory_file(memory_dir,
+        name)`. A missing target file is a silent no-op.
+      - `verdict matches "merge_into:<other>"` -> append a record
+        to the suggestions JSON file (`suggestions_path`). The
+        suggestion is appended only when BOTH the source and
+        target memories exist on disk; a missing-target skips
+        with a yellow warning.
+      - any other shape -> silently skipped (fail-soft, mirrors
+        T11's malformed-appendix handling).
+
+    `suggestions_path` parent dir is created if missing. Atomic
+    write via `_atomic_write_text`. Each suggestion gets a
+    deterministic id (`<from>-<into>-<sha1[:8]>`) so a re-run with
+    the same agent output produces the same id (no duplicates).
+
+    Returns `{"kept": N, "dropped": N, "merge_suggested": N,
+    "skipped": N}`.
+    """
+    counts = {"kept": 0, "dropped": 0,
+              "merge_suggested": 0, "skipped": 0}
+    if not isinstance(findings, list):
+        return counts
+
+    existing: list[dict] = []
+    if suggestions_path.is_file():
+        try:
+            existing = json.loads(
+                suggestions_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(existing, list):
+                existing = []
+        except (OSError, json.JSONDecodeError):
+            existing = []
+    existing_ids = {s.get("id") for s in existing if isinstance(s, dict)}
+
+    new_suggestions: list[dict] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            counts["skipped"] += 1
+            continue
+        name = finding.get("memory")
+        verdict = finding.get("verdict")
+        reason = finding.get("reason", "") or ""
+        if not isinstance(name, str) or not isinstance(verdict, str):
+            counts["skipped"] += 1
+            continue
+
+        if verdict == "keep":
+            counts["kept"] += 1
+            continue
+        if verdict == "drop":
+            if _drop_memory_file(memory_dir, name):
+                counts["dropped"] += 1
+            else:
+                counts["skipped"] += 1
+            continue
+        m = _MERGE_INTO_RE.match(verdict)
+        if m:
+            target = m.group(1)
+            src_path = memory_dir / f"{name}.md"
+            tgt_path = memory_dir / f"{target}.md"
+            if not src_path.is_file():
+                counts["skipped"] += 1
+                continue
+            if not tgt_path.is_file():
+                print(yellow(
+                    f"  [memory] merge_into:{target} for {name} "
+                    f"skipped — target file does not exist"
+                ))
+                counts["skipped"] += 1
+                continue
+            sid = _suggestion_id(name, target)
+            if sid in existing_ids:
+                continue
+            new_suggestions.append({
+                "id": sid,
+                "from": name,
+                "into": target,
+                "reason": reason,
+                "status": "pending",
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+            counts["merge_suggested"] += 1
+            continue
+        counts["skipped"] += 1
+
+    if new_suggestions:
+        with _memory_lock:
+            merged = existing + new_suggestions
+            suggestions_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(
+                suggestions_path,
+                json.dumps(merged, indent=2) + "\n",
+            )
+    return counts

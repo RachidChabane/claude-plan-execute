@@ -1352,3 +1352,21 @@ def test_phase_loose_dict_can_override_branch_per_task():
         phase=phase_defaults,
     )
     assert val is False
+
+
+# --- M. memory_curation_threshold field (T16) ------------------------------
+
+def test_defaults_accepts_memory_curation_threshold_int():
+    d = Defaults(memory_curation_threshold=50)
+    assert d.memory_curation_threshold == 50
+
+
+def test_defaults_rejects_memory_curation_threshold_str():
+    with pytest.raises(ValidationError):
+        Defaults(memory_curation_threshold="thirty")
+
+
+def test_task_accepts_memory_curation_threshold_override():
+    t = Task(id=1, title="T", description="D",
+             memory_curation_threshold=25)
+    assert t.memory_curation_threshold == 25

@@ -33,6 +33,8 @@ HARDCODED_DEFAULTS: dict = {
     "task_branch_template": "task/{id}-{slug}",
     "auto_pr": False,
     "auto_merge": False,
+    # T16 (v0.3) — threshold for memory-curate gate auto-trigger.
+    "memory_curation_threshold": 30,
 }
 
 
@@ -72,6 +74,8 @@ KEYS_TO_AUDIT: tuple[str, ...] = (
     "auto_pr",
     "auto_merge",
     "pr_body_template",
+    # T16 (v0.3).
+    "memory_curation_threshold",
 )
 
 

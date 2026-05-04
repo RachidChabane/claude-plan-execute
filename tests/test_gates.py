@@ -42,6 +42,18 @@ def test_gates_package_imports_cleanly():
     assert hasattr(g, "AgentGate")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gates_memory_dir(monkeypatch, tmp_path):
+    """T16 §J.1: keep gates tests from touching the operator's
+    real ~/.claude/projects/... memory directory when an
+    agent gate substitutes {memory_dir}."""
+    isolated = tmp_path / "_iso_memdir"
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.memory_dir_for_cwd",
+        lambda _cwd=None: isolated,
+    )
+
+
 # ---------------------------------------------------------------------------
 # A. Gate / GateResult dataclasses
 # ---------------------------------------------------------------------------
@@ -728,6 +740,69 @@ def test_agent_gate_diff_path_default_is_None():
         cli={},
     )
     assert ag.diff_path is None
+
+
+def test_agent_gate_substitutes_memory_dir_placeholder(monkeypatch):
+    """Pin T16 §D.2: `{memory_dir}` placeholder is replaced with
+    the AgentGate.memory_dir value at run() time."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent",
+             prompt_template="memory dir: {memory_dir}\nend")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={}, memory_dir="/some/path",
+    ).run()
+    assert "memory dir: /some/path" in captured["prompt"]
+    assert "{memory_dir}" not in captured["prompt"]
+
+
+def test_agent_gate_memory_dir_None_substitutes_empty(monkeypatch):
+    """Pin T16 §D.2: `memory_dir=None` (default) replaces the
+    placeholder with the empty string."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent", prompt_template="dir={memory_dir}|end")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},  # memory_dir defaults to None
+    ).run()
+    assert "dir=|end" in captured["prompt"]
+    assert "{memory_dir}" not in captured["prompt"]
+
+
+def test_agent_gate_memory_dir_default_is_None():
+    g = Gate(kind="agent", prompt_template="x")
+    ag = AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},
+    )
+    assert ag.memory_dir is None
+
+
+def test_gates_module_exposes_memory_dir_for_cwd_attribute():
+    """Pin T16 §D.3 Step 1: the `memory_dir_for_cwd` import lives at
+    MODULE SCOPE in gates/__init__.py, NOT inside `run_gates`. This
+    is what makes `claude_plan_execute.gates.memory_dir_for_cwd` a
+    monkeypatch target. A future "tidy up imports" refactor that
+    re-localizes the import would silently break test isolation;
+    this assertion fails loudly. (Pin §N.17.)"""
+    import claude_plan_execute.gates as g
+    assert hasattr(g, "memory_dir_for_cwd")
+
+
+def test_extract_findings_memory_curate_shape_is_a_bare_list_of_dicts():
+    """Pin T16 §I.2: the memory-curate appendix is a bare list of
+    dicts (T11 case 3). The runner reads `r.findings` directly."""
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"memory":"x","verdict":"keep","reason":"y"}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    findings, sidecar = _extract_findings(text, "memory-curate", warn=False)
+    assert findings == [{"memory": "x", "verdict": "keep", "reason": "y"}]
+    assert sidecar == {"findings": findings}
 
 
 # ---------------------------------------------------------------------------
@@ -1891,11 +1966,8 @@ def test_test_critique_template_example_is_valid_findings_appendix():
 # This pin catches that.
 
 def test_run_one_signature_field_order_after_t10():
-    """T10 §D12 — `_run_one` signature is exactly:
-    name, gate, task, cli, diff_path, usage_jsonl_path, task_dir, state.
-    All four optional params are POSITIONAL_OR_KEYWORD (NOT
-    KEYWORD_ONLY) so the parallel pool's positional submit() works.
-    """
+    """T10 §D12 — `_run_one` signature includes memory_dir at the
+    end (T16 §D.4). All optional params are POSITIONAL_OR_KEYWORD."""
     import inspect
 
     from claude_plan_execute.gates import _run_one
@@ -1907,6 +1979,7 @@ def test_run_one_signature_field_order_after_t10():
         "name", "gate", "task", "cli",
         "diff_path", "usage_jsonl_path",
         "task_dir", "state",
+        "memory_dir",
     ]
     for p in params:
         assert p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD, (

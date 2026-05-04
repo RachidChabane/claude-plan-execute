@@ -13,6 +13,7 @@ from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
 from claude_plan_execute.memory import (
+    count_memory_entries,
     increment_citations_for_plan,
     memory_dir_for_cwd,
     prune_expired_memories,
@@ -72,7 +73,7 @@ _BUILTIN_FACTORY_NAMES: frozenset[str] = frozenset({
     "tests", "lint", "untranslated-strings", "design-fidelity",
 })
 _BUILTIN_REGISTRY_NAMES: frozenset[str] = frozenset({
-    "test-critique", "security-auditor",
+    "test-critique", "security-auditor", "memory-curate",
 })
 
 
@@ -233,6 +234,19 @@ def execute_task(
     }
     resolved_config_path.write_text(
         json.dumps(audit_payload, indent=2, sort_keys=False) + "\n"
+    )
+    # T16: hoisted bindings consumed by both Phase 4 (§E.4 post-
+    # process) and the success-path trailer (§E.2 threshold check).
+    # `memory_dir_for_cwd` is pure (no I/O; the directory may not
+    # exist yet — `count_memory_entries` returns 0 for a missing
+    # dir). The `or 30` defends against a project_defaults file
+    # with `memory_curation_threshold: null` that survives
+    # pydantic's `int | None = None` validation. Symmetric with
+    # the existing `resolved` (line 201) and `plans_dir` (line
+    # 208) hoists.
+    memory_dir = memory_dir_for_cwd(Path.cwd())
+    threshold = int(
+        resolved["memory_curation_threshold"]["value"] or 30
     )
     # Track the path on the per-task state entry so the dashboard can find it.
     entry = state.get(tid)
@@ -721,6 +735,20 @@ def execute_task(
         gate_names_phase = list(phase_dict.get("gates_extra") or [])
         gate_names_task = list(task.get("gates_extra") or [])
         gate_names = gate_names_project + gate_names_phase + gate_names_task
+        # T16: pending curate flag → append the gate name to
+        # the resolved list. `gate_names` is the only var
+        # consumed by `_resolve_gate_specs`. The `not in
+        # gate_names` guard prevents a duplicate when an operator
+        # has hard-wired `memory-curate` into `defaults.gates`
+        # or a phase's `gates_extra` AND has the threshold flag
+        # set: without the dedupe, GateRegistry.resolve would
+        # preserve the duplicate and the serial pool would run
+        # the agent twice per task (Sonnet/medium budget waste).
+        if (
+            state.data.get("pending_memory_curate")
+            and "memory-curate" not in gate_names
+        ):
+            gate_names.append("memory-curate")
         if gate_names:
             from claude_plan_execute.gates.invariants import loaded_invariant_names
             invariant_names = loaded_invariant_names()
@@ -766,6 +794,51 @@ def execute_task(
                     cli=cli,
                     state=state,
                 )
+                # T16: post-process memory-curate findings, if
+                # the gate ran. The gate is on_failure=warn, so
+                # a failure here will NOT enter the `blocking`
+                # list below. We apply verdicts even when the
+                # gate's text VERDICT was FAIL — the findings are
+                # the source of truth, and the runner is fail-
+                # soft on a missing/malformed appendix.
+                curate_result = next(
+                    (r for r in gate_results
+                     if r.name == "memory-curate"),
+                    None,
+                )
+                if curate_result is not None:
+                    from claude_plan_execute.memory import (
+                        apply_memory_curate_findings,
+                    )
+                    suggestions_path = (
+                        plans_dir / "memory-merge-suggestions.json"
+                    )
+                    counts = apply_memory_curate_findings(
+                        memory_dir=memory_dir,
+                        findings=curate_result.findings or [],
+                        suggestions_path=suggestions_path,
+                    )
+                    print(dim(
+                        f"  [memory] curate: "
+                        f"{counts['kept']} kept, "
+                        f"{counts['dropped']} dropped, "
+                        f"{counts['merge_suggested']} merge "
+                        f"suggestion(s)."
+                    ))
+                    # Clear FIRST (so a count_memory_entries
+                    # raise leaves the flag in the safest
+                    # possible state — cleared, with E.2's
+                    # trailer re-arming on the next task from a
+                    # fresh count), then re-arm only if the
+                    # post-prune count is still over threshold.
+                    state.data["pending_memory_curate"] = False
+                    try:
+                        post_count = count_memory_entries(memory_dir)
+                    except OSError:
+                        post_count = 0
+                    if post_count > threshold:
+                        state.data["pending_memory_curate"] = True
+                    state.save()
                 blocking = [
                     r for r in gate_results
                     if not r.passed and r.on_failure == "block"
@@ -924,7 +997,8 @@ def execute_task(
         # ----- T15: cross-task memory passes -------------------------
         # `memory_dir_for_cwd` is pure (does not require dir to exist);
         # both helpers below short-circuit when the dir is missing.
-        memory_dir = memory_dir_for_cwd(Path.cwd())
+        # `memory_dir` is the T16-hoisted binding bound earlier (after
+        # the audit-payload write), reused here unchanged.
 
         # Citation pass — uses `prior_status` snapshotted at line 231
         # (BEFORE Phase 3 mutated status to "implementing"). Re-running
@@ -985,6 +1059,31 @@ def execute_task(
             print(yellow(
                 f"  [memory] lifecycle prune skipped: {exc}"
             ))
+
+        # T16: threshold detection. After T15's lifecycle prune,
+        # count surviving per-memory files and arm the curate-gate
+        # flag on state if over threshold. Single-shot: cleared
+        # after the gate runs in the next task. The flag is sticky
+        # across re-runs of an already-done task — that's fine,
+        # the flag is idempotent (running the gate clears it
+        # regardless). `memory_dir` and `threshold` are HOISTED
+        # bindings; `count_memory_entries` is module-level imported.
+        try:
+            current_count = count_memory_entries(memory_dir)
+        except OSError as exc:
+            print(yellow(
+                f"  [memory] curate-threshold check skipped: {exc}"
+            ))
+            current_count = 0
+        if current_count > threshold:
+            if not state.data.get("pending_memory_curate"):
+                state.data["pending_memory_curate"] = True
+                state.save()
+                print(dim(
+                    f"  [memory] curate threshold crossed "
+                    f"({current_count} > {threshold}); "
+                    f"memory-curate will run on the next task."
+                ))
         return
     finally:
         # v0.3 task 8 (Plan §D4.6): defensive teardown for every
