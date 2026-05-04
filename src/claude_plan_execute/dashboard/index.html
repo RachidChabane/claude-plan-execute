@@ -963,6 +963,80 @@ body::before {
 }
 .service-log-pane.open { display: block; }
 
+/* ── Aggregations panel (T12) ── */
+.aggregations-panel {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 14px 18px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+}
+.aggregations-panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px;
+  color: var(--text-tertiary);
+}
+
+.agg-card {
+  background: var(--bg-deep);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.agg-card-header {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 6px;
+}
+.agg-card-title {
+  font-family: var(--font-mono); font-size: 12px;
+  color: var(--text-primary);
+}
+.agg-card-meta {
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--text-tertiary);
+}
+.agg-sparkline {
+  display: block; width: 100%; height: 28px;
+  margin: 6px 0 10px;
+}
+.agg-bar-list { display: flex; flex-direction: column; gap: 4px; }
+.agg-bar-row {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono); font-size: 11px;
+}
+.agg-bar-label {
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-secondary);
+}
+.agg-bar-track {
+  flex: 2; height: 6px;
+  background: var(--bg-base); border-radius: 3px;
+  overflow: hidden;
+}
+.agg-bar-fill {
+  height: 100%; background: var(--accent-blue);
+  border-radius: 3px;
+}
+.agg-bar-count {
+  font-size: 10px; color: var(--text-tertiary);
+  min-width: 24px; text-align: right;
+}
+.agg-empty {
+  font-size: 11px; font-family: var(--font-mono);
+  color: var(--text-tertiary); padding: 6px 0;
+  font-style: italic;
+}
+.agg-truncated {
+  font-size: 10px; font-family: var(--font-mono);
+  color: var(--text-tertiary); padding: 6px 0 0;
+}
+.agg-error {
+  font-size: 11px; color: var(--accent-red);
+  font-family: var(--font-mono); padding: 6px 0;
+}
+
 /* ── Tab bar ── */
 .task-tabs {
   display: flex;
@@ -1349,6 +1423,18 @@ body::before {
         <span class="service-meta" id="servicesCount">0</span>
       </div>
       <div id="servicesList"></div>
+    </div>
+
+    <!-- T12: Aggregations panel. Hidden when aggregations.yaml is
+         absent or empty. Per-card data is fetched on init and
+         re-fetched when a task transitions to 'done'. -->
+    <div class="aggregations-panel fade-in" id="aggregationsPanel"
+         style="display:none">
+      <div class="aggregations-panel-header">
+        <span>Aggregations</span>
+        <span class="agg-card-meta" id="aggregationsCount">0</span>
+      </div>
+      <div id="aggregationsList"></div>
     </div>
 
     <!-- Running banner -->
@@ -1894,7 +1980,16 @@ function connectWS() {
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'log') addLog(msg.level || 'info', msg.message);
-        if (msg.type === 'state') { state = msg.data; updateUI(); }
+        if (msg.type === 'state') {
+          state = msg.data; updateUI();
+          // T12: re-fetch aggregations when a new task completes.
+          const doneCount = Object.values(state.tasks || {})
+            .filter(t => t.status === 'done').length;
+          if (doneCount !== lastDoneCount) {
+            lastDoneCount = doneCount;
+            fetchAggregations();
+          }
+        }
       } catch {
         addLog('dim', e.data);
       }
@@ -1959,18 +2054,124 @@ async function restartService(name) {
   await fetchServices();
 }
 
+// ── T12: Aggregations panel ──
+
+const AGG_TOP_N = 10;
+let lastDoneCount = 0;
+
+async function fetchAggregations() {
+  const list = await api('/api/aggregations');
+  if (!list || !Array.isArray(list.aggregations)) return;
+  const panel = document.getElementById('aggregationsPanel');
+  const listEl = document.getElementById('aggregationsList');
+  const count = document.getElementById('aggregationsCount');
+  if (list.aggregations.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+  count.textContent = String(list.aggregations.length);
+
+  // Render placeholder cards immediately, then populate each.
+  listEl.innerHTML = list.aggregations.map(a => `
+    <div class="agg-card" id="agg-card-${esc(a.name)}">
+      <div class="agg-card-header">
+        <span class="agg-card-title">${esc(a.name)}</span>
+        <span class="agg-card-meta">${esc(a.gate)} · ${esc(a.mode)}</span>
+      </div>
+      <div class="agg-card-body"><em>Loading…</em></div>
+    </div>
+  `).join('');
+
+  await Promise.all(list.aggregations.map(a => fetchOneAggregation(a.name)));
+}
+
+async function fetchOneAggregation(name) {
+  const card = document.getElementById(`agg-card-${name}`);
+  if (!card) return;
+  const body = card.querySelector('.agg-card-body');
+  const data = await api(`/api/aggregate/${encodeURIComponent(name)}`);
+  if (!data || data.error) {
+    body.innerHTML = `<div class="agg-error">${esc(data?.error || 'Could not load')}</div>`;
+    return;
+  }
+  body.innerHTML = renderAggregationBody(data);
+}
+
+function renderAggregationBody(data) {
+  const rows = data.rows || [];
+  if (rows.length === 0) {
+    return '<div class="agg-empty">No findings yet.</div>';
+  }
+  const sparkline = renderSparkline(buildSparklineData(rows));
+  const top = rows.slice(0, AGG_TOP_N);
+  const max = top[0].total_count || 1;
+  const bars = top.map(r => {
+    const pct = Math.max(2, Math.round(100 * r.total_count / max));
+    const tip = Object.entries(r.per_task)
+      .map(([tid, n]) => `task ${tid}: ${n}`).join(' · ');
+    return `
+      <div class="agg-bar-row" data-tooltip="${esc(tip)}">
+        <span class="agg-bar-label">${esc(r.finding)}</span>
+        <span class="agg-bar-track">
+          <span class="agg-bar-fill" style="width:${pct}%"></span>
+        </span>
+        <span class="agg-bar-count">${r.total_count}</span>
+      </div>`;
+  }).join('');
+  const more = rows.length > AGG_TOP_N
+    ? `<div class="agg-truncated">+ ${rows.length - AGG_TOP_N} more</div>`
+    : '';
+  return `${sparkline}<div class="agg-bar-list">${bars}</div>${more}`;
+}
+
+function buildSparklineData(rows) {
+  const totals = {};
+  for (const row of rows) {
+    for (const [tid, n] of Object.entries(row.per_task)) {
+      totals[tid] = (totals[tid] || 0) + n;
+    }
+  }
+  const tids = Object.keys(totals).sort((a, b) => {
+    const aNum = /^\d+$/.test(a), bNum = /^\d+$/.test(b);
+    if (aNum && bNum) return parseInt(a) - parseInt(b);
+    if (aNum !== bNum) return aNum ? -1 : 1;
+    return a.localeCompare(b);
+  });
+  return tids.map(t => ({ tid: t, count: totals[t] }));
+}
+
+function renderSparkline(points) {
+  if (points.length < 2) return '';
+  const w = 280, h = 28, pad = 2;
+  const max = Math.max(1, ...points.map(p => p.count));
+  const xs = (i) => pad + i * (w - 2 * pad) / (points.length - 1);
+  const ys = (n) => h - pad - n * (h - 2 * pad) / max;
+  const path = points
+    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${xs(i).toFixed(1)} ${ys(p.count).toFixed(1)}`)
+    .join(' ');
+  return `<svg viewBox="0 0 ${w} ${h}"
+              preserveAspectRatio="none" class="agg-sparkline">
+    <path d="${path}" fill="none"
+          stroke="var(--accent-blue)" stroke-width="1.4"/>
+  </svg>`;
+}
+
 // ── Init ──
 
 async function init() {
   await fetchTasks();
   await fetchState();
   await fetchServices();
+  await fetchAggregations();
   connectWS();
 
   // Poll state every 2s as fallback
   setInterval(() => {
     fetchState();
     fetchServices();
+    // T12: aggregations are NOT polled — they refresh on
+    // 'state' events whose done-count changed.
   }, 2000);
 }
 

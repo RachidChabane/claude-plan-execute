@@ -33,6 +33,13 @@ except ImportError:
           file=sys.stderr)
     sys.exit(1)
 
+from claude_plan_execute.aggregations import (
+    AggregationConfigError,
+    AggregationRuntimeError,
+    compute_aggregation,
+    find_aggregations_file,
+    load_aggregations,
+)
 from claude_plan_execute.loader import find_tasks_file, load_tasks_data
 from claude_plan_execute.state import State
 
@@ -47,6 +54,11 @@ DASHBOARD_PATH = PACKAGE_DIR / "dashboard" / "index.html"
 # slug-like string ids (letters/digits/dash/underscore). Blocks `..`, `/`,
 # `.`, spaces, and anything else that could escape the plans_dir tree.
 _SAFE_TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+# T12: aggregation names use the same charset as task IDs and gate
+# names. Aliased rather than re-declared so the relationship is
+# documented in one place.
+_SAFE_AGGREGATION_NAME_RE = _SAFE_TASK_ID_RE
 
 
 def _resolve_cpe_script() -> str | None:
@@ -260,6 +272,83 @@ async def get_gate_output(task_id: str, gate_name: str):
         return JSONResponse({"content": gate_path.read_text(encoding="utf-8")})
     except OSError as exc:
         return JSONResponse({"error": f"Could not read file: {exc}"}, status_code=500)
+
+
+# v0.3 task 12 (Plan §2.14): cross-task aggregation panel.
+# Read-only post-hoc; walks {plans_dir}/task-*/gates/ on each request.
+# aggregations.yaml lives at the work_dir root or under docs/, mirroring
+# tasks.yaml discovery.
+
+def _aggregations_plans_dir() -> Path:
+    """Resolve the active plans_dir (tasks.yaml override OR 'plans')."""
+    defaults = load_tasks().get("defaults", {})
+    plans_dir_name = defaults.get("plans_dir", "plans")
+    return work_dir / plans_dir_name
+
+
+@app.get("/api/aggregations")
+async def list_aggregations():
+    """List configured aggregations.
+
+    Returns 200 with `{"aggregations": []}` when aggregations.yaml is
+    absent (NOT 404 — the dashboard distinguishes "absent" from
+    "broken"). Returns 500 on YAML parse failure or 400 on per-entry
+    shape error so the frontend can surface a toast instead of an
+    empty panel.
+    """
+    af = find_aggregations_file(work_dir)
+    if af is None:
+        return JSONResponse({"aggregations": []})
+    try:
+        specs = load_aggregations(af)
+    except AggregationRuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    except AggregationConfigError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({
+        "aggregations": [
+            {"name": s.name, "gate": s.gate, "mode": s.mode}
+            for s in specs
+        ],
+    })
+
+
+@app.get("/api/aggregate/{name}")
+async def get_aggregation(name: str):
+    """Compute aggregation rows for the named aggregation.
+
+    Returns 400 when `name` fails the safe-id regex (path-traversal
+    guard). Returns 404 when aggregations.yaml is absent OR no entry
+    matches `name`. Returns 500 on YAML parse failure or bad regex
+    compile. Returns 400 on per-entry shape error.
+    """
+    if not _SAFE_AGGREGATION_NAME_RE.fullmatch(name):
+        return JSONResponse(
+            {"error": "Invalid aggregation name"}, status_code=400,
+        )
+    af = find_aggregations_file(work_dir)
+    if af is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    try:
+        specs = load_aggregations(af)
+    except AggregationRuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    except AggregationConfigError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    spec = next((s for s in specs if s.name == name), None)
+    if spec is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    plans_dir = _aggregations_plans_dir()
+    try:
+        rows = compute_aggregation(spec, plans_dir)
+    except AggregationRuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return JSONResponse({
+        "name": spec.name,
+        "gate": spec.gate,
+        "mode": spec.mode,
+        "rows": rows,
+    })
 
 
 # v0.3 task 8 (Plan §D6.2): services endpoints. Reuse
