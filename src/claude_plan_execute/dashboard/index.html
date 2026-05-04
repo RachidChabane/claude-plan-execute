@@ -1565,6 +1565,8 @@ function renderTasks() {
             ${task.commit_message ? `<span class="task-meta-item"><strong>commit:</strong> ${esc(task.commit_message)}</span>` : ''}
             ${ts.review_round ? `<span class="task-meta-item"><strong>review round:</strong> ${ts.review_round}</span>` : ''}
             ${ts.plan_path ? `<span class="task-meta-item"><strong>plan:</strong> ${esc(ts.plan_path)}</span>` : ''}
+            ${ts.branch ? `<span class="task-meta-item"><strong>branch:</strong> ${esc(ts.branch)}</span>` : ''}
+            ${ts.pr_url ? `<span class="task-meta-item"><strong>PR:</strong> <a href="${esc(ts.pr_url)}" target="_blank" rel="noopener">${esc(ts.pr_url)}</a></span>` : ''}
           </div>
           <div class="task-tabs">
             <button class="task-tab active" onclick="switchTab(${task.id}, 'config', this)">Config</button>

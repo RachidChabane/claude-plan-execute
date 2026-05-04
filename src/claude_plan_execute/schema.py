@@ -123,6 +123,14 @@ class Defaults(BaseModel):
     caps: Caps | None = None
     on_max_review_rounds: Literal["fail", "auto_approve"] | None = None
 
+    # T9 (v0.3 §2.12) — per-task branches + auto-PR.
+    branch_per_task: bool | None = None
+    base_branch: str | None = None
+    task_branch_template: str | None = None
+    auto_pr: bool | None = None
+    auto_merge: bool | None = None
+    pr_body_template: str | None = None
+
     # Legacy v1 fields (still accepted; deprecation warning fires for v2 files)
     plan_timeout_minutes: int | None = None
     review_timeout_minutes: int | None = None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -141,6 +142,46 @@ def execute_task(
     entry["resolved_config_path"] = str(resolved_config_path)
     state.save()
 
+    # T9 (v0.3 §2.12) §D6: pre-Phase-1 branch hook. Lives BEFORE
+    # the try/finally so a branch failure surfaces as a normal
+    # early-return — services have not started yet, so there is no
+    # teardown to coordinate. The branch decision MUST land on the
+    # state entry before Phase 1 so an interrupted-mid-Phase-1
+    # retry knows which branch to re-checkout (the next pass re-
+    # executes this hook idempotently).
+    if bool(resolved["branch_per_task"]["value"]):
+        _branch_template = resolved["task_branch_template"]["value"]
+        _base_branch = resolved["base_branch"]["value"]
+        try:
+            _branch = _render_branch_name(
+                _branch_template, tid, _slug(task["title"]),
+            )
+            _parent_branch = _resolve_parent_branch(
+                task, state, _base_branch,
+            )
+            _create_or_checkout_branch(
+                _branch, _parent_branch, _base_branch,
+            )
+        except _GitOperationError as exc:
+            state.set_status(
+                tid, "blocked",
+                block_reason="branch_checkout_failed",
+            )
+            state.record_failure(tid, make_failure_record(
+                failure_class="branch_checkout_failed",
+                phase="branch",
+                reason=str(exc),
+                artifacts={"task_dir": str(task_dir)},
+            ))
+            print(red(
+                f"\n  Task {tid} blocked: branch checkout "
+                f"failed: {exc}"
+            ))
+            return
+        state.set_status(
+            tid, state.get(tid)["status"], branch=_branch,
+        )
+
     # v0.3 task 8 (Plan §D4.6): wrap the body in try/finally so
     # gate- and task-scope services are torn down on every exit
     # path — success, blocked, dry-run early-return, uncaught
@@ -246,6 +287,12 @@ def execute_task(
         rate_limit_base_backoff_seconds = int(
             resolved["rate_limit_base_backoff_seconds"]["value"]
         )
+        # T9 (v0.3 §2.12).
+        branch_per_task = bool(resolved["branch_per_task"]["value"])
+        base_branch = resolved["base_branch"]["value"]
+        auto_pr = bool(resolved["auto_pr"]["value"])
+        auto_merge = bool(resolved["auto_merge"]["value"])
+        pr_body_template = resolved["pr_body_template"]["value"]
         skip_perms = cli.get("skip_permissions", False)
         verbose = cli.get("verbose", False)
     
@@ -500,10 +547,14 @@ def execute_task(
         # Runs unconditionally before Phase 4 (even when no gates are
         # configured) so the artifact has standalone operator-debug
         # value. Empty diff → empty file; templates handle that branch.
-        # T9 will pass branch_per_task / base_branch kwargs once the
-        # branch primitives ship; T7's call uses the HEAD~1..HEAD
-        # default. (Plan §D1 / §D6.)
-        diff_text = _capture_implement_diff()
+        # T9 §D5 patches the call site to pass branch_per_task /
+        # base_branch from the resolver chain so the diff form
+        # switches to `origin/{base}...HEAD` when the per-task
+        # branch is in scope.
+        diff_text = _capture_implement_diff(
+            branch_per_task=branch_per_task,
+            base_branch=base_branch,
+        )
         (task_dir / "diff.patch").write_text(diff_text, encoding="utf-8")
 
         # v0.3 task 8 (Plan §D4.5): ensure gate-scoped services are
@@ -672,7 +723,89 @@ def execute_task(
                         f"({', '.join(r.name for r in blocking)})."
                     ))
                     return
-    
+
+        # T9 (v0.3 §2.12) §D9: post-Phase-4 PR / merge hook. Skipped
+        # entirely when `branch_per_task` or `auto_pr` is False (the
+        # backward-compat default — zero new shell-outs). PR side-
+        # effects can fail without losing the task's work; failures
+        # transition to blocked + a specific failure_class so
+        # operators can re-run after fixing (e.g., gh auth).
+        pr_url: str | None = None
+        if branch_per_task and auto_pr:
+            _branch_for_pr = state.get(tid).get("branch")
+            push_proc = subprocess.run(
+                ["git", "push", "-u", "origin", _branch_for_pr],
+                capture_output=True, text=True, timeout=120,
+            )
+            if push_proc.returncode != 0:
+                state.set_status(
+                    tid, "blocked", block_reason="push_failed",
+                )
+                state.record_failure(tid, make_failure_record(
+                    failure_class="push_failed",
+                    phase="post_implement",
+                    reason=(
+                        f"git push -u origin {_branch_for_pr} failed "
+                        f"(exit {push_proc.returncode}): "
+                        f"{(push_proc.stderr or push_proc.stdout).strip()[-500:]}"
+                    ),
+                    artifacts={"plan": str(plan_path)},
+                ))
+                print(red(
+                    f"\n  Task {tid} blocked: git push failed."
+                ))
+                return
+            try:
+                pr_url = _open_or_get_pr_url(
+                    branch=_branch_for_pr,
+                    base_branch=base_branch,
+                    title=task["title"],
+                    body=_render_pr_body(
+                        task, plan_path, pr_body_template,
+                    ),
+                )
+            except _GitOperationError as exc:
+                state.set_status(
+                    tid, "blocked", block_reason="pr_create_failed",
+                )
+                state.record_failure(tid, make_failure_record(
+                    failure_class="pr_create_failed",
+                    phase="post_implement",
+                    reason=str(exc),
+                    artifacts={"plan": str(plan_path)},
+                ))
+                print(red(
+                    f"\n  Task {tid} blocked: gh pr create failed."
+                ))
+                return
+            if auto_merge:
+                merge_proc = subprocess.run(
+                    ["gh", "pr", "merge", "--auto", "--squash",
+                     _branch_for_pr],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if merge_proc.returncode != 0:
+                    state.set_status(
+                        tid, "blocked", block_reason="merge_failed",
+                    )
+                    state.record_failure(tid, make_failure_record(
+                        failure_class="merge_failed",
+                        phase="post_implement",
+                        reason=(
+                            f"gh pr merge --auto --squash failed "
+                            f"(exit {merge_proc.returncode}): "
+                            f"{(merge_proc.stderr or merge_proc.stdout).strip()[-500:]}"
+                        ),
+                        artifacts={
+                            "plan": str(plan_path),
+                            "pr_url": pr_url,
+                        },
+                    ))
+                    print(red(
+                        f"\n  Task {tid} blocked: gh pr merge failed."
+                    ))
+                    return
+
         # T2 §D8: roll up per-run usage rows into the per-task summary.
         # Failed / blocked tasks short-circuit before this point; they
         # do NOT get a usage_summary. Re-running a done task overwrites
@@ -681,6 +814,10 @@ def execute_task(
         done_extras: dict = {}
         if summary["total_runs"] > 0:
             done_extras["usage_summary"] = summary
+        # T9 §D9: pr_url lands on the state entry alongside
+        # usage_summary when auto_pr fired and produced a URL.
+        if pr_url is not None:
+            done_extras["pr_url"] = pr_url
 
         # v0.3 task 8 (Plan §D4.6): success-path explicit teardown.
         # `reset_crash_count` runs for services that held running
@@ -770,6 +907,206 @@ def _capture_git_porcelain() -> str:
     if proc.returncode != 0:
         return ""
     return proc.stdout
+
+
+# --- T9 (v0.3 §2.12) — branch + PR helpers --------------------------------
+
+
+class _GitOperationError(RuntimeError):
+    """Raised by branch / PR helpers on a non-recoverable git/gh failure.
+
+    The runner catches this and writes a FailureRecord. Exists so the
+    runner doesn't have to import subprocess.CalledProcessError into
+    high-level state-setting code.
+    """
+
+
+_SLUG_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_SLUG_BODY_CAP = 30  # T9 v0.3 §2.12: keep branch names readable
+
+_DEFAULT_PR_BODY_TEMPLATE = (
+    "Auto-opened by `claude-plan-execute` for task {id}.\n\n"
+    "**Title.** {title}\n\n"
+    "**Description.**\n\n{description}\n\n"
+    "**Plan.** [`{plan_path}`]({plan_path})\n\n"
+    "**Diff.** See `diff.patch` in the task's plans dir.\n"
+)
+
+
+def _slug(title: str) -> str:
+    """Lowercase, collapse non-alphanumeric runs to '-', trim, cap at 30 chars.
+
+    Edge cases:
+      - Empty / whitespace-only title → "task" sentinel.
+      - All-non-alphanumeric (e.g., "!!!") → "task" sentinel.
+      - Mid-token cap at 30 chars → trim trailing '-'.
+      - Non-ASCII letters dropped (branch names with non-ASCII trip
+        several git server implementations).
+    """
+    lower = title.lower()
+    collapsed = _SLUG_NON_ALNUM.sub("-", lower).strip("-")
+    if not collapsed:
+        return "task"
+    body = collapsed[:_SLUG_BODY_CAP].rstrip("-")
+    return body or "task"
+
+
+def _render_branch_name(template: str, tid: int | str, slug: str) -> str:
+    """Render a branch name from the template and slug.
+
+    Raises `_GitOperationError` when the template references an unknown
+    placeholder (only `{id}` and `{slug}` are supported in v0.3).
+    """
+    try:
+        return template.format(id=tid, slug=slug)
+    except KeyError as exc:
+        raise _GitOperationError(
+            f"task_branch_template {template!r} references unknown "
+            f"placeholder {exc.args[0]!r} (only {{id}} and {{slug}} "
+            f"are supported)"
+        )
+
+
+def _branch_exists_locally(branch: str) -> bool:
+    """Return True iff `git rev-parse --verify <branch>` exits 0.
+
+    Defensive: any subprocess failure (no git binary, timeout, etc.)
+    yields False; the caller will see the create-branch step fail with
+    a clearer message.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify", branch],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def _resolve_parent_branch(
+    task: dict, state: "State", base_branch: str,
+) -> str:
+    """Pick the parent ref to base the new branch from.
+
+    Walks `task["depends_on"]` in declaration order; the LAST done +
+    branched dependency wins (operationalizes the v0.3 §2.12 "latest
+    done" tie-break as "last in depends_on order"). Falls back to
+    `origin/{base_branch}` when no qualifying dependency exists.
+    """
+    deps = task.get("depends_on") or []
+    parent = None
+    for dep_id in deps:
+        entry = state.get(dep_id)
+        if entry.get("status") == "done" and entry.get("branch"):
+            parent = entry["branch"]
+    if parent is not None:
+        return parent
+    return f"origin/{base_branch}"
+
+
+def _create_or_checkout_branch(
+    branch: str, parent_branch: str, base_branch: str,
+) -> None:
+    """Idempotent: re-checkout an existing local branch, else fetch (when
+    parent is `origin/<base>`) and `git checkout -b <branch> <parent>`.
+
+    Raises `_GitOperationError` on any non-zero exit.
+    """
+    if _branch_exists_locally(branch):
+        proc = subprocess.run(
+            ["git", "checkout", branch],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            raise _GitOperationError(
+                f"git checkout {branch} failed (exit "
+                f"{proc.returncode}): "
+                f"{(proc.stderr or proc.stdout).strip()}"
+            )
+        return
+    if parent_branch.startswith("origin/"):
+        fetch_proc = subprocess.run(
+            ["git", "fetch", "origin", base_branch],
+            capture_output=True, text=True, timeout=60,
+        )
+        if fetch_proc.returncode != 0:
+            raise _GitOperationError(
+                f"git fetch origin {base_branch} failed (exit "
+                f"{fetch_proc.returncode}): "
+                f"{(fetch_proc.stderr or fetch_proc.stdout).strip()}"
+            )
+    create_proc = subprocess.run(
+        ["git", "checkout", "-b", branch, parent_branch],
+        capture_output=True, text=True, timeout=10,
+    )
+    if create_proc.returncode != 0:
+        raise _GitOperationError(
+            f"git checkout -b {branch} {parent_branch} failed "
+            f"(exit {create_proc.returncode}): "
+            f"{(create_proc.stderr or create_proc.stdout).strip()}"
+        )
+
+
+def _render_pr_body(
+    task: dict, plan_path: Path, template_path: str | None,
+) -> str:
+    """Render the PR body either from a configured template file or the
+    built-in default. A missing template file falls back silently.
+
+    Supported placeholders: `{id}`, `{title}`, `{description}`,
+    `{plan_path}`. Raises `_GitOperationError` on KeyError.
+    """
+    body_template = _DEFAULT_PR_BODY_TEMPLATE
+    if template_path:
+        p = Path(template_path)
+        if p.is_file():
+            body_template = p.read_text(encoding="utf-8")
+    try:
+        return body_template.format(
+            id=task["id"],
+            title=task["title"],
+            description=task["description"],
+            plan_path=str(plan_path),
+        )
+    except KeyError as exc:
+        raise _GitOperationError(
+            f"pr_body_template references unknown placeholder "
+            f"{exc.args[0]!r}"
+        )
+
+
+def _open_or_get_pr_url(
+    *, branch: str, base_branch: str, title: str, body: str,
+) -> str:
+    """Return the URL of the PR for `branch`, opening one if needed.
+
+    Two-step sequence (plan §3.A): `gh pr list --head <branch> --json
+    url -q '.[0].url // ""'` first; on empty stdout, `gh pr create
+    --base <base> --title <title> --body <body>`. The list step is
+    defensive (non-zero exit yields empty URL); the create step is
+    mandatory and raises `_GitOperationError` on failure.
+    """
+    list_proc = subprocess.run(
+        ["gh", "pr", "list", "--head", branch,
+         "--json", "url", "-q", '.[0].url // ""'],
+        capture_output=True, text=True, timeout=30,
+    )
+    existing = list_proc.stdout.strip() if list_proc.returncode == 0 else ""
+    if existing:
+        return existing
+    create_proc = subprocess.run(
+        ["gh", "pr", "create", "--base", base_branch,
+         "--title", title, "--body", body],
+        capture_output=True, text=True, timeout=120,
+    )
+    if create_proc.returncode != 0:
+        raise _GitOperationError(
+            f"gh pr create --base {base_branch} failed (exit "
+            f"{create_proc.returncode}): "
+            f"{(create_proc.stderr or create_proc.stdout).strip()[-500:]}"
+        )
+    return create_proc.stdout.strip()
 
 
 def _capture_implement_diff(

@@ -401,6 +401,13 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "dev_server_url",
         "max_rate_limit_retries",
         "rate_limit_base_backoff_seconds",
+        # T9 (v0.3 §2.12) — per-task branches + auto-PR.
+        "branch_per_task",
+        "base_branch",
+        "task_branch_template",
+        "auto_pr",
+        "auto_merge",
+        "pr_body_template",
     )
     assert KEYS_TO_AUDIT == expected
 

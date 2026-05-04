@@ -42,6 +42,11 @@ FAILURE_CLASSES = (
     "service_unavailable",                # v0.3 task 8 — ServiceUnavailableError
     "service_crashed",                    # v0.3 task 8 — single crash auto-recovered
     "service_unstable",                   # v0.3 task 8 — 3 consecutive crashes
+    # T9 (v0.3 §2.12) — branch / PR side-effect failures.
+    "branch_checkout_failed",             # v0.3 task 9 — Pre-Phase-1 git checkout / fetch failure
+    "push_failed",                        # v0.3 task 9 — Post-Phase-4 git push -u origin <branch>
+    "pr_create_failed",                   # v0.3 task 9 — Post-Phase-4 gh pr create / list failure
+    "merge_failed",                       # v0.3 task 9 — Post-Phase-4 gh pr merge --auto --squash failure
 )
 
 

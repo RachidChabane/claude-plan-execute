@@ -24,6 +24,15 @@ HARDCODED_DEFAULTS: dict = {
     "dev_server_url": "http://localhost:5173",
     "max_rate_limit_retries": 3,
     "rate_limit_base_backoff_seconds": 60,
+    # T9 (v0.3 §2.12) — per-task branches + auto-PR. NB:
+    # `pr_body_template` deliberately absent so unset → None at the
+    # resolver, which `_render_pr_body` handles as "use the built-in
+    # default body".
+    "branch_per_task": False,
+    "base_branch": "main",
+    "task_branch_template": "task/{id}-{slug}",
+    "auto_pr": False,
+    "auto_merge": False,
 }
 
 
@@ -56,6 +65,13 @@ KEYS_TO_AUDIT: tuple[str, ...] = (
     "dev_server_url",
     "max_rate_limit_retries",
     "rate_limit_base_backoff_seconds",
+    # T9 (v0.3 §2.12) — per-task branches + auto-PR.
+    "branch_per_task",
+    "base_branch",
+    "task_branch_template",
+    "auto_pr",
+    "auto_merge",
+    "pr_body_template",
 )
 
 

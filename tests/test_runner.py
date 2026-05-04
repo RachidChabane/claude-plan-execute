@@ -7848,3 +7848,758 @@ def test_single_task_phase_scope_service_torn_down_only_at_run_end(
     # what cleans up phase-scope services in single-task mode.
     assert "all" in stub.tear_down_calls
 
+
+# ===========================================================================
+# BB. T9 — branch_per_task + auto_pr + auto_merge (v0.3 §2.12)
+# ===========================================================================
+#
+# Pattern: every integration test in this section uses the
+# `runner.subprocess.run` discriminator (matching cmd[0]/cmd[1]/cmd[2]) so
+# the helpers run end-to-end. Direct helper-mocking is reserved for pure-
+# function tests (slug / render / parent resolution).
+
+
+# --- BB.1: slug + render + parent-branch helpers (pure) -------------------
+
+
+def test_slug_normal_title():
+    """Pin §D4: lowercase + dash collapse for a typical title."""
+    from claude_plan_execute.runner import _slug
+    assert _slug("Add Feature X") == "add-feature-x"
+
+
+def test_slug_collapses_underscores():
+    """Pin §D4: underscores are non-alphanumeric → collapsed to '-'."""
+    from claude_plan_execute.runner import _slug
+    assert _slug("feat: add_user_auth") == "feat-add-user-auth"
+
+
+def test_slug_strips_non_ascii_letters():
+    """Pin §D4: non-ASCII characters drop to '-' then trailing-strip."""
+    from claude_plan_execute.runner import _slug
+    assert _slug("café") == "caf"
+
+
+def test_slug_empty_title_returns_sentinel():
+    """Pin §D4: empty / non-alphanumeric titles → 'task' sentinel."""
+    from claude_plan_execute.runner import _slug
+    assert _slug("") == "task"
+    assert _slug("   ") == "task"
+    assert _slug("!!!") == "task"
+
+
+def test_slug_caps_body_at_30_chars():
+    """Pin §D4: 30-char body cap, never trailing '-'."""
+    from claude_plan_execute.runner import _slug
+    long_title = "a" * 60
+    s = _slug(long_title)
+    assert len(s) <= 30
+    assert not s.endswith("-")
+    # Mid-separator-run case
+    s2 = _slug("aaaaa bbbbb ccccc ddddd eeeee fffff ggggg hhhhh")
+    assert len(s2) <= 30
+    assert not s2.endswith("-")
+
+
+def test_render_branch_name():
+    """Pin §D7: standard template substitution."""
+    from claude_plan_execute.runner import _render_branch_name
+    assert _render_branch_name("task/{id}-{slug}", 17, "foo") == "task/17-foo"
+
+
+def test_render_branch_name_unknown_placeholder_raises():
+    """Pin §D7: unknown placeholder → _GitOperationError with hint."""
+    from claude_plan_execute.runner import (
+        _render_branch_name, _GitOperationError,
+    )
+    with pytest.raises(_GitOperationError) as exc_info:
+        _render_branch_name("task/{wat}", 1, "x")
+    assert "wat" in str(exc_info.value)
+
+
+def test_resolve_parent_branch_no_deps_returns_origin_base():
+    """Pin §D7: empty depends_on → 'origin/{base}'."""
+    from claude_plan_execute.runner import _resolve_parent_branch
+    state = State(_BB_tmp_state())
+    task = {"id": 1, "title": "T", "description": "D"}
+    assert _resolve_parent_branch(task, state, "main") == "origin/main"
+
+
+def test_resolve_parent_branch_done_dep_with_branch_wins():
+    """Pin §D7: a single done+branched dep returns that branch."""
+    from claude_plan_execute.runner import _resolve_parent_branch
+    state = State(_BB_tmp_state())
+    state.set_status(3, "done", branch="task/3-foo")
+    task = {"id": 9, "title": "T", "description": "D", "depends_on": [3]}
+    assert _resolve_parent_branch(task, state, "main") == "task/3-foo"
+
+
+def test_resolve_parent_branch_undone_dep_falls_back_to_origin():
+    """Pin §D7: a pending dep without a branch falls through to origin."""
+    from claude_plan_execute.runner import _resolve_parent_branch
+    state = State(_BB_tmp_state())
+    # 3 is pending by default; no branch field
+    task = {"id": 9, "title": "T", "description": "D", "depends_on": [3]}
+    assert _resolve_parent_branch(task, state, "develop") == "origin/develop"
+
+
+def test_resolve_parent_branch_last_in_depends_on_wins():
+    """Pin §D7: depends_on order is the tie-break — last done+branched dep
+    wins (operationalizes 'latest done' deterministically)."""
+    from claude_plan_execute.runner import _resolve_parent_branch
+    state = State(_BB_tmp_state())
+    state.set_status(3, "done", branch="task/3-foo")
+    state.set_status(7, "done", branch="task/7-bar")
+    task = {"id": 9, "title": "T", "description": "D", "depends_on": [3, 7]}
+    assert _resolve_parent_branch(task, state, "main") == "task/7-bar"
+
+
+# Helper: per-test temp state.json path (uses tempfile to avoid cross-test
+# fixture leakage; State auto-creates the file on first save).
+def _BB_tmp_state():
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="bb_state_", suffix=".json")
+    import os
+    os.close(fd)
+    os.unlink(path)
+    return Path(path)
+
+
+def _BB_make_fake_run(*, branch_exists=False, push_rc=0,
+                     pr_list_stdout="", pr_list_rc=0,
+                     pr_create_rc=0, pr_create_stdout="https://github.com/x/y/pull/1",
+                     merge_rc=0, fetch_rc=0, checkout_rc=0,
+                     create_branch_rc=0, diff_stdout=""):
+    """Build a `subprocess.run` stub that discriminates on cmd[]
+    shape and records every invocation. Returns `(fake_run, calls)`.
+    All defaults are happy-path; pass per-test overrides to inject
+    failures.
+    """
+    calls: list[list] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+
+        class P:
+            pass
+
+        p = P()
+        p.stderr = ""
+        if cmd[:2] == ["git", "rev-parse"]:
+            p.returncode = 0 if branch_exists else 1
+            p.stdout = ""
+        elif cmd[:2] == ["git", "fetch"]:
+            p.returncode = fetch_rc
+            p.stdout = ""
+            p.stderr = "fetch failed" if fetch_rc != 0 else ""
+        elif cmd[:3] == ["git", "checkout", "-b"]:
+            p.returncode = create_branch_rc
+            p.stdout = ""
+            p.stderr = "checkout -b failed" if create_branch_rc != 0 else ""
+        elif cmd[:2] == ["git", "checkout"]:
+            p.returncode = checkout_rc
+            p.stdout = ""
+        elif cmd[:2] == ["git", "diff"]:
+            p.returncode = 0
+            p.stdout = diff_stdout
+        elif cmd[:2] == ["git", "push"]:
+            p.returncode = push_rc
+            p.stdout = ""
+            p.stderr = "push rejected" if push_rc != 0 else ""
+        elif cmd[:3] == ["gh", "pr", "list"]:
+            p.returncode = pr_list_rc
+            p.stdout = pr_list_stdout
+        elif cmd[:3] == ["gh", "pr", "create"]:
+            p.returncode = pr_create_rc
+            p.stdout = pr_create_stdout
+            p.stderr = "create failed" if pr_create_rc != 0 else ""
+        elif cmd[:3] == ["gh", "pr", "merge"]:
+            p.returncode = merge_rc
+            p.stdout = ""
+            p.stderr = "merge failed" if merge_rc != 0 else ""
+        elif cmd[:2] == ["git", "status"]:
+            p.returncode = 0
+            p.stdout = ""
+        else:
+            p.returncode = 0
+            p.stdout = ""
+        return p
+
+    return fake_run, calls
+
+
+# --- BB.2: branch hook integration in execute_task -----------------------
+
+
+def test_branch_per_task_false_no_git_subprocess_calls(monkeypatch, tmp_path):
+    """Pin §D13: default-off → zero new git/gh shell-outs. Only the
+    T7 diff-capture (`git diff HEAD~1..HEAD`) and T6 porcelain
+    (`git status --porcelain`) calls are allowed; no rev-parse, no
+    fetch, no push, no gh."""
+    fake_run, calls = _BB_make_fake_run()
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    # Only allowed shapes: diff (T7) and status (T6 / porcelain)
+    for cmd in calls:
+        assert cmd[:2] in (["git", "diff"], ["git", "status"]), (
+            f"Unexpected git/gh invocation when branch_per_task=False: {cmd}"
+        )
+    # No gh at all
+    assert not any(cmd[0] == "gh" for cmd in calls)
+    # No rev-parse / fetch / push / checkout
+    assert not any(
+        cmd[:2] in (["git", "rev-parse"], ["git", "fetch"],
+                    ["git", "push"], ["git", "checkout"])
+        for cmd in calls
+    )
+
+
+def test_branch_per_task_true_creates_branch_from_origin_main(
+    monkeypatch, tmp_path,
+):
+    """Pin §D6: branch_per_task=True with no existing local branch
+    → fetch origin main, then `git checkout -b task/1-t origin/main`."""
+    fake_run, calls = _BB_make_fake_run(branch_exists=False)
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    # Fetch origin main
+    assert ["git", "fetch", "origin", "main"] in calls
+    # Create branch from origin/main
+    assert ["git", "checkout", "-b", "task/1-t", "origin/main"] in calls
+
+
+def test_branch_per_task_true_idempotent_re_checkout_when_exists(
+    monkeypatch, tmp_path,
+):
+    """Pin §D7: existing local branch → plain `git checkout <branch>`,
+    NOT `-b`."""
+    fake_run, calls = _BB_make_fake_run(branch_exists=True)
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    # Idempotent re-checkout (no -b)
+    assert ["git", "checkout", "task/1-t"] in calls
+    assert not any(cmd[:3] == ["git", "checkout", "-b"] for cmd in calls)
+    # No fetch when branch exists locally
+    assert not any(cmd[:2] == ["git", "fetch"] for cmd in calls)
+
+
+def test_branch_recorded_on_state_entry(monkeypatch, tmp_path):
+    """Pin §D6: after the branch hook, state entry has `branch=<name>`."""
+    fake_run, _ = _BB_make_fake_run(branch_exists=False)
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1).get("branch") == "task/1-t"
+
+
+def test_branch_failure_blocks_with_branch_checkout_failed_class(
+    monkeypatch, tmp_path,
+):
+    """Pin §D6: a failing `git fetch` surfaces as blocked +
+    failure_class=branch_checkout_failed."""
+    fake_run, _ = _BB_make_fake_run(branch_exists=False, fetch_rc=1)
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry.get("block_reason") == "branch_checkout_failed"
+    attempts = entry["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "branch_checkout_failed"
+    assert attempts[0]["phase"] == "branch"
+
+
+def test_diff_target_switches_when_branch_per_task_true(
+    monkeypatch, tmp_path,
+):
+    """Pin §D5: with branch_per_task=True + base_branch=develop, the
+    `git diff` cmd is `["git", "diff", "origin/develop...HEAD"]` —
+    NOT the default `HEAD~1..HEAD`."""
+    fake_run, calls = _BB_make_fake_run(branch_exists=True)
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "base_branch": "develop",
+        },
+        cli={}, skip_to="implement",
+    )
+    diff_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "diff"]]
+    assert diff_cmds, "expected at least one git diff invocation"
+    assert ["git", "diff", "origin/develop...HEAD"] in diff_cmds
+    # Old HEAD~1..HEAD form must NOT fire when branch_per_task=True
+    assert ["git", "diff", "HEAD~1..HEAD"] not in diff_cmds
+
+
+# --- BB.3: auto_pr / auto_merge integration ------------------------------
+
+
+def test_auto_pr_creates_when_no_existing_pr(monkeypatch, tmp_path):
+    """Pin §3.A / §D9: empty pr list stdout → gh pr create runs;
+    state ends `done` with `pr_url` set to the create stdout."""
+    fake_run, calls = _BB_make_fake_run(
+        branch_exists=True,
+        pr_list_stdout="",
+        pr_create_stdout="https://github.com/foo/bar/pull/42\n",
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    assert state.get(1).get("pr_url") == "https://github.com/foo/bar/pull/42"
+    # gh pr create fired
+    assert any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
+
+
+def test_auto_pr_uses_existing_url_when_pr_already_open(
+    monkeypatch, tmp_path,
+):
+    """Pin §3.A: non-empty pr list stdout → use that URL; NO gh pr
+    create invoked."""
+    fake_run, calls = _BB_make_fake_run(
+        branch_exists=True,
+        pr_list_stdout="https://github.com/foo/bar/pull/7\n",
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    assert state.get(1).get("pr_url") == "https://github.com/foo/bar/pull/7"
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
+
+
+def test_auto_pr_push_failure_blocks_with_push_failed_class(
+    monkeypatch, tmp_path,
+):
+    """Pin §D9: failing git push → blocked + failure_class=push_failed."""
+    fake_run, _ = _BB_make_fake_run(branch_exists=True, push_rc=1)
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry.get("block_reason") == "push_failed"
+    attempts = entry["attempts"]
+    assert any(
+        a["failure_class"] == "push_failed" and a["phase"] == "post_implement"
+        for a in attempts
+    )
+
+
+def test_auto_pr_create_failure_blocks_with_pr_create_failed_class(
+    monkeypatch, tmp_path,
+):
+    """Pin §D9: empty pr list stdout + non-zero pr create exit →
+    blocked + failure_class=pr_create_failed."""
+    fake_run, _ = _BB_make_fake_run(
+        branch_exists=True, pr_list_stdout="", pr_create_rc=1,
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry.get("block_reason") == "pr_create_failed"
+    attempts = entry["attempts"]
+    assert any(
+        a["failure_class"] == "pr_create_failed"
+        and a["phase"] == "post_implement"
+        for a in attempts
+    )
+
+
+def test_auto_merge_invokes_gh_pr_merge_with_correct_args(
+    monkeypatch, tmp_path,
+):
+    """Pin §D9 Comment-A: with auto_merge=True, after a successful PR
+    open, `gh pr merge --auto --squash <branch>` runs (positional
+    branch arg) and state ends `done`."""
+    fake_run, calls = _BB_make_fake_run(
+        branch_exists=True,
+        pr_list_stdout="https://github.com/foo/bar/pull/9\n",
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": True,
+            "auto_merge": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+    merge_cmds = [c for c in calls if c[:3] == ["gh", "pr", "merge"]]
+    assert merge_cmds, "expected gh pr merge invocation"
+    cmd = merge_cmds[0]
+    assert cmd == ["gh", "pr", "merge", "--auto", "--squash", "task/1-t"]
+
+
+def test_auto_merge_failure_blocks_with_merge_failed_class(
+    monkeypatch, tmp_path,
+):
+    """Pin §D9: failing gh pr merge → blocked + failure_class=merge_failed."""
+    fake_run, _ = _BB_make_fake_run(
+        branch_exists=True,
+        pr_list_stdout="https://github.com/foo/bar/pull/9\n",
+        merge_rc=1,
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": True,
+            "auto_merge": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry.get("block_reason") == "merge_failed"
+    attempts = entry["attempts"]
+    assert any(
+        a["failure_class"] == "merge_failed" and a["phase"] == "post_implement"
+        for a in attempts
+    )
+
+
+def test_create_branch_with_missing_parent_blocks_with_clear_error(
+    monkeypatch, tmp_path,
+):
+    """Pin §R2 edge case: dependency's local branch deleted between
+    runs. Setup: dep task is `done` with `branch="task/3-foo"` on
+    its state entry, but `git rev-parse --verify task/3-foo`
+    returncode=1 AND `git checkout -b new task/3-foo` returncode=1
+    (parent ref unknown). Assert state goes blocked + failure_class
+    branch_checkout_failed, AND `reason` contains the missing parent
+    name so the operator sees which ref is missing."""
+    fake_run, _ = _BB_make_fake_run(
+        branch_exists=False, create_branch_rc=1,
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    state.set_status(3, "done", branch="task/3-foo")
+    task = _make_task(id=9, depends_on=[3])
+    execute_task(
+        task, state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(9)
+    assert entry["status"] == "blocked"
+    assert entry.get("block_reason") == "branch_checkout_failed"
+    attempts = entry["attempts"]
+    assert len(attempts) >= 1
+    rec = attempts[-1]
+    assert rec["failure_class"] == "branch_checkout_failed"
+    # Reason must reference the parent ref that's missing
+    assert "task/3-foo" in rec["reason"]
+
+
+# --- BB.4: bonus tests ----------------------------------------------------
+
+
+def test_branch_per_task_without_auto_pr_records_branch_only(
+    monkeypatch, tmp_path,
+):
+    """Pin §D9 `if branch_per_task and auto_pr:` — with auto_pr=False,
+    state has `branch` but NO `pr_url`."""
+    fake_run, calls = _BB_make_fake_run(branch_exists=True)
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": False,
+        },
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "done"
+    assert entry.get("branch") == "task/1-t"
+    assert "pr_url" not in entry
+    assert not any(cmd[0] == "gh" for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+
+
+def test_pr_body_falls_back_to_default_when_template_missing(
+    monkeypatch, tmp_path,
+):
+    """Pin §D8: missing template file → built-in default body.
+    Asserted via the `--body` arg passed to `gh pr create`."""
+    fake_run, calls = _BB_make_fake_run(
+        branch_exists=True, pr_list_stdout="",
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, title="My T", description="Some desc"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": True,
+            "pr_body_template": str(tmp_path / "missing.md"),  # nonexistent
+        },
+        cli={}, skip_to="implement",
+    )
+    create_cmds = [c for c in calls if c[:3] == ["gh", "pr", "create"]]
+    assert create_cmds, "expected gh pr create"
+    cmd = create_cmds[0]
+    body_idx = cmd.index("--body") + 1
+    body = cmd[body_idx]
+    assert body.startswith("Auto-opened by `claude-plan-execute`")
+
+
+def test_pr_body_uses_template_file_when_present(
+    monkeypatch, tmp_path,
+):
+    """Pin §D8: when the template file exists, its contents are
+    rendered with the supported placeholders."""
+    fake_run, calls = _BB_make_fake_run(
+        branch_exists=True, pr_list_stdout="",
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    tpl = tmp_path / "tpl.md"
+    tpl.write_text("My body for {title}", encoding="utf-8")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, title="MyT", description="D"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "branch_per_task": True,
+            "auto_pr": True,
+            "pr_body_template": str(tpl),
+        },
+        cli={}, skip_to="implement",
+    )
+    create_cmds = [c for c in calls if c[:3] == ["gh", "pr", "create"]]
+    assert create_cmds
+    cmd = create_cmds[0]
+    body_idx = cmd.index("--body") + 1
+    assert cmd[body_idx] == "My body for MyT"
+
+
+# --- BB.5: cli._slate_preflight_audit unit tests --------------------------
+
+
+def test_slate_preflight_audit_default_off_no_gh_no_violation():
+    """Pin §D11: empty file_defaults → no auto_pr, no auto_merge,
+    no gh required, no coherence violations."""
+    from claude_plan_execute.cli import _slate_preflight_audit
+    tasks = [{"id": 1, "title": "T", "description": "D"}]
+    needs_gh, viol = _slate_preflight_audit(
+        tasks, file_defaults={}, cli_overrides={},
+        phases_by_id={}, task_class_models={},
+    )
+    assert needs_gh is False
+    assert viol == []
+
+
+def test_slate_preflight_audit_auto_pr_with_branch_per_task_passes():
+    """Pin §D11: auto_pr=True AND branch_per_task=True → needs_gh=True,
+    no coherence violation."""
+    from claude_plan_execute.cli import _slate_preflight_audit
+    tasks = [{"id": 1, "title": "T", "description": "D"}]
+    needs_gh, viol = _slate_preflight_audit(
+        tasks,
+        file_defaults={"auto_pr": True, "branch_per_task": True},
+        cli_overrides={},
+        phases_by_id={}, task_class_models={},
+    )
+    assert needs_gh is True
+    assert viol == []
+
+
+def test_slate_preflight_audit_auto_pr_without_branch_per_task_flags():
+    """Pin §D11: auto_pr=True without branch_per_task=True → needs_gh=True
+    AND task is flagged in the coherence list."""
+    from claude_plan_execute.cli import _slate_preflight_audit
+    tasks = [{"id": 1, "title": "T", "description": "D"}]
+    needs_gh, viol = _slate_preflight_audit(
+        tasks,
+        file_defaults={"auto_pr": True},  # branch_per_task defaults False
+        cli_overrides={},
+        phases_by_id={}, task_class_models={},
+    )
+    assert needs_gh is True
+    assert viol == [1]
+
+
+def test_slate_preflight_audit_per_task_override_respects_off():
+    """Pin §D11: a task-level override of `auto_pr: False` defeats a
+    project default of True → no gh needed for that task."""
+    from claude_plan_execute.cli import _slate_preflight_audit
+    tasks = [{
+        "id": 1, "title": "T", "description": "D", "auto_pr": False,
+    }]
+    needs_gh, viol = _slate_preflight_audit(
+        tasks,
+        file_defaults={"auto_pr": True, "branch_per_task": True},
+        cli_overrides={},
+        phases_by_id={}, task_class_models={},
+    )
+    assert needs_gh is False
+    assert viol == []
+
+
+def test_slate_preflight_audit_auto_merge_alone_triggers_needs_gh():
+    """Pin §D11: auto_merge=True alone (without auto_pr) still flags
+    the slate as needing gh AND a coherence violation when
+    branch_per_task is False."""
+    from claude_plan_execute.cli import _slate_preflight_audit
+    tasks = [{"id": 1, "title": "T", "description": "D"}]
+    needs_gh, viol = _slate_preflight_audit(
+        tasks,
+        file_defaults={"auto_merge": True},
+        cli_overrides={},
+        phases_by_id={}, task_class_models={},
+    )
+    assert needs_gh is True
+    assert viol == [1]
+

@@ -136,6 +136,56 @@ def cmd_decisions_index(args) -> int:
     return 0
 
 
+def _slate_preflight_audit(
+    tasks: list[dict],
+    file_defaults: dict,
+    cli_overrides: dict,
+    phases_by_id: dict[str, dict],
+    task_class_models: dict[str, dict],
+) -> tuple[bool, list]:
+    """T9 §D11: walk every task in the slate and decide:
+
+    - `needs_gh`: True iff at least one task resolves to auto_pr=True
+      OR auto_merge=True (forces the gh-PATH check).
+    - `auto_pr_without_branch`: list of task IDs that resolve to
+      auto_pr/auto_merge True but branch_per_task False (the post-
+      Phase-4 PR hook is gated on `branch_per_task and auto_pr`).
+
+    Uses the same `resolve(...)` helper the runner uses, so per-task
+    overrides are honored (a task that sets `auto_pr: false` even
+    when project defaults say true is skipped).
+    """
+    needs_gh = False
+    auto_pr_without_branch: list = []
+    for t in tasks:
+        phase_dict_t: dict = {}
+        if phases_by_id and t.get("phase") in phases_by_id:
+            phase_dict_t = dict(
+                phases_by_id[t["phase"]].get("defaults") or {}
+            )
+        task_class_dict_t: dict = {}
+        tc_name = t.get("task_class") or phase_dict_t.get("task_class")
+        if task_class_models and tc_name in task_class_models:
+            task_class_dict_t = dict(task_class_models[tc_name])
+        auto_pr_t = bool(resolve(
+            "auto_pr", t, file_defaults, cli_overrides,
+            phase=phase_dict_t, task_class=task_class_dict_t,
+        ))
+        auto_merge_t = bool(resolve(
+            "auto_merge", t, file_defaults, cli_overrides,
+            phase=phase_dict_t, task_class=task_class_dict_t,
+        ))
+        branch_per_task_t = bool(resolve(
+            "branch_per_task", t, file_defaults, cli_overrides,
+            phase=phase_dict_t, task_class=task_class_dict_t,
+        ))
+        if auto_pr_t or auto_merge_t:
+            needs_gh = True
+            if not branch_per_task_t:
+                auto_pr_without_branch.append(t["id"])
+    return needs_gh, auto_pr_without_branch
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="claude-plan-execute",
@@ -286,6 +336,33 @@ def main():
             print(f"  Task {bold(str(t['id']).rjust(3))}: [{status_color(s)}]{dim(extra)}")
         print()
         return
+
+    # T9 (v0.3 §2.12) §D11: gh CLI preflight + auto_pr/branch_per_task
+    # coherence check. Fires only when at least one task in the slate
+    # resolves to auto_pr=True or auto_merge=True; projects that don't
+    # use the auto-PR machinery aren't forced to install gh. The
+    # coherence check fires before the gh-PATH check so a misconfigured
+    # slate gets a precise error regardless of whether gh is installed.
+    needs_gh, auto_pr_without_branch = _slate_preflight_audit(
+        tasks, file_defaults, cli_overrides,
+        phases_by_id, task_class_models,
+    )
+    if auto_pr_without_branch:
+        print(red(
+            f"Error: tasks {auto_pr_without_branch} resolve to auto_pr "
+            f"or auto_merge = True but branch_per_task = False. The "
+            f"post-Phase-4 PR hook is gated on `branch_per_task and "
+            f"auto_pr`; set `branch_per_task: true` (project, phase, "
+            f"task_class, or per-task) to enable PR creation."
+        ), file=sys.stderr)
+        sys.exit(1)
+    if needs_gh and not shutil.which("gh"):
+        print(red(
+            "Error: 'gh' not found on PATH but auto_pr or auto_merge "
+            "is enabled. Install GitHub CLI (https://cli.github.com) "
+            "and run `gh auth login`."
+        ), file=sys.stderr)
+        sys.exit(1)
 
     # Validate dependencies and get execution order
     ordered_tasks = validate_dependencies(tasks)

@@ -1221,3 +1221,134 @@ def test_task_typo_gate_extra_singular_rejected_with_suggestion(
     err = capsys.readouterr().err
     assert "gate_extra" in err
     assert "Did you mean 'gates_extra'?" in err
+
+
+# --- T9: branch_per_task / auto_pr Defaults (v0.3 §2.12) ------------------
+
+
+def test_defaults_accepts_branch_per_task_fields():
+    """All 6 T9 fields settable on Defaults(...) with documented types."""
+    d = Defaults(
+        branch_per_task=True,
+        base_branch="develop",
+        task_branch_template="task/{id}-{slug}",
+        auto_pr=True,
+        auto_merge=False,
+        pr_body_template="docs/pr-template.md",
+    )
+    assert d.branch_per_task is True
+    assert d.base_branch == "develop"
+    assert d.task_branch_template == "task/{id}-{slug}"
+    assert d.auto_pr is True
+    assert d.auto_merge is False
+    assert d.pr_body_template == "docs/pr-template.md"
+
+
+def test_defaults_branch_per_task_rejects_non_bool():
+    """Pydantic v2 lax-mode coerces "true"/0/1, but rejects clearly-non-
+    bool strings (e.g., "xyz") and out-of-range ints (e.g., 123)."""
+    with pytest.raises(ValidationError):
+        Defaults(branch_per_task="xyz")
+    with pytest.raises(ValidationError):
+        Defaults(branch_per_task=123)
+
+
+def test_defaults_base_branch_rejects_non_string():
+    """`Defaults(base_branch=123)` raises ValidationError."""
+    with pytest.raises(ValidationError):
+        Defaults(base_branch=123)
+
+
+def test_defaults_branch_fields_default_to_none():
+    """All 6 T9 fields default to None on `Defaults()`."""
+    d = Defaults()
+    assert d.branch_per_task is None
+    assert d.base_branch is None
+    assert d.task_branch_template is None
+    assert d.auto_pr is None
+    assert d.auto_merge is None
+    assert d.pr_body_template is None
+
+
+def test_v2_with_branch_per_task_validates_clean(tmp_path):
+    """YAML round-trip with all 6 T9 fields set."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  branch_per_task: true\n"
+        "  base_branch: develop\n"
+        "  task_branch_template: 'feature/{id}-{slug}'\n"
+        "  auto_pr: true\n"
+        "  auto_merge: false\n"
+        "  pr_body_template: docs/pr-template.md\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.branch_per_task is True
+    assert tf.defaults.base_branch == "develop"
+    assert tf.defaults.task_branch_template == "feature/{id}-{slug}"
+    assert tf.defaults.auto_pr is True
+    assert tf.defaults.auto_merge is False
+    assert tf.defaults.pr_body_template == "docs/pr-template.md"
+
+
+def test_extra_key_under_defaults_suggests_branch_field(tmp_path, capsys):
+    """A typo `branch_per_taks` (missing `s`) emits a Did-you-mean hint
+    pointing at `branch_per_task`."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  branch_per_taks: true\n"   # typo (missing s)
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "branch_per_taks" in err
+    assert "Did you mean 'branch_per_task'?" in err
+
+
+def test_effective_defaults_passes_through_branch_fields(tmp_path):
+    """effective_defaults preserves all 6 T9 fields."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  branch_per_task: true\n"
+        "  base_branch: develop\n"
+        "  task_branch_template: 'task/{id}-{slug}'\n"
+        "  auto_pr: true\n"
+        "  auto_merge: true\n"
+        "  pr_body_template: docs/pr.md\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["branch_per_task"] is True
+    assert eff["base_branch"] == "develop"
+    assert eff["task_branch_template"] == "task/{id}-{slug}"
+    assert eff["auto_pr"] is True
+    assert eff["auto_merge"] is True
+    assert eff["pr_body_template"] == "docs/pr.md"
+
+
+def test_phase_loose_dict_can_override_branch_per_task():
+    """A phase with `defaults: { branch_per_task: false }` overrides a
+    project-level `true`. Resolver-level integration check."""
+    from claude_plan_execute.config import resolve
+
+    file_defaults = {"branch_per_task": True}
+    phase_defaults = {"branch_per_task": False}
+    val = resolve(
+        "branch_per_task",
+        task={"id": 1},
+        file_defaults=file_defaults,
+        cli_overrides={},
+        phase=phase_defaults,
+    )
+    assert val is False
