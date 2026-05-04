@@ -174,6 +174,27 @@ def test_factory_template_lists_three_viewports():
     assert "1280" in body
 
 
+def test_factory_does_NOT_substitute_diff_path_at_factory_time():
+    """Pin T7 §D2 / §D6: the design-fidelity factory substitutes
+    `{persona}` and `{dev_server_url}` at factory time but
+    deliberately leaves `{diff_path}` as a literal placeholder.
+    The substitution happens at gate-run-time in AgentGate.run().
+    Regression guard against a future refactor that "helpfully"
+    pre-renders all placeholders in the factory — that would
+    break the diff_path substitution because the diff is per-
+    task and not known at factory time."""
+    g = make_design_fidelity_gate(
+        dev_server_url="http://localhost:5173",
+        persona="## Conventions\n\nFoo.\n",
+    )
+    # Factory-rendered body still contains the literal placeholder.
+    assert "{diff_path}" in g.prompt_template
+    # Sanity: persona and dev_server_url WERE substituted (existing
+    # contract — pinned by sibling tests in this section).
+    assert "{persona}" not in g.prompt_template
+    assert "{dev_server_url}" not in g.prompt_template
+
+
 # ---------------------------------------------------------------------------
 # C. Factory does NOT register on default_registry
 # ---------------------------------------------------------------------------

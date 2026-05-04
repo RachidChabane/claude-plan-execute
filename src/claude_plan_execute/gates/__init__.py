@@ -212,8 +212,15 @@ def _when_matches(when: tuple[str, ...], task: dict) -> tuple[bool, str]:
 # Per-gate worker (catches exceptions; produces a GateResult either way)
 # ---------------------------------------------------------------------------
 
-def _run_one(name: str, gate: Gate, task: dict, cli: dict) -> GateResult:
+def _run_one(
+    name: str, gate: Gate, task: dict, cli: dict,
+    diff_path: str | None = None,
+) -> GateResult:
     """Execute one gate, returning a GateResult on success OR failure.
+
+    `diff_path` (T7, v0.3) is the path to the precomputed
+    implementation diff. Threaded only into `AgentGate`; `ShellGate`
+    has no template substitution surface and ignores it.
 
     Exceptions are caught and reported; the gate-run loop never raises
     out of `run_gates`.
@@ -223,7 +230,10 @@ def _run_one(name: str, gate: Gate, task: dict, cli: dict) -> GateResult:
         if gate.kind == "shell":
             return ShellGate(name=name, gate=gate).run()
         if gate.kind == "agent":
-            return AgentGate(name=name, gate=gate, task=task, cli=cli).run()
+            return AgentGate(
+                name=name, gate=gate, task=task, cli=cli,
+                diff_path=diff_path,
+            ).run()
         return GateResult(
             name=name, passed=False, output="",
             output_path=None,
@@ -271,6 +281,13 @@ def run_gates(
     gates_dir = task_dir / "gates"
     gates_dir.mkdir(parents=True, exist_ok=True)
 
+    # T7 §D7: derive the precomputed-diff path from task_dir and
+    # thread it into every _run_one call (agent gates substitute it;
+    # shell gates ignore it). Path is computed unconditionally even
+    # when no agent gates are configured — cheap; the runner has
+    # already written the file.
+    diff_path_str = str(task_dir / "diff.patch")
+
     # Filter by `when` first; skipped gates produce passive results.
     runnable: list[tuple[str, Gate]] = []
     skipped: list[GateResult] = []
@@ -298,14 +315,15 @@ def run_gates(
     # Serial first (single-runner dependence assumed; see §D5).
     for name, gate in serial:
         print(dim(f"  Running gate '{name}' (serial)..."))
-        results.append(_run_one(name, gate, task, cli))
+        results.append(_run_one(name, gate, task, cli,
+                                diff_path=diff_path_str))
 
     # Then parallel.
     if parallel:
         max_workers = min(len(parallel), 4)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
-                ex.submit(_run_one, n, g, task, cli): n
+                ex.submit(_run_one, n, g, task, cli, diff_path_str): n
                 for (n, g) in parallel
             }
             for fut in as_completed(futures):

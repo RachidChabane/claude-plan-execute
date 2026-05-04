@@ -2775,7 +2775,8 @@ def test_execute_task_phase_gates_extra_appended_to_project_gates(
     invoked: list[str] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(cmd[0])
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(cmd[0])
 
         class P:
             pass
@@ -2954,7 +2955,8 @@ def test_execute_task_tests_gate_runs_resolved_test_command(monkeypatch, tmp_pat
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -2986,7 +2988,8 @@ def test_execute_task_tests_gate_uses_per_task_test_command(monkeypatch, tmp_pat
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3164,7 +3167,8 @@ def test_execute_task_tests_gate_runs_alongside_unconfigured_lint(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3205,7 +3209,8 @@ def test_execute_task_tests_gate_phase_extra_appended(monkeypatch, tmp_path):
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3287,7 +3292,8 @@ def test_execute_task_lint_gate_runs_resolved_lint_command(monkeypatch, tmp_path
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3319,7 +3325,8 @@ def test_execute_task_lint_gate_uses_per_task_lint_command(monkeypatch, tmp_path
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3424,7 +3431,8 @@ def test_execute_task_lint_unconfigured_warns_and_skips(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3465,7 +3473,8 @@ def test_execute_task_lint_explicit_empty_command_runs_noop(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3605,7 +3614,8 @@ def test_execute_task_lint_runs_alongside_tests_in_parallel(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3643,7 +3653,8 @@ def test_execute_task_lint_phase_extra_appended(monkeypatch, tmp_path):
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -3704,7 +3715,8 @@ def test_execute_task_invariant_grep_meta_name_expands_to_loaded_invariants(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         x = P(); x.returncode = 0; x.stdout = ""; x.stderr = ""
         return x
@@ -3773,7 +3785,8 @@ def test_execute_task_invariant_grep_after_tests_runs_in_dispatch_order(
     invoked: list[str] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(cmd[2])
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(cmd[2])
         class P: pass
         x = P(); x.returncode = 0; x.stdout = ""; x.stderr = ""
         return x
@@ -3819,7 +3832,8 @@ def test_execute_task_specific_invariant_name_runs_directly(
     invoked: list[str] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(cmd[2])
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(cmd[2])
         class P: pass
         x = P(); x.returncode = 0; x.stdout = ""; x.stderr = ""
         return x
@@ -3930,7 +3944,8 @@ def test_execute_task_invariant_loaded_but_not_in_gates_does_NOT_run(
     invoked: list[str] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(cmd[2])
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(cmd[2])
         class P: pass
         x = P(); x.returncode = 0; x.stdout = ""; x.stderr = ""
         return x
@@ -4128,7 +4143,8 @@ def test_execute_task_test_critique_runs_after_tests_in_parallel_dispatch(
 
     shell_invoked: list[list[str]] = []
     def fake_shell_run(cmd, **kwargs):
-        shell_invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            shell_invoked.append(list(cmd))
         class P: pass
         x = P(); x.returncode = 0; x.stdout = "ok"; x.stderr = ""
         return x
@@ -4548,7 +4564,8 @@ def test_execute_task_untranslated_strings_gate_runs_resolved_command(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -4583,7 +4600,8 @@ def test_execute_task_untranslated_strings_gate_uses_per_task_command(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -4699,7 +4717,8 @@ def test_execute_task_untranslated_strings_unconfigured_warns_and_skips(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -4744,7 +4763,8 @@ def test_execute_task_untranslated_strings_explicit_empty_command_runs_noop(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -4888,7 +4908,8 @@ def test_execute_task_untranslated_strings_runs_alongside_tests_and_lint_in_para
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -4930,7 +4951,8 @@ def test_execute_task_untranslated_strings_phase_extra_appended(
     invoked: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        invoked.append(list(cmd))
+        if cmd[:2] != ["git", "diff"]:  # T7: ignore precomputed-diff capture
+            invoked.append(list(cmd))
         class P: pass
         p = P()
         p.returncode = 0
@@ -5640,3 +5662,236 @@ def test_execute_task_status_stays_implementing_during_resume(
     from claude_plan_execute.state import STATUSES
     assert "resuming" not in STATUSES
     assert state.get(1)["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# W. Precomputed diff write before Phase 4 (task 7 v0.3)
+# ---------------------------------------------------------------------------
+
+def test_execute_task_writes_diff_patch_post_implement(monkeypatch, tmp_path):
+    """Pin T7 §D1: after a successful implement, the runner writes
+    `task_dir / 'diff.patch'` with the captured `git diff HEAD~1..HEAD`
+    output. The file exists and contains the stubbed git stdout."""
+    diff_body = "diff --git a/foo b/foo\n+added line\n"
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        if cmd[:2] == ["git", "diff"]:
+            p.stdout = diff_body
+        else:
+            p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    diff_path = tmp_path / "task-1" / "diff.patch"
+    assert diff_path.is_file()
+    assert diff_body in diff_path.read_text(encoding="utf-8")
+
+
+def test_execute_task_diff_patch_empty_when_git_returns_empty(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D10: empty git stdout → empty diff.patch (zero
+    bytes). The file always exists; templates handle "diff is
+    empty, read source"."""
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    diff_path = tmp_path / "task-1" / "diff.patch"
+    assert diff_path.is_file()
+    assert diff_path.read_text(encoding="utf-8") == ""
+
+
+def test_execute_task_diff_patch_empty_when_subprocess_fails(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D6: defensive — git binary missing / non-repo /
+    timeout → helper returns ''; the runner writes an empty
+    diff.patch. Mirrors `_capture_git_porcelain` behavior."""
+    def boom(cmd, **kwargs):
+        raise FileNotFoundError("git not installed")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", boom,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    diff_path = tmp_path / "task-1" / "diff.patch"
+    assert diff_path.is_file()
+    assert diff_path.read_text(encoding="utf-8") == ""
+
+
+def test_execute_task_diff_patch_tail_capped_at_256kb(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D5: a synthesized git stdout > 256 KB is tail-
+    capped to fit `_DIFF_CAP_BYTES + marker overhead`. Verifies
+    the runner→helper→`_tail_cap(cap=)` chain."""
+    from claude_plan_execute.runner import _DIFF_CAP_BYTES
+    big = "Y" * (_DIFF_CAP_BYTES + 50000)
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = big if cmd[:2] == ["git", "diff"] else ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    diff_path = tmp_path / "task-1" / "diff.patch"
+    body = diff_path.read_text(encoding="utf-8")
+    assert len(body.encode("utf-8")) <= _DIFF_CAP_BYTES + 100
+    assert "[truncated:" in body
+
+
+def test_execute_task_all_done_resume_writes_diff_patch(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D1: `resume_mode == "all_done"` skips Phase 3 but
+    still reaches the diff-write site. The diff.patch is created
+    (capturing the latest commit, however incomplete that may be
+    for multi-WIP-commit implementations — see §R3)."""
+    diff_body = "diff --git a/x b/x\n+last commit\n"
+
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        if cmd[:2] == ["git", "diff"]:
+            p.stdout = diff_body
+        else:
+            p.stdout = ""  # porcelain (not called on all_done route, but defensive)
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+    _seed_progress(tmp_path, 1, "- [x] one\n- [x] two")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    diff_path = tmp_path / "task-1" / "diff.patch"
+    assert diff_path.is_file()
+    assert diff_body in diff_path.read_text(encoding="utf-8")
+
+
+def test_execute_task_implementer_timeout_does_NOT_write_diff_patch(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D12: the implementer_timeout early-return short-
+    circuits before the diff-write site. No diff.patch is created.
+    The next attempt's runner pass writes one if it reaches Phase 4."""
+    def fake_run(cmd, **kwargs):
+        # Only invoked if execute_task reaches a subprocess site;
+        # the timeout early-return prevents that.
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+
+    def stub_timeout(*args, **kwargs):
+        claude._last_run_timed_out = True
+        return 1, ""
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub_timeout)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    diff_path = tmp_path / "task-1" / "diff.patch"
+    assert not diff_path.exists()
+    assert state.get(1)["status"] == "blocked"
+
+
+def test_execute_task_implementer_max_turns_does_NOT_write_diff_patch(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D12: the implementer_max_turns early-return short-
+    circuits before the diff-write site. No diff.patch is created."""
+    def fake_run(cmd, **kwargs):
+        class P: pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.subprocess.run", fake_run,
+    )
+
+    def stub_max_turns(*args, **kwargs):
+        claude._last_run_subtype = "error_max_turns"
+        return 0, "ok"
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub_max_turns)
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    diff_path = tmp_path / "task-1" / "diff.patch"
+    assert not diff_path.exists()
+    assert state.get(1)["status"] == "blocked"

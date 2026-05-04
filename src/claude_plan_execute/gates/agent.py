@@ -41,12 +41,24 @@ def _load_template(path_or_inline: str) -> str:
 
 @dataclass
 class AgentGate:
-    """Runner for `kind: agent` Gates."""
+    """Runner for `kind: agent` Gates.
+
+    `diff_path` (T7, v0.3) is the path to the precomputed
+    implementation diff written by the runner immediately before
+    Phase 4. The substitution `body.replace("{diff_path}",
+    self.diff_path or "")` runs after the template body is loaded
+    so agent-gate templates can reference the diff via
+    `{diff_path}` placeholder. Persona substitution still happens
+    at factory time (per gate); diff_path substitution happens
+    here at gate-run time because the diff is per-task and not
+    known until implement finishes. (Plan §D2 / §D3.)
+    """
 
     name: str
     gate: Gate
     task: dict
     cli: dict
+    diff_path: str | None = None
 
     def run(self) -> GateResult:
         if self.gate.kind != "agent":
@@ -59,6 +71,7 @@ class AgentGate:
             )
 
         body = _load_template(self.gate.prompt_template)
+        body = body.replace("{diff_path}", self.diff_path or "")
         prompt = (
             f"You are running a post-implement gate for the "
             f"following task.\n\n"

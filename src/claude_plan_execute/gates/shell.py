@@ -17,19 +17,26 @@ from claude_plan_execute.gates import Gate, GateResult
 _OUTPUT_CAP_BYTES = 100 * 1024  # 100 KB; matches enhancement plan §2.1
 
 
-def _tail_cap(text: str) -> str:
-    """Tail-truncate `text` to fit within _OUTPUT_CAP_BYTES UTF-8 bytes.
+def _tail_cap(text: str, cap: int = _OUTPUT_CAP_BYTES) -> str:
+    """Tail-truncate `text` to fit within `cap` UTF-8 bytes (default
+    `_OUTPUT_CAP_BYTES`, 100 KB).
 
     Prepends a `[truncated: <N> bytes omitted at head]` marker when
     truncation happens. Tail-cap (not head-cap) preserves the most
     actionable signal — the end of test output, the final exit
     summary. (Plan §D8.)
+
+    Task 7 (v0.3) added the `cap` keyword for runner-side reuse:
+    `runner._capture_implement_diff` calls with `cap=_DIFF_CAP_BYTES`
+    (256 KB) for the precomputed diff artifact. The default
+    preserves every pre-task-7 caller's behavior (100 KB for gate
+    output).
     """
     encoded = text.encode("utf-8")
-    if len(encoded) <= _OUTPUT_CAP_BYTES:
+    if len(encoded) <= cap:
         return text
-    omitted = len(encoded) - _OUTPUT_CAP_BYTES
-    tailed = encoded[-_OUTPUT_CAP_BYTES:].decode("utf-8", errors="ignore")
+    omitted = len(encoded) - cap
+    tailed = encoded[-cap:].decode("utf-8", errors="ignore")
     return f"[truncated: {omitted} bytes omitted at head]\n{tailed}"
 
 

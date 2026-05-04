@@ -639,6 +639,72 @@ def test_agent_gate_skip_permissions_defaults_to_False(monkeypatch):
     assert captured["kwargs"]["verbose"] is False
 
 
+def test_agent_gate_substitutes_diff_path_in_inline_template(monkeypatch):
+    """Pin T7 §D3 / §D7: AgentGate.diff_path is substituted into
+    `{diff_path}` placeholders via .replace() on the loaded body.
+    Inline-body case — the substitution happens after _load_template
+    falls through (path-too-long → OSError → verbatim return)."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent",
+             prompt_template="The diff is at: {diff_path}\nDone.")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={}, diff_path="/tmp/foo/diff.patch",
+    ).run()
+    assert "The diff is at: /tmp/foo/diff.patch" in captured["prompt"]
+    assert "{diff_path}" not in captured["prompt"]
+
+
+def test_agent_gate_substitutes_diff_path_in_file_template(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D3: file-loaded body case — _load_template reads the
+    file, AgentGate.run() substitutes {diff_path} on the returned
+    body. Identical user-facing behavior to inline-body case."""
+    captured = _stub_run_claude(monkeypatch)
+    template_path = tmp_path / "tmpl.md"
+    template_path.write_text("Diff at: {diff_path}")
+    g = Gate(kind="agent", prompt_template=str(template_path))
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={}, diff_path="/path/to/diff.patch",
+    ).run()
+    assert "Diff at: /path/to/diff.patch" in captured["prompt"]
+    assert "{diff_path}" not in captured["prompt"]
+
+
+def test_agent_gate_diff_path_None_substitutes_with_empty_string(monkeypatch):
+    """Pin T7 §D3: `diff_path=None` (the default) replaces
+    `{diff_path}` with the empty string, NOT the literal token.
+    Avoids leaking template internals to the agent when callers
+    don't supply a diff_path (existing tests, future direct
+    callers without runner context)."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent", prompt_template="path={diff_path}|end")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},  # diff_path defaults to None
+    ).run()
+    assert "path=|end" in captured["prompt"]
+    assert "{diff_path}" not in captured["prompt"]
+
+
+def test_agent_gate_diff_path_default_is_None():
+    """Pin T7 §D7: the new `diff_path` field defaults to None so
+    every existing test call site (16 of them in this module)
+    keeps working without modification."""
+    g = Gate(kind="agent", prompt_template="x")
+    ag = AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},
+    )
+    assert ag.diff_path is None
+
+
 # ---------------------------------------------------------------------------
 # F. _tail_cap helper
 # ---------------------------------------------------------------------------
@@ -672,6 +738,24 @@ def test_tail_cap_keeps_tail_not_head():
     assert "TAILMARKER_AT_END" in out
     # The head portion should be truncated.
     assert out.count("HEAD") < text.count("HEAD")
+
+
+def test_tail_cap_respects_explicit_cap_kwarg():
+    """Pin T7 §D5: `_tail_cap` accepts a `cap=` kwarg that
+    overrides the default `_OUTPUT_CAP_BYTES`. The runner uses
+    this with `cap=_DIFF_CAP_BYTES` (256 KB) for the
+    precomputed-diff artifact; gate output keeps the 100 KB
+    default. Regression guard for the refactor: the kwarg path
+    must produce a body bounded by the new cap, not the old
+    constant."""
+    cap = 1024  # 1 KB — small for a fast assertion
+    text = "Z" * 5000  # 5 KB — well over the 1 KB cap
+    out = _tail_cap(text, cap=cap)
+    encoded = out.encode("utf-8")
+    # Cap + marker overhead (~50 bytes for "[truncated: <N>
+    # bytes omitted at head]\n") is the budget.
+    assert len(encoded) <= cap + 50
+    assert "[truncated:" in out
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +969,50 @@ def test_run_gates_exception_in_gate_yields_failed_result(monkeypatch, tmp_path)
     )
     assert results[0].passed is False
     assert "disk full" in (results[0].error or "")
+
+
+def test_run_gates_passes_diff_path_into_agent_gate(monkeypatch, tmp_path):
+    """Pin T7 §D7: run_gates computes
+    `str(task_dir / 'diff.patch')` and threads it to AgentGate
+    via _run_one. The agent's prompt body has the substituted
+    path."""
+    captured: list[tuple[str, dict]] = []
+
+    def fake_run_claude(prompt, **kwargs):
+        captured.append((prompt, kwargs))
+        return 0, "VERDICT: PASS\n"
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", fake_run_claude,
+    )
+    g = Gate(kind="agent",
+             prompt_template="diff_path is {diff_path}")
+    run_gates(
+        [("agent-gate", g)],
+        task={"id": 7, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert len(captured) == 1
+    expected = str(tmp_path / "diff.patch")
+    assert f"diff_path is {expected}" in captured[0][0]
+
+
+def test_run_gates_diff_path_threading_does_NOT_affect_shell_gates(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D8: ShellGate has no template substitution surface.
+    Threading diff_path through _run_one is a no-op for shell-kind
+    gates. The shell gate runs unchanged; no error from the
+    diff_path kwarg presence."""
+    _stub_subprocess_run_global(monkeypatch, stdout="ok\n")
+    g = Gate(kind="shell", command=("true",))
+    results = run_gates(
+        [("shell-only", g)],
+        task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert len(results) == 1
+    assert results[0].passed is True
 
 
 # ---------------------------------------------------------------------------

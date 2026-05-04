@@ -335,6 +335,17 @@ def test_make_test_critique_gate_template_body_starts_with_test_critique_header(
     assert "test-critique" in body.lower() or "test critic" in body.lower()
 
 
+def test_test_critique_template_references_diff_path_placeholder():
+    """Pin T7 §D9: the test-critique template body contains the
+    literal `{diff_path}` placeholder so AgentGate.run() can
+    substitute it. File-content assertion (before any rendering
+    by AgentGate). Regression guard against a future template
+    rewrite that drops the placeholder."""
+    g = default_registry().get("test-critique")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "{diff_path}" in body
+
+
 # ---------------------------------------------------------------------------
 # H. security-auditor built-in agent gate (task 16)
 # ---------------------------------------------------------------------------
@@ -472,6 +483,17 @@ def test_security_auditor_template_body_starts_with_recognizable_header():
         "security-auditor" in body.lower()
         or "security auditor" in body.lower()
     )
+
+
+def test_security_auditor_template_references_diff_path_placeholder():
+    """Pin T7 §D9: the security-auditor template body contains
+    the literal `{diff_path}` placeholder so AgentGate.run() can
+    substitute it. File-content assertion (before any rendering
+    by AgentGate). Regression guard against a future template
+    rewrite that drops the placeholder."""
+    g = default_registry().get("security-auditor")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "{diff_path}" in body
 
 
 def test_test_critique_and_security_auditor_are_both_registered():

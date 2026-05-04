@@ -11,6 +11,7 @@ from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
 from claude_plan_execute.gates import Gate, default_registry, run_gates
+from claude_plan_execute.gates.shell import _tail_cap
 from claude_plan_execute.gates.builtin import (
     make_design_fidelity_gate,
     make_lint_gate,
@@ -33,6 +34,14 @@ from claude_plan_execute.prompts import (
     parse_progress_status,
 )
 from claude_plan_execute.state import State, make_failure_record
+
+
+# T7 §D5: 256 KB cap for the precomputed implement-diff artifact.
+# Larger than gates/shell.py:_OUTPUT_CAP_BYTES (100 KB) because
+# diffs are denser context than test logs (operator-debug value
+# justifies the larger budget). The same `_tail_cap` algorithm
+# services both — see gates/shell.py:_tail_cap docstring.
+_DIFF_CAP_BYTES = 256 * 1024
 
 
 def check_verdict(review_path: Path) -> tuple[bool, str]:
@@ -383,6 +392,16 @@ def execute_task(
             print(red(f"\n  Task {tid} blocked: implementer max-turns."))
             return
 
+    # --- POST-IMPLEMENT: precompute diff for agent gates (task 7 v0.3) ---
+    # Runs unconditionally before Phase 4 (even when no gates are
+    # configured) so the artifact has standalone operator-debug
+    # value. Empty diff → empty file; templates handle that branch.
+    # T9 will pass branch_per_task / base_branch kwargs once the
+    # branch primitives ship; T7's call uses the HEAD~1..HEAD
+    # default. (Plan §D1 / §D6.)
+    diff_text = _capture_implement_diff()
+    (task_dir / "diff.patch").write_text(diff_text, encoding="utf-8")
+
     # --- PHASE 4: GATES (task 11) ---
     # `defaults.gates` (project-level list of names) + `phases[i].
     # defaults.gates_extra` (phase overlay). Names are resolved
@@ -566,6 +585,47 @@ def _capture_git_porcelain() -> str:
     if proc.returncode != 0:
         return ""
     return proc.stdout
+
+
+def _capture_implement_diff(
+    *, branch_per_task: bool = False, base_branch: str = "main",
+) -> str:
+    """Run `git diff HEAD~1..HEAD` (or `origin/{base_branch}...HEAD`
+    when `branch_per_task=True`) and return stdout tail-capped at
+    `_DIFF_CAP_BYTES` (256 KB).
+
+    On any failure (no git binary, no HEAD~1, non-zero exit,
+    timeout) returns ''. The caller writes the result to
+    `{task_dir}/diff.patch` unconditionally so agent-gate
+    templates can substitute `{diff_path}` and read the file —
+    even an empty file has a meaningful "diff is empty, read
+    source" branch in those templates.
+
+    T7 ships with the HEAD~1..HEAD form (`branch_per_task=False`
+    default). T9 will set the kwargs from the resolver chain
+    when its `branch_per_task` switch is on; the call site at
+    runner.py:<post-Phase-3> changes; this helper does not.
+    See plan §D6.
+
+    Defensive against the same failure modes as
+    `_capture_git_porcelain`: missing git binary, non-git working
+    tree, permissions error, slow/stuck git invocation. The
+    timeout is 30 seconds (vs 10 for porcelain) — diffs can be
+    heavier on large repos.
+    """
+    if branch_per_task:
+        cmd = ["git", "diff", f"origin/{base_branch}...HEAD"]
+    else:
+        cmd = ["git", "diff", "HEAD~1..HEAD"]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return _tail_cap(proc.stdout, cap=_DIFF_CAP_BYTES)
 
 
 def handle_sigint(signum, frame):

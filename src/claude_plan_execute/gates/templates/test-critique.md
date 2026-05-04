@@ -10,12 +10,23 @@ actual contract being delivered.
    yourself. The implement step has just landed a single
    commit; HEAD should be that commit.
 
-2. Run `git diff HEAD~1 HEAD` to see the full implement diff.
-   If `HEAD~1` does not exist (first commit) or the diff is
-   empty, run `git diff` to see uncommitted changes and proceed
-   with what's there. If there is no git history at all, emit
-   `VERDICT: FAIL` with an explanation that the gate cannot
-   evaluate without a diff.
+2. Read the precomputed implementation diff at `{diff_path}`.
+   The runner wrote it immediately after the implement phase
+   (against `HEAD~1..HEAD`), so it captures the exact work this
+   gate is evaluating. Read it before reading source files —
+   the diff is the contract surface for this gate.
+
+   - If the file is empty, the diff is empty (no-op task —
+     docs-only change, refactor with full coverage, trivial
+     fix). In that case fall back to reading source files
+     directly to evaluate the change. (Note: on a true no-op,
+     the "Special cases / Zero new tests in the diff" guidance
+     below still applies.)
+   - If the file is missing entirely (not the runner's normal
+     behavior), run `git diff HEAD~1 HEAD` as a fallback.
+   - If neither approach yields a diff and there is no git
+     history at all, emit `VERDICT: FAIL` with an explanation
+     that the gate cannot evaluate without a diff.
 
 3. From the diff, identify which test files were added or
    modified. Test files typically live under `tests/`,

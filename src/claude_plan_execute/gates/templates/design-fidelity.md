@@ -27,6 +27,21 @@ You have access to these MCP tools:
 If any of these tools is unavailable, emit `VERDICT: FAIL` with
 "Playwright MCP not available" as the reason.
 
+## Implementation diff
+
+The runner has written the implementation diff to `{diff_path}`.
+While this gate primarily exercises the LIVE app (not the diff —
+see the "No production-relevant changes in the diff" special case
+below), reading the diff helps you SCOPE the audit:
+
+- New routes mentioned in the diff → exercise those specifically
+  in addition to the project's persona-named routes.
+- New components / changed selectors → focus contrast / structure
+  / focus-visible checks on them.
+- An empty `diff.patch` (no-op task) means use the standard route
+  discovery — `/` and any in-page navigation links. Still run all
+  three viewports.
+
 ## Steps
 
 1. Identify the key flows to verify. The project's persona

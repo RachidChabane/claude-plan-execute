@@ -12,12 +12,25 @@ in the codebase.
    yourself. The implement step has just landed a single
    commit; HEAD should be that commit.
 
-2. Run `git diff HEAD~1 HEAD` to see the full implement diff.
-   If `HEAD~1` does not exist (first commit) or the diff is
-   empty, run `git diff` to see uncommitted changes and proceed
-   with what's there. If there is no git history at all, emit
-   `VERDICT: FAIL` with an explanation that the gate cannot
-   evaluate without a diff.
+2. Read the precomputed implementation diff at `{diff_path}`.
+   The runner wrote it immediately after the implement phase
+   (against `HEAD~1..HEAD`), so it captures the exact work this
+   gate is evaluating. Read it first — the diff is the contract
+   surface for this gate. Then read the surrounding context for
+   each changed file (not just the hunks) so you can judge
+   whether changed lines introduce a vulnerability in the broader
+   file context.
+
+   - If the file is empty, the diff is empty (no-op task —
+     docs-only change, comment-only edit, fixture-only). In
+     that case the "No production changes in the diff" special
+     case below applies; emit `VERDICT: PASS` with a one-
+     sentence Reason.
+   - If the file is missing entirely (not the runner's normal
+     behavior), run `git diff HEAD~1 HEAD` as a fallback.
+   - If neither approach yields a diff and there is no git
+     history at all, emit `VERDICT: FAIL` with an explanation
+     that the gate cannot evaluate without a diff.
 
 3. From the diff, identify which production files were added
    or modified (anything outside test directories, fixtures,
