@@ -558,13 +558,15 @@ def execute_task(
 
         # --- PHASE 4: GATES (task 11) ---
         # `defaults.gates` (project-level list of names) + `phases[i].
-        # defaults.gates_extra` (phase overlay). Names are resolved
-        # against the default registry; unknown names produce a single
-        # warning and are skipped (forward-compat with task 12+
-        # registering built-ins).
+        # defaults.gates_extra` (phase overlay) + `task.gates_extra`
+        # (per-task overlay, v0.3 task 4). Layers concatenate in that
+        # order; no subtraction. Names are resolved against the default
+        # registry; unknown names produce a single warning and are
+        # skipped (forward-compat with task 12+ registering built-ins).
         gate_names_project = list(file_defaults.get("gates") or [])
         gate_names_phase = list(phase_dict.get("gates_extra") or [])
-        gate_names = gate_names_project + gate_names_phase
+        gate_names_task = list(task.get("gates_extra") or [])
+        gate_names = gate_names_project + gate_names_phase + gate_names_task
         if gate_names:
             from claude_plan_execute.gates.invariants import loaded_invariant_names
             invariant_names = loaded_invariant_names()

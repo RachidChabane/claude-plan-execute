@@ -167,6 +167,7 @@ class Task(BaseModel):
     implement_max_turns: int | None = None
     max_review_rounds: int | None = None
     services_required_extra: list[str] | None = None
+    gates_extra: list[str] | None = None
 
 
 class TasksFile(BaseModel):

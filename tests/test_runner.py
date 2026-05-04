@@ -2828,6 +2828,157 @@ def test_execute_task_phase_gates_extra_appended_to_project_gates(
     assert sorted(invoked) == ["PHASE", "PROJ"]
 
 
+def test_execute_task_task_gates_extra_runs_with_no_project_or_phase(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """v0.3 task 4 §2.21: a task-level gates_extra runs even when
+    defaults.gates is empty and no phase overlay is configured."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] != ["git", "diff"]:
+            invoked.append(cmd[0])
+
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _clean_default_registry.register(
+        "g-task", Gate(kind="shell", command=("TASK",)),
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, gates_extra=["g-task"]), state,
+        file_defaults={"plans_dir": str(tmp_path)},  # no 'gates' key
+        cli={}, skip_to="implement",
+    )
+    assert invoked == ["TASK"]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_task_gates_extra_appended_to_phase_gates_extra(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """v0.3 task 4 §2.21: task gates_extra is appended after phase
+    gates_extra. Mirrors test_execute_task_phase_gates_extra_appended_
+    to_project_gates at line 2796."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    invoked: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] != ["git", "diff"]:
+            invoked.append(cmd[0])
+
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    _clean_default_registry.register(
+        "g-phase", Gate(kind="shell", command=("PHASE",)),
+    )
+    _clean_default_registry.register(
+        "g-task",  Gate(kind="shell", command=("TASK",)),
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="ui", gates_extra=["g-task"]), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+        phases_by_id={"ui": {"id": "ui",
+                             "defaults": {"gates_extra": ["g-phase"]}}},
+        skip_to="implement",
+    )
+    assert sorted(invoked) == ["PHASE", "TASK"]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_three_layer_gates_concat_order_is_project_phase_task(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """v0.3 task 4 §2.21: the resolved gate list passed into run_gates is
+    project + phase + task in that order. Pin via a run_gates spy because
+    parallel_safe shell gates run in a ThreadPoolExecutor and subprocess
+    invocation order can't pin concat order."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register("g-proj",
+        Gate(kind="shell", command=("PROJ",)))
+    _clean_default_registry.register("g-phase",
+        Gate(kind="shell", command=("PHASE",)))
+    _clean_default_registry.register("g-task",
+        Gate(kind="shell", command=("TASK",)))
+
+    captured: dict = {}
+    real_run_gates = runner.run_gates
+
+    def spy(resolved_gates, **kwargs):
+        captured["names"] = [n for (n, _g) in resolved_gates]
+        return real_run_gates(resolved_gates, **kwargs)
+    monkeypatch.setattr("claude_plan_execute.runner.run_gates", spy)
+
+    # Stub the actual gate execution so the spy result is the only
+    # thing we assert on.
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, phase="ui", gates_extra=["g-task"]), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["g-proj"]},
+        cli={},
+        phases_by_id={"ui": {"id": "ui",
+                             "defaults": {"gates_extra": ["g-phase"]}}},
+        skip_to="implement",
+    )
+    assert captured["names"] == ["g-proj", "g-phase", "g-task"]
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_task_gates_extra_unknown_name_warns_and_proceeds(
+    monkeypatch, tmp_path, capsys, _clean_default_registry,
+):
+    """v0.3 task 4 §2.21: a typo in a task-level gate NAME (the field
+    itself is correctly spelled) produces the existing 'Unknown gate(s)
+    skipped' warning, not a hard error. Mirrors
+    test_execute_task_with_unknown_gate_name_warns_and_proceeds_to_done
+    at line 2674; only difference is the unknown name lives in
+    task.gates_extra rather than defaults.gates."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, gates_extra=["definitely-unknown"]), state,
+        file_defaults={"plans_dir": str(tmp_path)},  # no project gates
+        cli={}, skip_to="implement",
+    )
+    out = capsys.readouterr().out
+    assert "Unknown gate(s)" in out
+    assert "definitely-unknown" in out
+    assert state.get(1)["status"] == "done"
+
+
 def test_execute_task_blocking_gate_does_NOT_set_done(
     monkeypatch, tmp_path, _clean_default_registry,
 ):

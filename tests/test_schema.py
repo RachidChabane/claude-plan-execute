@@ -1183,3 +1183,41 @@ def test_duplicate_service_names_rejected(tmp_path, capsys):
         loader.load_tasks_file(p)
     err = capsys.readouterr().err
     assert "Duplicate service names" in err
+
+
+# --- P. Task.gates_extra (v0.3 task 4 §2.21) ------------------------------
+
+
+def test_task_accepts_gates_extra():
+    """Task §2.21: Task.gates_extra is a list[str] | None."""
+    t = Task(id=1, title="T", description="D",
+             gates_extra=["lint", "design-fidelity"])
+    assert t.gates_extra == ["lint", "design-fidelity"]
+
+
+def test_task_gates_extra_defaults_to_None():
+    """Task §2.21: gates_extra defaults to None when unset."""
+    t = Task(id=1, title="T", description="D")
+    assert t.gates_extra is None
+
+
+def test_task_typo_gate_extra_singular_rejected_with_suggestion(
+    tmp_path, capsys,
+):
+    """Task §2.21: extra='forbid' on Task catches the singular typo
+    `gate_extra` (no trailing s) and difflib suggests `gates_extra`.
+    Mirrors test_typo_lint_cmd_suggests_lint_command at line 701."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - id: 1\n"
+        "    title: T\n"
+        "    description: D\n"
+        "    gate_extra: [lint]\n"   # typo (no trailing s)
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "gate_extra" in err
+    assert "Did you mean 'gates_extra'?" in err
