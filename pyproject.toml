@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-plan-execute"
-version = "0.2.0"
+version = "0.3.0"
 description = "Automated plan-review-implement workflow for Claude Code."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,5 +1,11 @@
 # Migrating from tasks.yaml version 1 → version 2
 
+> **Looking for the v0.2 → v0.3 guide?** See
+> [docs/migration-v3.md](migration-v3.md). The v0.3 release adds new
+> opt-in primitives (services, branch_per_task, human gates, structured
+> findings) with no breaking changes — your existing v0.2 task files
+> load and run unchanged.
+
 ## Overview
 
 Version 2 is a strict superset of version 1. The only **required** change is bumping `version: 1` to `version: 2`. All new keys (`caps`, `phases`, `task_class_models`, etc.) are optional. Version 1 files continue to load without error — the loader preserves backward compatibility and injects sensible defaults for any keys you have not set.
