@@ -5,6 +5,7 @@ import argparse
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +23,59 @@ from claude_plan_execute.loader import (
 )
 from claude_plan_execute.runner import execute_task, handle_sigint
 from claude_plan_execute.state import State
+
+
+def run_preflight(file_defaults: dict) -> int:
+    """Run the project's baseline gates once, before the task loop.
+
+    Returns 0 if every configured baseline gate passes; non-zero if any fail.
+    The slate-runner aborts on non-zero so a single broken pre-existing test
+    can't cascade into N blocked tasks. Bypass with --skip-preflight.
+
+    Currently checks `tests` (always, when test_command is set) and `lint`
+    (when defaults.lint_command is set). Untranslated-strings is project-
+    specific and not part of the baseline check; nor is design-fidelity
+    (it requires a running dev server).
+    """
+    checks: list[tuple[str, str]] = []
+    test_cmd = file_defaults.get("test_command")
+    lint_cmd = file_defaults.get("lint_command")
+    if test_cmd:
+        checks.append(("tests", test_cmd))
+    if lint_cmd:
+        checks.append(("lint", lint_cmd))
+    if not checks:
+        return 0
+
+    print(bold("\n--- Preflight: baseline gates ---"))
+    failed: list[tuple[str, str, str]] = []
+    for name, cmd in checks:
+        print(dim(f"  {name}: {cmd}"))
+        proc = subprocess.run(
+            ["bash", "-c", cmd], capture_output=True, text=True,
+        )
+        if proc.returncode == 0:
+            print(green(f"    PASS"))
+        else:
+            tail = (proc.stdout or "") + (proc.stderr or "")
+            print(red(f"    FAIL (exit {proc.returncode})"))
+            failed.append((name, cmd, tail[-3000:]))
+
+    if not failed:
+        return 0
+
+    print(red(
+        f"\nPreflight detected {len(failed)} broken baseline gate"
+        f"{'s' if len(failed) != 1 else ''}. Refusing to start the slate.\n"
+        f"A pre-existing failure here would otherwise block every task in\n"
+        f"the slate. Fix the baseline first, then re-run.\n"
+        f"(To bypass: --skip-preflight.)\n"
+    ))
+    for name, cmd, tail in failed:
+        print(red(f"=== {name} ({cmd}) — last 3000 chars ==="))
+        print(tail)
+        print()
+    return 1
 
 
 def cmd_decisions_index(args) -> int:
@@ -120,6 +174,8 @@ def main():
                         help="Pass --dangerously-skip-permissions to claude")
     parser.add_argument("--verbose", action="store_true", help="Pass --verbose to claude")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip the baseline tests/lint preflight check before the task loop")
     args = parser.parse_args()
 
     if getattr(args, "no_color", False):
@@ -216,6 +272,14 @@ def main():
 
     # Validate dependencies and get execution order
     ordered_tasks = validate_dependencies(tasks)
+
+    # Preflight: refuse to start when the baseline tests/lint already fail.
+    # A single pre-existing failure here would otherwise cascade through
+    # every task's gate phase. Bypass with --skip-preflight, or skip
+    # implicitly when --task / --reset / --list / --status / --dry-run.
+    if not args.skip_preflight and not args.task and not args.dry_run:
+        if run_preflight(file_defaults) != 0:
+            sys.exit(1)
 
     # Install SIGINT handler
     signal.signal(signal.SIGINT, handle_sigint)
