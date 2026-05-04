@@ -22,6 +22,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import pathspec
+from pathspec.patterns import GitWildMatchPattern
+
 from claude_plan_execute.colors import dim, red, yellow
 
 # ---------------------------------------------------------------------------
@@ -144,28 +147,64 @@ def _when_matches(when: tuple[str, ...], task: dict) -> tuple[bool, str]:
       - empty tuple, or any tuple containing "always" → match.
       - "task_class:<name>" → matches when task["task_class"] == "<name>".
         Multiple `task_class:<name>` tokens in the same `when` are OR-ed.
-      - any other token, in absence of "always" or a matching
-        task_class — no match (skipped with a passive-result reason).
+      - "touches:<glob>" → matches when any gitignore-style glob in the
+        `when` tuple matches any path in `task["key_files"]`. Globs use
+        `pathspec.GitWildMatchPattern` semantics — path-component aware,
+        gitignore-equivalent. Multiple `touches:<glob>` tokens are OR-ed
+        (so `["touches:**/auth/**", "touches:**/api/**"]` matches a task
+        whose key_files touches EITHER subtree). To get AND semantics,
+        declare multiple gates each with one pattern.
+      - `task_class` and `touches` ALSO OR across categories: a `when`
+        of `["task_class:ui", "touches:**/auth/**"]` matches if either
+        the class OR any glob matches.
+      - any unrecognised token, in absence of "always" or a matching
+        predicate — no match (skipped with a passive-result reason).
 
-    Future tasks add cases here:
-      - "touches:<glob>"     (enhancement plan §2.1)
+    The `touches:` matcher uses pathspec rather than stdlib fnmatch
+    because fnmatch lacks path-component awareness: `*` matches `/`,
+    so `src/api/*.py` over-matches `src/api/v1/users.py`, and
+    `**/auth/**` under-matches `auth/foo.py` at the leading edge.
+    See plans/task-3/plan.md §"Documented deviations" for the
+    empirical comparison.
     """
     if not when or "always" in when:
         return True, "always"
 
-    actual = task.get("task_class")
+    actual_class = task.get("task_class")
     class_tokens = [t for t in when if t.startswith("task_class:")]
+    touch_tokens = [t for t in when if t.startswith("touches:")]
+
+    # task_class branch — cheap, runs first.
     if class_tokens:
         wanted = {t[len("task_class:"):] for t in class_tokens}
-        if actual in wanted:
-            return True, f"task_class={actual!r}"
-        return False, (
-            f"task_class={actual!r} not in {sorted(wanted)}"
-        )
+        if actual_class in wanted:
+            return True, f"task_class={actual_class!r}"
+        # task_class miss falls through to touches; do NOT return False yet.
 
+    # touches branch — gitignore-style glob match against key_files.
+    if touch_tokens:
+        patterns = [t[len("touches:"):] for t in touch_tokens]
+        spec = pathspec.PathSpec.from_lines(GitWildMatchPattern, patterns)
+        key_files = task.get("key_files") or []
+        matched = [kf for kf in key_files if spec.match_file(kf)]
+        if matched:
+            return True, f"touches=match:{matched[:3]}"
+
+    # Recognised predicates considered, none matched.
+    if class_tokens or touch_tokens:
+        parts: list[str] = []
+        if class_tokens:
+            wanted = sorted({t[len("task_class:"):] for t in class_tokens})
+            parts.append(f"task_class={actual_class!r} not in {wanted}")
+        if touch_tokens:
+            patterns = [t[len("touches:"):] for t in touch_tokens]
+            key_files = task.get("key_files") or []
+            parts.append(f"touches={patterns} not in key_files={key_files}")
+        return False, "; ".join(parts)
+
+    # No recognised matcher tokens at all.
     return False, (
-        f"when={list(when)} not implemented in v1 "
-        f"(future task adds matchers)"
+        f"when={list(when)} not implemented (no recognised matcher)"
     )
 
 

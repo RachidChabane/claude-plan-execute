@@ -225,12 +225,145 @@ def test_when_matches_always_wins_over_task_class():
     assert ok is True
 
 
-def test_when_matches_touches_glob_does_not_match_in_task_11():
-    """Task 11 defers `touches:<glob>` matchers; task 20 does NOT add
-    them. Verifies non-task_class non-always tokens still fall through
-    to the 'not implemented' branch."""
-    ok, _ = _when_matches(("touches:src/auth/**",), {"id": 1})
+def test_when_matches_touches_with_no_key_files_attribute():
+    """Task 3 case (c): a task with no `key_files` key on the dict
+    yields an empty key-files list; touches patterns can't match
+    anything; result is False with a touches=... not in key_files=[]
+    reason."""
+    ok, reason = _when_matches(("touches:src/auth/**",), {"id": 1})
     assert ok is False
+    assert "touches=" in reason
+    assert "key_files=[]" in reason
+
+
+# --- task 3: touches:<glob> matcher (gitignore-style globs) ---
+
+def test_when_matches_touches_recursive_double_star_matches_at_any_depth():
+    """Task 3 case (a) — the design-critical bug-lock test.
+
+    `touches:**/auth/**` MUST match `frontend/src/auth/Login.tsx`
+    via gitignore semantics. stdlib fnmatch handles this case
+    accidentally correctly (see plan §"Documented deviations"),
+    but fails on `auth/foo.py` and over-matches `src/api/*.py`
+    against `src/api/v1/users.py`. Pathspec's GitWildMatchPattern
+    is the contract; this test pins that the contract is what
+    we ship."""
+    ok, reason = _when_matches(
+        ("touches:**/auth/**",),
+        {"id": 1, "key_files": ["frontend/src/auth/Login.tsx"]},
+    )
+    assert ok is True
+    assert "frontend/src/auth/Login.tsx" in reason
+
+
+def test_when_matches_touches_recursive_double_star_matches_at_root_depth():
+    """Task 3 case (a) extended: gitignore's leading `**/` matches
+    zero or more path components. `touches:**/auth/**` must match
+    `auth/foo.py` (no prefix). This is the under-match case stdlib
+    fnmatch gets wrong."""
+    ok, _ = _when_matches(
+        ("touches:**/auth/**",),
+        {"id": 1, "key_files": ["auth/foo.py"]},
+    )
+    assert ok is True
+
+
+def test_when_matches_touches_single_component_glob_does_not_cross_directories():
+    """Task 3 case (b): `src/api/*.py` matches `src/api/users.py`
+    but NOT `src/api/v1/users.py`. This is the over-match case
+    stdlib fnmatch gets wrong; pathspec's path-component awareness
+    is the fix."""
+    ok, reason = _when_matches(
+        ("touches:src/api/*.py",),
+        {"id": 1, "key_files": ["src/api/users.py"]},
+    )
+    assert ok is True
+    assert "src/api/users.py" in reason
+
+    # Pin the negative half — a deeper path does NOT match.
+    ok2, _ = _when_matches(
+        ("touches:src/api/*.py",),
+        {"id": 1, "key_files": ["src/api/v1/users.py"]},
+    )
+    assert ok2 is False
+
+
+def test_when_matches_touches_with_empty_key_files_list():
+    """Task 3 case (d): `key_files: []` (explicit empty list)
+    yields no matches. Distinct from case (c) which has no
+    key_files key at all; both produce False but exercise
+    different code paths in `task.get('key_files') or []`."""
+    ok, reason = _when_matches(
+        ("touches:src/auth/**",),
+        {"id": 1, "key_files": []},
+    )
+    assert ok is False
+    assert "key_files=[]" in reason
+
+
+def test_when_matches_mixed_task_class_and_touches_passes_when_task_class_matches():
+    """Task 3 case (e): `when=[task_class:ui, touches:**/auth/**]`
+    on a task with `task_class=ui` (and key_files that DON'T match
+    the glob) PASSES via the task_class branch. Verifies task_class
+    short-circuits success without reaching touches."""
+    ok, reason = _when_matches(
+        ("task_class:ui", "touches:**/auth/**"),
+        {"id": 1, "task_class": "ui", "key_files": ["src/random.go"]},
+    )
+    assert ok is True
+    assert "task_class='ui'" in reason
+
+
+def test_when_matches_touches_negative_match_with_unrelated_key_files():
+    """Task 3 case (f): a touches glob with no matching key_file
+    returns False. Reason names the patterns and the (non-matching)
+    key_files for diagnosis."""
+    ok, reason = _when_matches(
+        ("touches:**/auth/**",),
+        {"id": 1, "key_files": ["src/random.go", "tests/test_x.py"]},
+    )
+    assert ok is False
+    assert "touches=['**/auth/**']" in reason
+    assert "src/random.go" in reason
+
+
+def test_when_matches_multiple_touches_or_semantics():
+    """Pin OR-of-touches: `[touches:A, touches:B]` matches if
+    EITHER pattern matches any key_file. The matched-files list
+    in the reason includes only files matched by the spec
+    (regardless of which pattern matched them)."""
+    ok, reason = _when_matches(
+        ("touches:**/auth/**", "touches:**/api/**"),
+        {"id": 1, "key_files": ["src/api/users.py"]},
+    )
+    assert ok is True
+    assert "src/api/users.py" in reason
+
+
+def test_when_matches_falls_through_from_task_class_miss_to_touches_match():
+    """Pin §D3: the load-bearing control-flow change. A `when` with
+    BOTH `task_class:ui` and `touches:**/auth/**` on a task whose
+    task_class is NOT ui but whose key_files ARE under auth/ MUST
+    pass via touches. Pre-task-3, the eager `False` return in the
+    task_class branch blocked this. Locks the new fall-through."""
+    ok, reason = _when_matches(
+        ("task_class:ui", "touches:**/auth/**"),
+        {"id": 1, "task_class": "schema", "key_files": ["src/auth/api.py"]},
+    )
+    assert ok is True
+    assert "src/auth/api.py" in reason
+
+
+def test_when_matches_always_wins_over_touches():
+    """Pin §D4 rule 1 extended to touches: `('touches:**/x/**', 'always')`
+    on a task with no matching key_files still PASSES because
+    `always` short-circuits all predicate checks."""
+    ok, reason = _when_matches(
+        ("touches:**/x/**", "always"),
+        {"id": 1, "key_files": ["src/random.go"]},
+    )
+    assert ok is True
+    assert reason == "always"
 
 
 # ---------------------------------------------------------------------------
