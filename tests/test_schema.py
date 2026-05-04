@@ -1370,3 +1370,225 @@ def test_task_accepts_memory_curation_threshold_override():
     t = Task(id=1, title="T", description="D",
              memory_curation_threshold=25)
     assert t.memory_curation_threshold == 25
+
+
+# --- Q. Parallelism (T13 v0.3 §2.5) ---------------------------------------
+
+def test_defaults_accepts_parallelism_field():
+    """T13 §F1.1: Defaults gains parallelism: int | None field."""
+    d = Defaults(parallelism=4)
+    assert d.parallelism == 4
+
+
+def test_defaults_parallelism_defaults_to_none():
+    """T13 §D6: parallelism unset → None; runner reads `or 1`."""
+    d = Defaults()
+    assert d.parallelism is None
+
+
+def test_defaults_parallelism_typo_paralelism_suggests_correction(
+    tmp_path, capsys,
+):
+    """T13 §F1.3: typo `paralelism` rejected with difflib hint."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  paralelism: 2\n"     # typo
+        "  branch_per_task: true\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "paralelism" in err
+    assert "Did you mean 'parallelism'?" in err
+
+
+def test_parallelism_eq_1_does_NOT_require_branch_per_task(tmp_path):
+    """T13 §F1.2: parallelism=1 is the default-equivalent and does
+    NOT trip the interlock — backward compat."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 1\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.parallelism == 1
+
+
+def test_parallelism_gt_1_without_branch_per_task_rejected(
+    tmp_path, capsys,
+):
+    """T13 §F1.2 / §D5: the headline interlock — parallelism>1 +
+    branch_per_task=false is a hard load-time error."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "parallelism" in err
+    assert "branch_per_task" in err
+    assert "race" in err
+
+
+def test_parallelism_gt_1_with_explicit_branch_per_task_false_rejected(
+    tmp_path, capsys,
+):
+    """T13 §D5: explicit `branch_per_task: false` ALSO trips the
+    interlock — the user must set true (no implicit-None acceptance)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 3\n"
+        "  branch_per_task: false\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "branch_per_task" in err
+
+
+def test_parallelism_gt_1_with_branch_per_task_true_validates(tmp_path):
+    """T13 §F1.2: the happy path — parallelism>1 + branch_per_task=true
+    loads cleanly."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 3\n"
+        "  branch_per_task: true\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.parallelism == 3
+    assert tf.defaults.branch_per_task is True
+
+
+def test_parallelism_gt_1_with_lifetime_task_service_rejected(
+    tmp_path, capsys,
+):
+    """T13 §F1.2 / §D5: second interlock — lifetime=task services
+    are unsafe under parallelism (multi-instance support is v0.4)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "  branch_per_task: true\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: \"true\"\n"
+        "    lifetime: task\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lifetime" in err
+    assert "dev" in err
+
+
+def test_parallelism_gt_1_with_lifetime_gate_service_rejected(
+    tmp_path, capsys,
+):
+    """T13 §F1.2: lifetime=gate services trip the same interlock."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "  branch_per_task: true\n"
+        "services:\n"
+        "  - name: gatesvc\n"
+        "    command: \"true\"\n"
+        "    lifetime: gate\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lifetime" in err
+    assert "gatesvc" in err
+
+
+def test_parallelism_gt_1_with_lifetime_phase_service_rejected(
+    tmp_path, capsys,
+):
+    """T13 §F1.2: lifetime=phase services trip the same interlock —
+    phase tracking has no meaning under parallelism."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "  branch_per_task: true\n"
+        "services:\n"
+        "  - name: phsvc\n"
+        "    command: \"true\"\n"
+        "    lifetime: phase\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lifetime" in err
+    assert "phsvc" in err
+
+
+def test_parallelism_gt_1_with_only_lifetime_run_services_validates(
+    tmp_path,
+):
+    """T13 §F1.2: lifetime=run services are SAFE under parallelism
+    (idempotent ensure, shared across workers)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "  branch_per_task: true\n"
+        "services:\n"
+        "  - name: db\n"
+        "    command: \"true\"\n"
+        "    lifetime: run\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.parallelism == 2
+
+
+def test_parallelism_eq_0_treated_as_unset(tmp_path):
+    """T13 §D6: parallelism: 0 is benignly accepted; runner's
+    `parallelism or 1` collapses to 1 (single worker)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 0\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.parallelism == 0

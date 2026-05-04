@@ -21,7 +21,12 @@ from claude_plan_execute.loader import (
     render_decisions_index,
     scan_decisions,
 )
-from claude_plan_execute.runner import execute_task, explain_task, handle_sigint
+from claude_plan_execute.runner import (
+    execute_task,
+    explain_task,
+    handle_sigint,
+    run_slate,
+)
 from claude_plan_execute.services import (
     ServiceManager,
     ServiceUnavailableError,
@@ -611,7 +616,6 @@ def main():
     # uncaught exception. The dry-run guard around ensure() mirrors
     # the §D4.4 / §D4.5 guards in the runner — no service work fires
     # in dry-run mode at any layer.
-    prev_phase: str | None = None
     try:
         if not args.dry_run:
             try:
@@ -648,52 +652,26 @@ def main():
                 all_task_ids=all_task_ids,
             )
         else:
-            for task in ordered_tasks:
-                s = state.get(task["id"])["status"]
-                if s == "done":
-                    print(dim(f"\n  Skipping task {task['id']} (done)"))
-                    continue
-                # Phase-boundary detection (Plan §D5.3): on phase
-                # change, tear down the previous phase's services and
-                # ensure the new phase's. Tear-downs are unconditional
-                # (no-op on stopped services); ensure() is dry-run
-                # guarded.
-                cur_phase = task.get("phase")
-                if cur_phase != prev_phase:
-                    if prev_phase is not None:
-                        service_manager.tear_down_for_scope("phase")
-                    if cur_phase is not None:
-                        pdict = (
-                            (phases_by_id.get(cur_phase) or {})
-                            .get("defaults") or {}
-                        )
-                        phase_required = list(
-                            pdict.get("services_required_extra") or []
-                        )
-                        phase_scope = [
-                            n for n in phase_required
-                            if service_manager.spec_lifetime(n) == "phase"
-                        ]
-                        if not args.dry_run:
-                            try:
-                                service_manager.ensure(phase_scope)
-                            except ServiceUnavailableError as exc:
-                                print(red(
-                                    f"Error: phase '{cur_phase}' service "
-                                    f"start failed: {exc}"
-                                ), file=sys.stderr)
-                                prev_phase = cur_phase
-                                continue
-                    prev_phase = cur_phase
-                execute_task(
-                    task, state, file_defaults, cli_overrides,
-                    phases_by_id=phases_by_id,
-                    task_class_models=task_class_models,
-                    skip_to=args.skip_to,
-                    dry_run=args.dry_run,
-                    service_manager=service_manager,
-                    all_task_ids=all_task_ids,
-                )
+            # T13 (v0.3 §2.5): replace the inline serial loop +
+            # phase-boundary tracking with a single call to
+            # `run_slate`. `parallelism=1` (the default) preserves
+            # v0.2.0 behavior — same task order, same phase tear-down,
+            # same state writes. `parallelism>1` activates concurrent
+            # workers (schema interlock guarantees lifetime=phase
+            # services are absent in that mode).
+            run_slate(
+                parallelism=(tasks_file_obj.defaults.parallelism or 1),
+                ordered_tasks=ordered_tasks,
+                all_task_ids=all_task_ids,
+                state=state,
+                file_defaults=file_defaults,
+                cli_overrides=cli_overrides,
+                phases_by_id=phases_by_id,
+                task_class_models=task_class_models,
+                service_manager=service_manager,
+                dry_run=args.dry_run,
+                skip_to=args.skip_to,
+            )
     finally:
         # Unconditional cleanup: idempotent on stopped services, so a
         # dry-run that started nothing pays zero cost here.

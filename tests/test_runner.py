@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -35,19 +36,11 @@ def _reset_module_globals(monkeypatch, tmp_path_factory):
     real ~/.claude/projects/... directory. Tests that need a writable
     memdir opt in via _stub_memory_dir(monkeypatch, tmp_path).
     """
-    claude._active_child = None
-    claude._last_run_timed_out = False
-    claude._last_run_subtype = None
-    claude._last_run_rate_limited = False
-    # T2 §D1: reset the five usage flags between tests.
-    claude._last_run_input_tokens = None
-    claude._last_run_output_tokens = None
-    claude._last_run_cache_read_tokens = None
-    claude._last_run_cache_creation_tokens = None
-    claude._last_run_duration_seconds = None
+    claude._active_child.clear()
+    claude._reset_last_run_state()
     runner._current_state = None
-    runner._current_task_id = 0
-    runner._current_phase = "plan"
+    runner._current_tasks.clear()
+    runner._worker_ids.clear()
 
     # T15: default isolation. Each test gets a fresh non-existent path
     # so neither citation pass nor lifecycle prune ever touches the
@@ -68,18 +61,11 @@ def _reset_module_globals(monkeypatch, tmp_path_factory):
     )
 
     yield
-    claude._active_child = None
-    claude._last_run_timed_out = False
-    claude._last_run_subtype = None
-    claude._last_run_rate_limited = False
-    claude._last_run_input_tokens = None
-    claude._last_run_output_tokens = None
-    claude._last_run_cache_read_tokens = None
-    claude._last_run_cache_creation_tokens = None
-    claude._last_run_duration_seconds = None
+    claude._active_child.clear()
+    claude._reset_last_run_state()
     runner._current_state = None
-    runner._current_task_id = 0
-    runner._current_phase = "plan"
+    runner._current_tasks.clear()
+    runner._worker_ids.clear()
 
 
 class FakePopen:
@@ -287,15 +273,16 @@ def test_check_verdict_returns_full_content_as_second_element(tmp_path):
 
 def test_kill_child_noop_when_no_active_child(monkeypatch):
     monkeypatch.setattr("claude_plan_execute.claude.subprocess.run", _stub_run)
-    claude._active_child = None
+    # Per T13 §F3.1: autouse fixture's `_active_child.clear()` already
+    # gives an empty dict; no per-thread entry → kill_child is a no-op.
     claude._kill_child()
-    assert claude._active_child is None
+    assert threading.get_ident() not in claude._active_child
 
 
 def test_kill_child_calls_terminate_on_running_child(monkeypatch):
     monkeypatch.setattr("claude_plan_execute.claude.subprocess.run", _stub_run)
     fake = FakePopen(["claude"])
-    claude._active_child = fake
+    claude._set_active_child(fake)
     claude._kill_child()
     # terminate sets _poll_returns to -15
     assert fake.poll() == -15
@@ -310,7 +297,7 @@ def test_kill_child_force_kills_after_terminate_timeout(monkeypatch):
 
     monkeypatch.setattr("claude_plan_execute.claude.subprocess.run", _stub_run)
     fake = FakePopenSlowToDie(["claude"])
-    claude._active_child = fake
+    claude._set_active_child(fake)
     claude._kill_child()
     # kill sets _poll_returns to -9 after the wait timeout
     assert fake.poll() == -9
@@ -326,7 +313,7 @@ def test_kill_child_invokes_pkill_with_minus_P_for_descendants(monkeypatch):
 
     monkeypatch.setattr("claude_plan_execute.claude.subprocess.run", fake_run)
     fake = FakePopen(["claude"])
-    claude._active_child = fake
+    claude._set_active_child(fake)
     claude._kill_child()
     assert captured["cmd"] == ["pkill", "-TERM", "-P", "12345"]
 
@@ -339,24 +326,24 @@ def test_kill_child_swallows_pkill_FileNotFoundError(monkeypatch):
         "claude_plan_execute.claude.subprocess.run", _stub_run_raises_fnf
     )
     fake = FakePopen(["claude"])
-    claude._active_child = fake
+    claude._set_active_child(fake)
     # Must not raise
     claude._kill_child()
-    assert claude._active_child is None
+    assert threading.get_ident() not in claude._active_child
 
 
 def test_kill_child_clears_active_child_to_none(monkeypatch):
     monkeypatch.setattr("claude_plan_execute.claude.subprocess.run", _stub_run)
-    claude._active_child = FakePopen(["claude"])
+    claude._set_active_child(FakePopen(["claude"]))
     claude._kill_child()
-    assert claude._active_child is None
+    assert threading.get_ident() not in claude._active_child
 
 
 def test_kill_child_does_NOT_terminate_already_exited_child(monkeypatch):
     monkeypatch.setattr("claude_plan_execute.claude.subprocess.run", _stub_run)
     fake = FakePopen(["claude"])
     fake._poll_returns = 0  # already exited
-    claude._active_child = fake
+    claude._set_active_child(fake)
     claude._kill_child()
     # If terminate() had run, _poll_returns would be -15. It must remain 0.
     assert fake.poll() == 0
@@ -508,7 +495,7 @@ def test_run_claude_clears_active_child_after_call(monkeypatch):
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
         skip_permissions=False, verbose=False,
     )
-    assert claude._active_child is None
+    assert threading.get_ident() not in claude._active_child
 
 
 # Note: the timeout path lets the real _kill_child run; subprocess.run (the
@@ -547,7 +534,7 @@ def test_run_claude_timeout_clears_active_child(monkeypatch):
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
         skip_permissions=False, verbose=False,
     )
-    assert claude._active_child is None
+    assert threading.get_ident() not in claude._active_child
 
 
 def test_run_claude_does_NOT_set_preexec_fn(monkeypatch):
@@ -644,7 +631,7 @@ def test_run_claude_sets_subtype_from_list_result_event(monkeypatch):
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
         skip_permissions=False, verbose=False,
     )
-    assert claude._last_run_subtype == "error_max_turns"
+    assert claude._last_run_state.subtype == "error_max_turns"
 
 
 def test_run_claude_sets_subtype_from_dict_legacy_shape(monkeypatch):
@@ -658,7 +645,7 @@ def test_run_claude_sets_subtype_from_dict_legacy_shape(monkeypatch):
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
         skip_permissions=False, verbose=False,
     )
-    assert claude._last_run_subtype == "success"
+    assert claude._last_run_state.subtype == "success"
 
 
 def test_run_claude_extracts_result_text_from_list_result_event(monkeypatch):
@@ -681,13 +668,13 @@ def test_run_claude_resets_subtype_at_call_entry(monkeypatch):
     """Pin §D6: stale telemetry from a prior call is cleared. Pre-set
     the flag, then make a call whose stdout has no parseable result
     event — the flag must be reset to None."""
-    claude._last_run_subtype = "leftover_from_prior_call"
+    claude._last_run_state.subtype = "leftover_from_prior_call"
     _patch_run_claude_subprocess(monkeypatch, stdout="not json")
     run_claude(
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
         skip_permissions=False, verbose=False,
     )
-    assert claude._last_run_subtype is None
+    assert claude._last_run_state.subtype is None
 
 
 def test_run_claude_timeout_sets_last_run_timed_out_flag(monkeypatch):
@@ -699,18 +686,18 @@ def test_run_claude_timeout_sets_last_run_timed_out_flag(monkeypatch):
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
         skip_permissions=False, verbose=False,
     )
-    assert claude._last_run_timed_out is True
+    assert claude._last_run_state.timed_out is True
 
 
 def test_run_claude_resets_timed_out_flag_at_call_entry(monkeypatch):
     """Stale-flag pin: a clean call after a prior timeout must clear the flag."""
-    claude._last_run_timed_out = True
+    claude._last_run_state.timed_out = True
     _patch_run_claude_subprocess(monkeypatch)
     run_claude(
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
         skip_permissions=False, verbose=False,
     )
-    assert claude._last_run_timed_out is False
+    assert claude._last_run_state.timed_out is False
 
 
 # ---------------------------------------------------------------------------
@@ -741,8 +728,8 @@ def _patch_run_claude_once(monkeypatch, responses):
         code, text, stderr = responses[i]
         # Simulate side-channel flags exactly like the real helper would:
         # reset at entry, set timed_out only on the explicit timeout sentinel.
-        claude._last_run_timed_out = (code == 1 and text == "" and stderr == "TIMEOUT")
-        claude._last_run_subtype = None
+        claude._last_run_state.timed_out = (code == 1 and text == "" and stderr == "TIMEOUT")
+        claude._last_run_state.subtype = None
         return (
             code,
             text,
@@ -770,7 +757,7 @@ def test_run_claude_success_first_attempt_no_retry(monkeypatch):
     assert (code, text) == (0, "ok")
     assert len(helper_calls) == 1
     assert sleeps == []
-    assert claude._last_run_rate_limited is False
+    assert claude._last_run_state.rate_limited is False
 
 
 def test_run_claude_one_rate_limit_then_success(monkeypatch):
@@ -785,7 +772,7 @@ def test_run_claude_one_rate_limit_then_success(monkeypatch):
     assert (code, text) == (0, "ok")
     assert len(helper_calls) == 2
     assert sleeps == [60]
-    assert claude._last_run_rate_limited is False
+    assert claude._last_run_state.rate_limited is False
 
 
 def test_run_claude_all_retries_exhausted_sets_flag(monkeypatch):
@@ -802,7 +789,7 @@ def test_run_claude_all_retries_exhausted_sets_flag(monkeypatch):
     assert (code, text) == (1, "")
     assert len(helper_calls) == 4
     assert sleeps == [60, 120, 240]
-    assert claude._last_run_rate_limited is True
+    assert claude._last_run_state.rate_limited is True
 
 
 def test_run_claude_non_rate_limit_failure_not_retried(monkeypatch):
@@ -816,7 +803,7 @@ def test_run_claude_non_rate_limit_failure_not_retried(monkeypatch):
     assert (code, text) == (1, "")
     assert len(helper_calls) == 1
     assert sleeps == []
-    assert claude._last_run_rate_limited is False
+    assert claude._last_run_state.rate_limited is False
 
 
 def test_run_claude_timeout_does_not_consume_rate_limit_budget(monkeypatch):
@@ -833,8 +820,8 @@ def test_run_claude_timeout_does_not_consume_rate_limit_budget(monkeypatch):
     assert (code, text) == (1, "")
     assert len(helper_calls) == 1
     assert sleeps == []
-    assert claude._last_run_timed_out is True
-    assert claude._last_run_rate_limited is False
+    assert claude._last_run_state.timed_out is True
+    assert claude._last_run_state.rate_limited is False
 
 
 def test_run_claude_max_retries_zero_disables_rate_limit_awareness(monkeypatch):
@@ -851,7 +838,7 @@ def test_run_claude_max_retries_zero_disables_rate_limit_awareness(monkeypatch):
     assert (code, text) == (1, "")
     assert len(helper_calls) == 1
     assert sleeps == []
-    assert claude._last_run_rate_limited is False
+    assert claude._last_run_state.rate_limited is False
 
 
 @pytest.mark.parametrize("stderr_text", [
@@ -918,7 +905,7 @@ def test_run_claude_exhaustion_banner_format(monkeypatch, capsys):
 
 def test_run_claude_resets_rate_limited_flag_at_entry(monkeypatch):
     """A clean call after a prior exhaustion must clear the flag."""
-    claude._last_run_rate_limited = True  # leftover
+    claude._last_run_state.rate_limited = True  # leftover
     _patch_run_claude_once(monkeypatch, [
         (0, "ok", ""),
     ])
@@ -926,7 +913,7 @@ def test_run_claude_resets_rate_limited_flag_at_entry(monkeypatch):
         "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
         skip_permissions=False, verbose=False,
     )
-    assert claude._last_run_rate_limited is False
+    assert claude._last_run_state.rate_limited is False
 
 
 def test_is_rate_limited_matches_each_pattern():
@@ -1028,6 +1015,23 @@ def test_execute_task_dry_run_skip_to_implement_returns_in_phase_3(monkeypatch, 
 
 
 def test_execute_task_sets_sigint_globals_on_entry(monkeypatch, tmp_path):
+    """Pin F4.4: when execute_task starts, `_set_current_task` is
+    called so the per-thread `_current_tasks` entry is populated for
+    `handle_sigint`'s iteration. Capture during the call (via stub
+    hook) because F4.8's outer try/finally CLEARS the entry on exit
+    (deliberate per parallel-mode correctness — see plan §F4.8). A
+    naive post-call read would KeyError on the empty dict and miss
+    the invariant being pinned.
+    """
+    captured: dict = {}
+    original = runner._set_current_task
+
+    def hook(tid, phase):
+        original(tid, phase)
+        captured.setdefault("tasks", dict(runner._current_tasks))
+        captured.setdefault("state", runner._current_state)
+
+    monkeypatch.setattr(runner, "_set_current_task", hook)
     _no_run_claude_called(monkeypatch)
     state = State(tmp_path / "state.json")
     execute_task(
@@ -1035,9 +1039,8 @@ def test_execute_task_sets_sigint_globals_on_entry(monkeypatch, tmp_path):
         file_defaults={"plans_dir": str(tmp_path)},
         cli={}, dry_run=True,
     )
-    assert runner._current_state is state
-    assert runner._current_task_id == 42
-    assert runner._current_phase == "plan"
+    assert captured["state"] is state
+    assert captured["tasks"][threading.get_ident()] == (42, "plan")
 
 
 def test_execute_task_uses_resolved_plans_dir_from_file_defaults(monkeypatch, tmp_path):
@@ -1107,8 +1110,7 @@ def test_handle_sigint_skips_save_when_state_is_none(monkeypatch):
 def test_handle_sigint_exits_with_code_130(monkeypatch, tmp_path):
     monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
     runner._current_state = State(tmp_path / "state.json")
-    runner._current_task_id = 7
-    runner._current_phase = "implement"
+    runner._set_current_task(7, "implement")
     with pytest.raises(SystemExit) as exc_info:
         handle_sigint(2, None)
     assert exc_info.value.code == 130
@@ -1117,8 +1119,7 @@ def test_handle_sigint_exits_with_code_130(monkeypatch, tmp_path):
 def test_handle_sigint_prints_resume_command(monkeypatch, capsys):
     monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
     runner._current_state = None
-    runner._current_task_id = 7
-    runner._current_phase = "implement"
+    runner._set_current_task(7, "implement")
     with pytest.raises(SystemExit):
         handle_sigint(2, None)
     out = capsys.readouterr().out
@@ -1935,8 +1936,8 @@ def _patch_run_claude_simulating_timeout(monkeypatch):
 
     def stub(*args, **kwargs):
         called.append((args, kwargs))
-        claude._last_run_timed_out = True
-        claude._last_run_subtype = None
+        claude._last_run_state.timed_out = True
+        claude._last_run_state.subtype = None
         return 1, ""
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
@@ -1950,8 +1951,8 @@ def _patch_run_claude_simulating_max_turns(monkeypatch):
 
     def stub(*args, **kwargs):
         called.append((args, kwargs))
-        claude._last_run_timed_out = False
-        claude._last_run_subtype = "error_max_turns"
+        claude._last_run_state.timed_out = False
+        claude._last_run_state.subtype = "error_max_turns"
         return 0, ""  # CLI exits cleanly even on max-turns
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
@@ -1964,8 +1965,8 @@ def _patch_run_claude_simulating_success(monkeypatch):
 
     def stub(*args, **kwargs):
         called.append((args, kwargs))
-        claude._last_run_timed_out = False
-        claude._last_run_subtype = "success"
+        claude._last_run_state.timed_out = False
+        claude._last_run_state.subtype = "success"
         return 0, "ok"
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
@@ -1974,7 +1975,7 @@ def _patch_run_claude_simulating_success(monkeypatch):
 
 def test_implement_timeout_records_failure(monkeypatch, tmp_path):
     """Pin §D7: implementer_timeout FailureRecord written when
-    claude._last_run_timed_out is True after Phase 3 run_claude."""
+    claude._last_run_state.timed_out is True after Phase 3 run_claude."""
     _patch_run_claude_simulating_timeout(monkeypatch)
     state = State(tmp_path / "state.json")
     execute_task(
@@ -2019,7 +2020,7 @@ def test_implement_timeout_includes_plan_artifact(monkeypatch, tmp_path):
 
 def test_implement_max_turns_records_failure(monkeypatch, tmp_path):
     """Pin §D7: implementer_max_turns FailureRecord written when
-    claude._last_run_subtype == 'error_max_turns'."""
+    claude._last_run_state.subtype == 'error_max_turns'."""
     _patch_run_claude_simulating_max_turns(monkeypatch)
     state = State(tmp_path / "state.json")
     execute_task(
@@ -2071,7 +2072,7 @@ def test_implement_does_NOT_record_failure_when_pre_set_flag_is_overridden(
     value. Pre-set the flag to True before execute_task — the stub
     must reset it via its assignment, otherwise a stale flag from a
     previous call would falsely trigger the timeout branch."""
-    claude._last_run_timed_out = True  # leftover from a prior call
+    claude._last_run_state.timed_out = True  # leftover from a prior call
     _patch_run_claude_simulating_success(monkeypatch)
     state = State(tmp_path / "state.json")
     execute_task(
@@ -2096,8 +2097,7 @@ def test_handle_sigint_records_manual_stop_when_task_in_flight(
     state = State(tmp_path / "state.json")
     state.set_status(1, "implementing")
     runner._current_state = state
-    runner._current_task_id = 1
-    runner._current_phase = "implement"
+    runner._set_current_task(1, "implement")
     with pytest.raises(SystemExit):
         handle_sigint(2, None)
     attempts = state.get(1)["attempts"]
@@ -2111,8 +2111,7 @@ def test_handle_sigint_records_manual_stop_during_planning(monkeypatch, tmp_path
     state = State(tmp_path / "state.json")
     state.set_status(1, "planning")
     runner._current_state = state
-    runner._current_task_id = 1
-    runner._current_phase = "plan"
+    runner._set_current_task(1, "plan")
     with pytest.raises(SystemExit):
         handle_sigint(2, None)
     assert state.get(1)["attempts"][0]["phase"] == "plan"
@@ -2124,7 +2123,7 @@ def test_handle_sigint_does_NOT_record_when_status_is_done(monkeypatch, tmp_path
     state = State(tmp_path / "state.json")
     state.set_status(1, "done")
     runner._current_state = state
-    runner._current_task_id = 1
+    runner._set_current_task(1, "plan")
     with pytest.raises(SystemExit):
         handle_sigint(2, None)
     assert state.get(1)["attempts"] == []
@@ -2135,7 +2134,7 @@ def test_handle_sigint_does_NOT_record_when_status_is_blocked(monkeypatch, tmp_p
     state = State(tmp_path / "state.json")
     state.set_status(1, "blocked", block_reason="implementer_timeout")
     runner._current_state = state
-    runner._current_task_id = 1
+    runner._set_current_task(1, "plan")
     with pytest.raises(SystemExit):
         handle_sigint(2, None)
     assert state.get(1)["attempts"] == []
@@ -2145,22 +2144,23 @@ def test_handle_sigint_does_NOT_record_when_state_is_None(monkeypatch):
     """Pin §D10: SIGINT before any execute_task is a noop on the failure surface."""
     monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
     runner._current_state = None
-    runner._current_task_id = 0
-    # Must not raise AttributeError or write anything.
+    # Per T13 §T4.5 sentinel-zero migration: drop the `_current_task_id = 0`
+    # write entirely (autouse fixture's `_current_tasks.clear()` already
+    # gives the empty-dict default).
     with pytest.raises(SystemExit):
         handle_sigint(2, None)
 
 
 def test_handle_sigint_does_NOT_record_when_task_id_is_zero(monkeypatch, tmp_path):
-    """Pin §D10: _current_task_id == 0 (initial sentinel) means no task in flight."""
+    """Pin §D10: empty `_current_tasks` dict means no task in flight.
+    Sentinel-zero semantics post-T13: no entry == "no task in flight".
+    """
     monkeypatch.setattr("claude_plan_execute.runner._kill_child", lambda: None)
     state = State(tmp_path / "state.json")
     runner._current_state = state
-    runner._current_task_id = 0
-    runner._current_phase = "plan"
+    # No _set_current_task call — autouse fixture's clear() leaves the dict empty.
     with pytest.raises(SystemExit):
         handle_sigint(2, None)
-    # No task entry should have been touched.
     assert state.data["tasks"] == {}
 
 
@@ -2176,8 +2176,7 @@ def test_handle_sigint_swallows_record_failure_exception(monkeypatch, tmp_path):
 
     state.record_failure = boom  # type: ignore[method-assign]
     runner._current_state = state
-    runner._current_task_id = 1
-    runner._current_phase = "implement"
+    runner._set_current_task(1, "implement")
     with pytest.raises(SystemExit) as exc_info:
         handle_sigint(2, None)
     assert exc_info.value.code == 130
@@ -2189,8 +2188,7 @@ def test_handle_sigint_still_exits_130(monkeypatch, tmp_path):
     state = State(tmp_path / "state.json")
     state.set_status(1, "implementing")
     runner._current_state = state
-    runner._current_task_id = 1
-    runner._current_phase = "implement"
+    runner._set_current_task(1, "implement")
     with pytest.raises(SystemExit) as exc_info:
         handle_sigint(2, None)
     assert exc_info.value.code == 130
@@ -2202,8 +2200,7 @@ def test_handle_sigint_still_prints_resume_command(monkeypatch, capsys, tmp_path
     state = State(tmp_path / "state.json")
     state.set_status(7, "implementing")
     runner._current_state = state
-    runner._current_task_id = 7
-    runner._current_phase = "implement"
+    runner._set_current_task(7, "implement")
     with pytest.raises(SystemExit):
         handle_sigint(2, None)
     out = capsys.readouterr().out
@@ -2220,9 +2217,9 @@ def _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch):
 
     def stub(*args, **kwargs):
         called.append((args, kwargs))
-        claude._last_run_timed_out = False
-        claude._last_run_subtype = None
-        claude._last_run_rate_limited = True
+        claude._last_run_state.timed_out = False
+        claude._last_run_state.subtype = None
+        claude._last_run_state.rate_limited = True
         return 1, ""
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
@@ -2231,7 +2228,7 @@ def _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch):
 
 def test_implement_rate_limit_records_failure(monkeypatch, tmp_path):
     """Pin §D6: rate_limited FailureRecord written when
-    claude._last_run_rate_limited is True after Phase 3 run_claude."""
+    claude._last_run_state.rate_limited is True after Phase 3 run_claude."""
     _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch)
     state = State(tmp_path / "state.json")
     execute_task(
@@ -2279,8 +2276,8 @@ def test_implement_rate_limit_takes_priority_over_timeout(monkeypatch, tmp_path)
     were set (theoretically impossible by §D5 exit guards, but defensive),
     the rate-limit branch runs first."""
     def stub(*args, **kwargs):
-        claude._last_run_timed_out = True       # spurious
-        claude._last_run_rate_limited = True    # authoritative
+        claude._last_run_state.timed_out = True       # spurious
+        claude._last_run_state.rate_limited = True    # authoritative
         return 1, ""
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
     state = State(tmp_path / "state.json")
@@ -2384,9 +2381,9 @@ def test_execute_task_passes_rate_limit_kwargs_to_run_claude(monkeypatch, tmp_pa
 
     def stub(*args, **kwargs):
         captured.update(kwargs)
-        claude._last_run_timed_out = False
-        claude._last_run_subtype = "success"
-        claude._last_run_rate_limited = False
+        claude._last_run_state.timed_out = False
+        claude._last_run_state.subtype = "success"
+        claude._last_run_state.rate_limited = False
         return 0, ""
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
@@ -4193,8 +4190,8 @@ def _patch_run_claude_for_agent_gate(monkeypatch, *, text="VERDICT: PASS\n"):
 
     def stub(prompt, **kwargs):
         captured.append((prompt, kwargs))
-        claude._last_run_timed_out = False
-        claude._last_run_subtype = "success"
+        claude._last_run_state.timed_out = False
+        claude._last_run_state.subtype = "success"
         return 0, text
 
     monkeypatch.setattr(
@@ -5556,8 +5553,8 @@ def test_execute_task_mid_list_skips_plan_and_review(monkeypatch, tmp_path):
 
     def stub(prompt, **kwargs):
         called.append(kwargs)
-        claude._last_run_subtype = "success"
-        claude._last_run_timed_out = False
+        claude._last_run_state.subtype = "success"
+        claude._last_run_state.timed_out = False
         return 0, "ok"
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
@@ -5712,7 +5709,7 @@ def test_execute_task_all_done_progress_skips_implement(monkeypatch, tmp_path):
 
     def stub(prompt, **kwargs):
         called.append(kwargs)
-        claude._last_run_subtype = "success"
+        claude._last_run_state.subtype = "success"
         return 0, "ok"
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
@@ -6052,7 +6049,7 @@ def test_execute_task_implementer_timeout_does_NOT_write_diff_patch(
     )
 
     def stub_timeout(*args, **kwargs):
-        claude._last_run_timed_out = True
+        claude._last_run_state.timed_out = True
         return 1, ""
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub_timeout)
@@ -6086,7 +6083,7 @@ def test_execute_task_implementer_max_turns_does_NOT_write_diff_patch(
     )
 
     def stub_max_turns(*args, **kwargs):
-        claude._last_run_subtype = "error_max_turns"
+        claude._last_run_state.subtype = "error_max_turns"
         return 0, "ok"
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub_max_turns)
@@ -6123,10 +6120,10 @@ def test_run_claude_sets_input_tokens_side_channel_flag(monkeypatch):
     _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
     run_claude("p", model="opus", effort="max", max_turns=1,
                timeout_minutes=1, skip_permissions=False, verbose=False)
-    assert claude._last_run_input_tokens == 12345
-    assert claude._last_run_output_tokens == 678
-    assert claude._last_run_cache_read_tokens == 8000
-    assert claude._last_run_cache_creation_tokens == 200
+    assert claude._last_run_state.input_tokens == 12345
+    assert claude._last_run_state.output_tokens == 678
+    assert claude._last_run_state.cache_read_tokens == 8000
+    assert claude._last_run_state.cache_creation_tokens == 200
 
 
 def test_run_claude_sets_duration_seconds_side_channel_flag(monkeypatch):
@@ -6135,19 +6132,19 @@ def test_run_claude_sets_duration_seconds_side_channel_flag(monkeypatch):
     _patch_run_claude_subprocess(monkeypatch)
     run_claude("p", model="opus", effort="max", max_turns=1,
                timeout_minutes=1, skip_permissions=False, verbose=False)
-    assert claude._last_run_duration_seconds is not None
-    assert claude._last_run_duration_seconds >= 0
+    assert claude._last_run_state.duration_seconds is not None
+    assert claude._last_run_state.duration_seconds >= 0
 
 
 def test_run_claude_resets_usage_flags_at_call_entry(monkeypatch):
     """Pin §D1: stale flags from a prior run are cleared. The new
     call's stdout has no `usage` event → flags reset to None."""
-    claude._last_run_input_tokens = 999_999  # leftover
+    claude._last_run_state.input_tokens = 999_999  # leftover
     stdout = json.dumps({"type": "result", "subtype": "success", "result": "ok"})
     _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
     run_claude("p", model="opus", effort="max", max_turns=1,
                timeout_minutes=1, skip_permissions=False, verbose=False)
-    assert claude._last_run_input_tokens is None
+    assert claude._last_run_state.input_tokens is None
 
 
 def test_run_claude_usage_flags_None_when_usage_event_absent(monkeypatch):
@@ -6158,10 +6155,10 @@ def test_run_claude_usage_flags_None_when_usage_event_absent(monkeypatch):
     _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
     run_claude("p", model="opus", effort="max", max_turns=1,
                timeout_minutes=1, skip_permissions=False, verbose=False)
-    assert claude._last_run_input_tokens is None
-    assert claude._last_run_output_tokens is None
-    assert claude._last_run_cache_read_tokens is None
-    assert claude._last_run_cache_creation_tokens is None
+    assert claude._last_run_state.input_tokens is None
+    assert claude._last_run_state.output_tokens is None
+    assert claude._last_run_state.cache_read_tokens is None
+    assert claude._last_run_state.cache_creation_tokens is None
 
 
 def test_run_claude_extracts_usage_from_list_result_event(monkeypatch):
@@ -6175,8 +6172,8 @@ def test_run_claude_extracts_usage_from_list_result_event(monkeypatch):
     _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
     run_claude("p", model="opus", effort="max", max_turns=1,
                timeout_minutes=1, skip_permissions=False, verbose=False)
-    assert claude._last_run_input_tokens == 100
-    assert claude._last_run_output_tokens == 50
+    assert claude._last_run_state.input_tokens == 100
+    assert claude._last_run_state.output_tokens == 50
 
 
 def test_run_claude_extracts_usage_from_dict_legacy_shape(monkeypatch):
@@ -6189,7 +6186,7 @@ def test_run_claude_extracts_usage_from_dict_legacy_shape(monkeypatch):
     _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
     run_claude("p", model="opus", effort="max", max_turns=1,
                timeout_minutes=1, skip_permissions=False, verbose=False)
-    assert claude._last_run_input_tokens == 1
+    assert claude._last_run_state.input_tokens == 1
 
 
 def test_run_claude_appends_jsonl_row_when_path_and_phase_provided(
@@ -6481,8 +6478,8 @@ def test_run_claude_once_5tuple_shape_on_timeout_path(monkeypatch):
     assert out == (1, "", "", None, 0.0)
     # C3: side-channel duration flag is set to 0.0 on the timeout
     # path for symmetry with the returned tuple's elapsed.
-    assert claude._last_run_duration_seconds == 0.0
-    assert claude._last_run_timed_out is True
+    assert claude._last_run_state.duration_seconds == 0.0
+    assert claude._last_run_state.timed_out is True
 
 
 def test_run_claude_once_returns_None_usage_when_stdout_is_garbage(
@@ -6590,8 +6587,8 @@ def _capture_run_claude_kwargs(monkeypatch, *, write_plan=True, tmp_path=None):
 
     def stub(prompt, **kwargs):
         calls.append(kwargs)
-        claude._last_run_timed_out = False
-        claude._last_run_subtype = "success"
+        claude._last_run_state.timed_out = False
+        claude._last_run_state.subtype = "success"
         # Write the plan file the first time so Phase 1 progresses.
         if write_plan and tmp_path is not None and len(calls) == 1:
             plan_dir = tmp_path / "task-1"
@@ -6702,8 +6699,8 @@ def test_execute_task_revise_phase_uses_phase_revise(monkeypatch, tmp_path):
         if len(calls) == 1:
             review_path = tmp_path / "task-1" / "review-1.md"
             review_path.write_text("## Verdict: NEEDS_REVISION\n")
-        claude._last_run_timed_out = False
-        claude._last_run_subtype = "success"
+        claude._last_run_state.timed_out = False
+        claude._last_run_state.subtype = "success"
         return 0, "ok"
 
     monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
@@ -10011,3 +10008,469 @@ def test_findings_non_dict_list_reduced_to_empty_by_extractor(
     # foo survives (no verdicts applied).
     assert (mem_dir / "foo.md").exists()
     assert not state.data.get("pending_memory_curate")
+
+
+# ===========================================================================
+# CC. T13 — Parallel scheduler (v0.3 §2.5)
+# ===========================================================================
+#
+# Pattern: stub execute_task with a barrier-respecting fake to drive
+# concurrency assertions deterministically. threading.Event ensures
+# no time.sleep dependence.
+
+
+def test_per_thread_last_run_flags_no_cross_contamination(
+    monkeypatch, tmp_path,
+):
+    """Pin §F3.5: two threads' _last_run_state.rate_limited flags
+    are independent (threading.local provides per-thread namespaces).
+    Without per-thread isolation, thread B's True bleeds into thread
+    A's check.
+    """
+    from claude_plan_execute import claude as claude_module
+
+    saw: dict[int, bool] = {}
+    barrier = threading.Barrier(2)
+
+    def worker(rate_limited: bool, key: int):
+        claude_module._last_run_state.rate_limited = rate_limited
+        barrier.wait(timeout=2.0)
+        saw[key] = claude_module._last_run("rate_limited", False)
+
+    t1 = threading.Thread(target=worker, args=(False, 1))
+    t2 = threading.Thread(target=worker, args=(True, 2))
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    assert saw[1] is False
+    assert saw[2] is True
+
+
+from claude_plan_execute.runner import run_slate, _SlateScheduler
+
+
+def _make_scheduler_inputs(tasks: list[dict], tmp_path: Path):
+    """Build the kwargs run_slate needs for an end-to-end scheduler test.
+
+    NB: `all_task_ids` MUST be present — `run_slate`'s signature has it
+    as a REQUIRED keyword-only kwarg (no default) per §F4.9.
+    """
+    state = State(tmp_path / "state.json")
+    return {
+        "ordered_tasks": tasks,
+        "all_task_ids": [t["id"] for t in tasks],
+        "state": state,
+        "file_defaults": {"plans_dir": str(tmp_path)},
+        "cli_overrides": {},
+        "phases_by_id": {},
+        "task_class_models": {},
+        "service_manager": _StubServiceManager(),
+        "dry_run": False,
+    }
+
+
+def test_run_slate_parallelism_1_serializes_independent_tasks_in_input_order(
+    monkeypatch, tmp_path,
+):
+    """Pin (a): parallelism=1 behaves identically to v0.2.0 — three
+    independent tasks (no `depends_on` chain) run sequentially in the
+    `ordered_tasks` declaration order.
+    """
+    order: list = []
+
+    def stub_execute_task(task, state, *a, **kw):
+        order.append(task["id"])
+        state.set_status(task["id"], "done")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_execute_task,
+    )
+    tasks = [
+        {"id": 1, "title": "A", "description": "D"},
+        {"id": 2, "title": "B", "description": "D"},
+        {"id": 3, "title": "C", "description": "D"},
+    ]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+    run_slate(parallelism=1, **kwargs)
+    assert order == [1, 2, 3]
+
+
+def test_run_slate_forwards_skip_to_to_execute_task(
+    monkeypatch, tmp_path,
+):
+    """Pin §F4.9 / §F5.1 (review-5 §N11): `run_slate` forwards
+    `skip_to=...` to every inner `execute_task` call.
+    """
+    captured: list = []
+    captured_lock = threading.Lock()
+
+    def stub_execute_task(task, state, *a, **kw):
+        with captured_lock:
+            captured.append(kw.get("skip_to"))
+        state.set_status(task["id"], "done")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_execute_task,
+    )
+    tasks = [
+        {"id": 1, "title": "A", "description": "D",
+         "key_files": ["src/a.py"]},
+        {"id": 2, "title": "B", "description": "D",
+         "key_files": ["src/b.py"]},
+    ]
+
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+    run_slate(parallelism=1, skip_to="implement", **kwargs)
+    assert captured == ["implement", "implement"]
+
+    captured.clear()
+    kwargs = _make_scheduler_inputs(tasks, tmp_path / "p2")
+    run_slate(parallelism=2, skip_to="implement", **kwargs)
+    assert len(captured) == 2
+    assert all(v == "implement" for v in captured)
+
+    captured.clear()
+    kwargs = _make_scheduler_inputs(tasks, tmp_path / "p3")
+    run_slate(parallelism=1, **kwargs)
+    assert captured == [None, None]
+
+
+def test_serial_blocked_parent_blocks_child(monkeypatch, tmp_path):
+    """Pin §B1 + §B4: T13's eligibility predicate diverges from
+    v0.2.0 on the failed-dep path — a blocked parent now prevents
+    children from running, AND the blocked parent itself is NOT
+    re-attempted in the same run.
+    """
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "blocked", block_reason="any")
+    ran: list = []
+    ran_lock = threading.Lock()
+
+    def stub_execute_task(task, *a, **kw):
+        with ran_lock:
+            ran.append(task["id"])
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_execute_task,
+    )
+    tasks = [
+        {"id": 1, "title": "A", "description": "D"},
+        {"id": 2, "title": "B", "description": "D", "depends_on": [1]},
+    ]
+    kwargs = {
+        "ordered_tasks": tasks,
+        "all_task_ids": [t["id"] for t in tasks],
+        "state": state,
+        "file_defaults": {"plans_dir": str(tmp_path)},
+        "cli_overrides": {},
+        "phases_by_id": {},
+        "task_class_models": {},
+        "service_manager": _StubServiceManager(),
+        "dry_run": False,
+    }
+    runner_thread = threading.Thread(
+        target=run_slate, kwargs={"parallelism": 1, **kwargs},
+    )
+    runner_thread.start()
+    runner_thread.join(timeout=2.0)
+    assert not runner_thread.is_alive(), (
+        "run_slate did not exit within 2.0s — likely a re-claim loop "
+        "on the blocked task. See plan §B1 / Option A."
+    )
+    assert ran == []
+    assert state.get(2)["status"] == "pending"
+    assert state.get(1)["status"] == "blocked"
+
+
+def test_run_slate_parallelism_2_runs_two_tasks_concurrently(
+    monkeypatch, tmp_path,
+):
+    """Pin (b): parallelism=2 runs two independent tasks simultaneously."""
+    started = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+
+    def stub_execute_task(task, state, *a, **kw):
+        idx = task["id"] - 1
+        started[idx].set()
+        release[idx].wait(timeout=5.0)
+        state.set_status(task["id"], "done")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_execute_task,
+    )
+    tasks = [
+        {"id": 1, "title": "A", "description": "D",
+         "key_files": ["src/a.py"]},
+        {"id": 2, "title": "B", "description": "D",
+         "key_files": ["src/b.py"]},
+    ]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+
+    runner_thread = threading.Thread(
+        target=run_slate,
+        kwargs={"parallelism": 2, **kwargs},
+    )
+    runner_thread.start()
+
+    assert started[0].wait(timeout=2.0)
+    assert started[1].wait(timeout=2.0)
+    release[0].set()
+    release[1].set()
+    runner_thread.join(timeout=5.0)
+    assert not runner_thread.is_alive()
+
+
+def test_eligibility_blocks_third_task_when_two_share_key_files(
+    monkeypatch, tmp_path,
+):
+    """Pin (c): worker-2 must NOT pick up task-3 while task-1 (shared
+    key_files with task-3) is in flight.
+    """
+    started = {tid: threading.Event() for tid in (1, 2, 3)}
+    release = {tid: threading.Event() for tid in (1, 2, 3)}
+
+    def stub_execute_task(task, state, *a, **kw):
+        started[task["id"]].set()
+        release[task["id"]].wait(timeout=5.0)
+        state.set_status(task["id"], "done")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_execute_task,
+    )
+    tasks = [
+        {"id": 1, "title": "A", "description": "D",
+         "key_files": ["src/auth.py"]},
+        {"id": 2, "title": "B", "description": "D",
+         "key_files": ["src/ui.py"]},
+        {"id": 3, "title": "C", "description": "D",
+         "key_files": ["src/auth.py"]},
+    ]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+    runner_thread = threading.Thread(
+        target=run_slate,
+        kwargs={"parallelism": 2, **kwargs},
+    )
+    runner_thread.start()
+
+    assert started[1].wait(timeout=2.0)
+    assert started[2].wait(timeout=2.0)
+    assert not started[3].is_set()
+    release[1].set()
+    assert started[3].wait(timeout=2.0)
+    release[2].set(); release[3].set()
+    runner_thread.join(timeout=5.0)
+
+
+def test_eligibility_respects_depends_on(monkeypatch, tmp_path):
+    """A task's depends_on chain blocks scheduling until parents are done."""
+    order: list[int] = []
+    order_lock = threading.Lock()
+
+    def stub_execute_task(task, state, *a, **kw):
+        with order_lock:
+            order.append(task["id"])
+        state.set_status(task["id"], "done")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_execute_task,
+    )
+    tasks = [
+        {"id": 1, "title": "A", "description": "D"},
+        {"id": 2, "title": "B", "description": "D", "depends_on": [1]},
+        {"id": 3, "title": "C", "description": "D", "depends_on": [2]},
+    ]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+    run_slate(parallelism=4, **kwargs)
+    assert order == [1, 2, 3]
+
+
+def test_failure_in_one_worker_does_not_kill_others(
+    monkeypatch, tmp_path,
+):
+    """Pin (e) + §B1 regression guard: a raised exception in
+    execute_task is caught by the worker; the slate continues.
+    """
+    started_2 = threading.Event()
+    release_2 = threading.Event()
+
+    def stub_execute_task(task, state, *a, **kw):
+        if task["id"] == 1:
+            raise RuntimeError("boom")
+        started_2.set()
+        release_2.wait(timeout=5.0)
+        state.set_status(task["id"], "done")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_execute_task,
+    )
+    tasks = [
+        {"id": 1, "title": "A", "description": "D",
+         "key_files": ["src/a.py"]},
+        {"id": 2, "title": "B", "description": "D",
+         "key_files": ["src/b.py"]},
+    ]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+
+    runner_thread = threading.Thread(
+        target=run_slate,
+        kwargs={"parallelism": 2, **kwargs},
+    )
+    runner_thread.start()
+    assert started_2.wait(timeout=2.0)
+    release_2.set()
+    runner_thread.join(timeout=5.0)
+    assert not runner_thread.is_alive()
+    state = kwargs["state"]
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1)["attempts"][0]["failure_class"] == "worker_exception"
+    assert len(state.get(1)["attempts"]) == 1
+
+
+def test_state_atomic_under_parallel_workers(monkeypatch, tmp_path):
+    """Pin (f): state.json updates are atomic under contention."""
+    def stub_execute_task(task, state, *a, **kw):
+        for phase in ("planning", "implementing", "done"):
+            state.set_status(task["id"], phase)
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_execute_task,
+    )
+    tasks = [
+        {"id": i, "title": f"T{i}", "description": "D",
+         "key_files": [f"src/f{i}.py"]}
+        for i in range(1, 21)
+    ]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+    run_slate(parallelism=4, **kwargs)
+    state = kwargs["state"]
+    for i in range(1, 21):
+        assert state.get(i)["status"] == "done"
+    on_disk = json.loads((tmp_path / "state.json").read_text())
+    assert len(on_disk["tasks"]) == 20
+
+
+def test_run_slate_parallelism_1_preserves_phase_teardown(
+    monkeypatch, tmp_path,
+):
+    """Pin §D7.1: parallelism=1 preserves the v0.2.0 phase-boundary
+    tear-down (calls service_manager.tear_down_for_scope('phase'))."""
+    tasks = [
+        {"id": 1, "title": "A", "description": "D", "phase": "p1"},
+        {"id": 2, "title": "B", "description": "D", "phase": "p2",
+         "depends_on": [1]},
+    ]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+
+    def stub_with_completion(task, state, *a, **kw):
+        state.set_status(task["id"], "done")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub_with_completion,
+    )
+    run_slate(parallelism=1, **kwargs)
+    stub = kwargs["service_manager"]
+    assert "phase" in stub.tear_down_calls
+
+
+def test_run_slate_parallel_path_does_not_track_phase(
+    monkeypatch, tmp_path,
+):
+    """Pin §D7.1 / §D7: parallelism>1 does NOT call
+    tear_down_for_scope('phase').
+    """
+    def stub(task, state, *a, **kw):
+        state.set_status(task["id"], "done")
+        sm = kw.get("service_manager")
+        if sm is not None:
+            sm.tear_down_for_scope("task")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub,
+    )
+    tasks = [
+        {"id": 1, "title": "A", "description": "D", "phase": "p1",
+         "key_files": ["src/a.py"]},
+        {"id": 2, "title": "B", "description": "D", "phase": "p2",
+         "key_files": ["src/b.py"]},
+    ]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+    run_slate(parallelism=2, **kwargs)
+    stub_mgr = kwargs["service_manager"]
+    assert "task" in stub_mgr.tear_down_calls
+    assert "phase" not in stub_mgr.tear_down_calls
+
+
+def test_log_prefix_appears_when_worker_id_set(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D9: with worker_id=N, runner stdout lines gain '[task-N]'
+    prefix. Without worker_id, no prefix (v0.2.0 behavior)."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+        worker_id=42,
+    )
+    out_with = capsys.readouterr().out
+    assert "[task-42]" in out_with
+
+    execute_task(
+        _make_task(id=2), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    out_without = capsys.readouterr().out
+    assert "[task-" not in out_without
+
+
+def test_eligibility_check_atomic_no_double_claim(monkeypatch, tmp_path):
+    """Pin §D2: the eligibility-check + claim happens under one lock,
+    so two workers can't both pick the same task.
+    """
+    call_count = 0
+    call_count_lock = threading.Lock()
+    proceed = threading.Event()
+
+    def stub(task, state, *a, **kw):
+        nonlocal call_count
+        with call_count_lock:
+            call_count += 1
+        proceed.wait(timeout=5.0)
+        state.set_status(task["id"], "done")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.execute_task", stub,
+    )
+    tasks = [{"id": 1, "title": "A", "description": "D"}]
+    kwargs = _make_scheduler_inputs(tasks, tmp_path)
+    runner_thread = threading.Thread(
+        target=run_slate,
+        kwargs={"parallelism": 4, **kwargs},
+    )
+    runner_thread.start()
+    threading.Event().wait(0.3)
+    proceed.set()
+    runner_thread.join(timeout=5.0)
+    assert call_count == 1
+
+
+def test_handle_sigint_records_manual_stop_when_awaiting_human(
+    monkeypatch, tmp_path,
+):
+    """Pin §F4.6: `awaiting_human` is in the SIGINT-active-set."""
+    state = State(tmp_path / "state.json")
+    state.set_status(7, "awaiting_human")
+    runner._current_state = state
+    runner._set_current_task(7, "implement")
+    monkeypatch.setattr(
+        "claude_plan_execute.runner._kill_child", lambda: None,
+    )
+    with pytest.raises(SystemExit) as ei:
+        handle_sigint(2, None)
+    assert ei.value.code == 130
+    attempts = state.get(7)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "manual_stop"
+    assert attempts[0]["phase"] == "implement"

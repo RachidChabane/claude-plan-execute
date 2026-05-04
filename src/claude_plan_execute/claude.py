@@ -30,27 +30,54 @@ from pathlib import Path
 
 from claude_plan_execute.colors import dim, red, yellow
 
-_active_child: subprocess.Popen | None = None
+# T13 (v0.3 §2.5) — per-thread active claude subprocess, keyed on
+# `threading.get_ident()`. The SIGINT-handler iterates the entire map
+# (snapshot pattern) so all in-flight workers receive SIGTERM/SIGKILL.
+_active_child: dict[int, subprocess.Popen] = {}
+_active_child_lock = threading.Lock()
 
-# Side-channel telemetry set by `run_claude`. The runner reads these
-# IMMEDIATELY after a `run_claude` call to differentiate normal
-# completion from timeout (subprocess.TimeoutExpired), max-turns
-# (CLI subtype "error_max_turns"), and rate-limit retry exhaustion.
-# `_last_run_timed_out` and `_last_run_subtype` are reset per-attempt
-# at `_run_claude_once` entry; `_last_run_rate_limited` is reset
-# per-call at `run_claude` entry.
-_last_run_timed_out: bool = False
-_last_run_subtype: str | None = None
-_last_run_rate_limited: bool = False
+# T13 §F3.4 — local SIGTERM grace window literal. Avoids a
+# cross-module import from services.py; matches v0.2.0's prior
+# wait(timeout=5) literal at this site.
+_SIGTERM_GRACE_SECONDS = 5
 
-# T2 §D1: token-usage side-channel flags. None means "no `usage`
-# event in the parsed result." Reset at `_run_claude_once` entry
-# alongside the other per-attempt flags.
-_last_run_input_tokens: int | None = None
-_last_run_output_tokens: int | None = None
-_last_run_cache_read_tokens: int | None = None
-_last_run_cache_creation_tokens: int | None = None
-_last_run_duration_seconds: float | None = None
+# T13 §F3.5 — per-thread namespace for the eight side-channel flags
+# formerly named `_last_run_<flag>`. Each thread sees its own attribute
+# bag, so sub-millisecond races between workers' run_claude calls can
+# no longer clobber another thread's read. Attribute names:
+#   subtype, timed_out, rate_limited, input_tokens, output_tokens,
+#   cache_read_tokens, cache_creation_tokens, duration_seconds.
+_last_run_state = threading.local()
+
+
+def _set_active_child(proc: subprocess.Popen) -> None:
+    """Record the current thread's running claude subprocess.
+
+    Per-thread keying so parallel `run_claude` calls (T13) don't
+    overwrite one another. SIGINT iterates the entire map.
+    """
+    with _active_child_lock:
+        _active_child[threading.get_ident()] = proc
+
+
+def _clear_active_child() -> None:
+    """Drop the current thread's entry. Called from `run_claude`'s
+    finally block. Safe to call when the entry is absent."""
+    with _active_child_lock:
+        _active_child.pop(threading.get_ident(), None)
+
+
+def _last_run(name: str, default=None):
+    """Read a per-thread flag with a default if not yet set on
+    this thread. Used by runner.py for the cross-thread reads."""
+    return getattr(_last_run_state, name, default)
+
+
+def _reset_last_run_state() -> None:
+    """Clear every per-thread flag for the current thread."""
+    for attr in list(vars(_last_run_state).keys()):
+        delattr(_last_run_state, attr)
+
 
 # T2 §D4: serializes JSONL appends across run_gates' parallel
 # agent-gate ThreadPoolExecutor (up to 4 concurrent writers).
@@ -149,33 +176,42 @@ def _maybe_append_usage(
     )
 
 
-def _kill_child():
-    """Kill the active claude child process and all its descendants."""
-    global _active_child
-    if _active_child and _active_child.poll() is None:
-        pid = _active_child.pid
-        # First, try SIGTERM on the child directly
-        try:
-            _active_child.terminate()
-        except OSError:
-            pass
-        try:
-            _active_child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            # Force kill
+def _kill_child() -> None:
+    """SIGTERM-then-SIGKILL every active claude subprocess.
+
+    Iterates ALL per-thread entries (T13 parallel mode). Snapshot
+    pattern avoids holding the lock across syscalls. Per-pid
+    `pkill -TERM -P <pid>` preserves the v0.2.0 orphan-cleanup
+    semantics. Per-proc `wait(timeout=_SIGTERM_GRACE_SECONDS)`
+    mirrors v0.2.0 so synchronous test mocks
+    (TimeoutExpired-on-wait + kill flips poll to -9) keep working.
+    After the per-proc loop finishes, the dict is `clear()`-ed so
+    post-SIGINT introspection reflects "no active children".
+    """
+    with _active_child_lock:
+        snapshot = list(_active_child.values())
+    for proc in snapshot:
+        if proc.poll() is None:
             try:
-                _active_child.kill()
-            except OSError:
+                proc.terminate()
+            except (ProcessLookupError, OSError):
                 pass
-        # Also kill any orphaned descendants via pkill (belt and suspenders)
-        try:
-            subprocess.run(
-                ["pkill", "-TERM", "-P", str(pid)],
-                capture_output=True, timeout=3,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-    _active_child = None
+            try:
+                subprocess.run(
+                    ["pkill", "-TERM", "-P", str(proc.pid)],
+                    capture_output=True, timeout=3,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+            try:
+                proc.wait(timeout=_SIGTERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+    with _active_child_lock:
+        _active_child.clear()
 
 
 def _run_claude_once(
@@ -191,21 +227,17 @@ def _run_claude_once(
     """Single subprocess attempt. Returns
     (returncode, result_text, stderr_text, usage_or_None, elapsed_seconds).
 
-    Resets `_last_run_timed_out`, `_last_run_subtype`, and the five
-    usage side-channel flags at entry — each call's flags reflect
-    this attempt only.
+    Resets `_last_run_state.timed_out`, `_last_run_state.subtype`, and
+    the five usage side-channel flags at entry — each call's flags
+    reflect this attempt only.
     """
-    global _active_child, _last_run_timed_out, _last_run_subtype
-    global _last_run_input_tokens, _last_run_output_tokens
-    global _last_run_cache_read_tokens, _last_run_cache_creation_tokens
-    global _last_run_duration_seconds
-    _last_run_timed_out = False
-    _last_run_subtype = None
-    _last_run_input_tokens = None
-    _last_run_output_tokens = None
-    _last_run_cache_read_tokens = None
-    _last_run_cache_creation_tokens = None
-    _last_run_duration_seconds = None
+    _last_run_state.timed_out = False
+    _last_run_state.subtype = None
+    _last_run_state.input_tokens = None
+    _last_run_state.output_tokens = None
+    _last_run_state.cache_read_tokens = None
+    _last_run_state.cache_creation_tokens = None
+    _last_run_state.duration_seconds = None
 
     cmd = [
         "claude",
@@ -228,22 +260,23 @@ def _run_claude_once(
         # Do NOT use setsid here — we want claude children in our process group
         # so that killing our group (from the server) kills everything.
         # For direct CLI usage, the SIGINT handler calls _kill_child explicitly.
-        _active_child = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        stdout, stderr = _active_child.communicate(timeout=timeout_minutes * 60)
-        returncode = _active_child.returncode
+        _set_active_child(proc)
+        stdout, stderr = proc.communicate(timeout=timeout_minutes * 60)
+        returncode = proc.returncode
     except subprocess.TimeoutExpired:
         print(red(f"  TIMEOUT after {timeout_minutes} minutes"))
-        _last_run_timed_out = True
+        _last_run_state.timed_out = True
         _kill_child()
-        _last_run_duration_seconds = 0.0
+        _last_run_state.duration_seconds = 0.0
         return 1, "", "", None, 0.0
     finally:
-        _active_child = None
+        _clear_active_child()
 
     elapsed = time.time() - start
     print(dim(f"  Completed in {elapsed:.0f}s (exit {returncode})"))
@@ -275,25 +308,25 @@ def _run_claude_once(
         elif isinstance(parsed, dict):
             result_event = parsed
         if result_event is not None:
-            _last_run_subtype = result_event.get("subtype")
+            _last_run_state.subtype = result_event.get("subtype")
             if "result" in result_event:
                 result_text = result_event["result"]
             usage_field = result_event.get("usage")
             if isinstance(usage_field, dict):
                 usage = usage_field
-                _last_run_input_tokens = int(usage.get("input_tokens", 0))
-                _last_run_output_tokens = int(usage.get("output_tokens", 0))
-                _last_run_cache_read_tokens = int(
+                _last_run_state.input_tokens = int(usage.get("input_tokens", 0))
+                _last_run_state.output_tokens = int(usage.get("output_tokens", 0))
+                _last_run_state.cache_read_tokens = int(
                     usage.get("cache_read_input_tokens", 0)
                 )
-                _last_run_cache_creation_tokens = int(
+                _last_run_state.cache_creation_tokens = int(
                     usage.get("cache_creation_input_tokens", 0)
                 )
             else:
                 usage = None
     except (json.JSONDecodeError, KeyError, TypeError):
         pass
-    _last_run_duration_seconds = elapsed
+    _last_run_state.duration_seconds = elapsed
     return returncode, result_text, stderr, usage, elapsed
 
 
@@ -328,8 +361,8 @@ def run_claude(
     exhaust on a rate-limit signal. The runner reads this flag
     immediately post-call to record a `rate_limited` FailureRecord.
 
-    Per-attempt side-channel flags (`_last_run_timed_out`,
-    `_last_run_subtype`) reflect the most recent attempt.
+    Per-attempt side-channel flags (`_last_run_state.timed_out`,
+    `_last_run_state.subtype`) reflect the most recent attempt.
 
     `usage_jsonl_path` and `phase` (T2, v0.3 §2.7): when both are
     non-None and the FINAL attempt's CLI output included a `usage`
@@ -338,8 +371,7 @@ def run_claude(
     `run_claude` call (per-call contract). Either kwarg unset
     disables the append.
     """
-    global _last_run_rate_limited
-    _last_run_rate_limited = False
+    _last_run_state.rate_limited = False
 
     # Opt-out: 0 retries → skip rate-limit awareness entirely.
     if max_rate_limit_retries == 0:
@@ -375,7 +407,7 @@ def run_claude(
             return code, result_text
 
         # Timeout: do NOT retry; do NOT consume rate-limit budget.
-        if _last_run_timed_out:
+        if _last_run("timed_out", False):
             _maybe_append_usage(
                 usage_jsonl_path, phase, model, last_usage, last_elapsed,
             )
@@ -400,7 +432,7 @@ def run_claude(
     _maybe_append_usage(
         usage_jsonl_path, phase, model, last_usage, last_elapsed,
     )
-    _last_run_rate_limited = True
+    _last_run_state.rate_limited = True
     print(red(
         f"  Rate-limit retries exhausted after {total_attempts} attempts."
     ))

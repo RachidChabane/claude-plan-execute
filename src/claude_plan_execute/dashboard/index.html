@@ -1747,11 +1747,21 @@ function updateStats() {
   document.getElementById('runningBanner').classList.toggle('visible', hasActive);
 
   if (hasActive) {
-    const activeTask = tasks.find(t => isActive(state.tasks?.[t.id]?.status));
-    if (activeTask) {
-      const ts = state.tasks[activeTask.id];
-      document.getElementById('runningTask').textContent = `Task ${activeTask.id}: ${activeTask.title}`;
-      document.getElementById('runningPhase').textContent = ts.status;
+    const activeTasks = tasks.filter(t => isActive(state.tasks?.[t.id]?.status));
+    if (activeTasks.length > 0) {
+      const taskEl = document.getElementById('runningTask');
+      const phaseEl = document.getElementById('runningPhase');
+      if (activeTasks.length === 1) {
+        const t = activeTasks[0];
+        const ts = state.tasks[t.id];
+        taskEl.textContent = `Task ${t.id}: ${t.title}`;
+        phaseEl.textContent = ts.status;
+      } else {
+        taskEl.textContent = `${activeTasks.length} tasks running`;
+        phaseEl.textContent = activeTasks
+          .map(t => `#${t.id} ${state.tasks[t.id].status}`)
+          .join(' · ');
+      }
       if (!runningStart) startRunTimer();
     }
   } else {

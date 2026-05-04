@@ -673,3 +673,91 @@ def test_summarize_usage_returns_correct_types(tmp_path):
     assert isinstance(s["total_cache_create"], int)
     assert isinstance(s["total_runs"], int)
     assert isinstance(s["duration_seconds"], float)
+
+
+# --- Thread-safety (T13 v0.3 §2.5) ----------------------------------------
+
+import threading
+
+
+def test_state_concurrent_set_status_no_lost_writes(tmp_path):
+    """T13 §F2.3: 16 threads each call set_status N times; final
+    state.json reflects ALL writes (no clobbered entries)."""
+    s = State(tmp_path / "state.json")
+    NUM_THREADS = 16
+    NUM_WRITES = 50
+
+    def worker(worker_id: int):
+        for i in range(NUM_WRITES):
+            s.set_status(
+                f"task_{worker_id}_{i}", "implementing",
+                round_num=i,
+            )
+
+    threads = [
+        threading.Thread(target=worker, args=(w,))
+        for w in range(NUM_THREADS)
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    # On disk: every write landed (no clobber).
+    on_disk = json.loads((tmp_path / "state.json").read_text())
+    expected_keys = {
+        f"task_{w}_{i}"
+        for w in range(NUM_THREADS) for i in range(NUM_WRITES)
+    }
+    assert set(on_disk["tasks"].keys()) == expected_keys
+
+
+def test_state_concurrent_record_failure_no_lost_attempts(tmp_path):
+    """T13 §F2.3: record_failure under contention preserves all
+    appends (the get-then-modify-then-save compound is atomic)."""
+    s = State(tmp_path / "state.json")
+    NUM_THREADS = 8
+    NUM_FAILURES_PER = 25
+
+    def worker(worker_id: int):
+        for i in range(NUM_FAILURES_PER):
+            s.record_failure(
+                "shared_task",
+                make_failure_record(
+                    "manual_stop", "implement",
+                    reason=f"w{worker_id}_i{i}",
+                ),
+            )
+
+    threads = [
+        threading.Thread(target=worker, args=(w,))
+        for w in range(NUM_THREADS)
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    attempts = s.get("shared_task")["attempts"]
+    assert len(attempts) == NUM_THREADS * NUM_FAILURES_PER
+
+
+def test_state_concurrent_save_atomic_no_partial_write(tmp_path):
+    """T13 §F2.3: under heavy concurrent save(), the on-disk file is
+    always parseable JSON (atomic-rename guarantee preserved)."""
+    s = State(tmp_path / "state.json")
+
+    def worker(worker_id: int):
+        for i in range(50):
+            s.set_status(f"t{worker_id}", "implementing", n=i)
+
+    threads = [
+        threading.Thread(target=worker, args=(w,))
+        for w in range(8)
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    on_disk = json.loads((tmp_path / "state.json").read_text())
+    assert "tasks" in on_disk
+
+
+def test_failure_classes_includes_worker_exception():
+    """T13 §F2.5: worker_exception added to FAILURE_CLASSES."""
+    assert "worker_exception" in FAILURE_CLASSES

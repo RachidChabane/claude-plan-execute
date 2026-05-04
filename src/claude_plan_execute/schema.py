@@ -131,6 +131,9 @@ class Defaults(BaseModel):
     auto_merge: bool | None = None
     pr_body_template: str | None = None
 
+    # T13 (v0.3 §2.5) — opt-in parallel task execution.
+    parallelism: int | None = None
+
     # T16 (v0.3) — AI-driven memory pruning trigger.
     memory_curation_threshold: int | None = None
 
@@ -304,6 +307,29 @@ class TasksFile(BaseModel):
                 raise ValueError(
                     f"Phase '{p.id}' services_required_extra references unknown "
                     f"service(s): {unknown}. Known: {sorted(service_names)}"
+                )
+
+        # 9. T13 (v0.3 §2.5) — parallelism interlocks.
+        parallelism = self.defaults.parallelism
+        if parallelism is not None and parallelism > 1:
+            if not self.defaults.branch_per_task:
+                raise ValueError(
+                    f"defaults.parallelism = {parallelism} requires "
+                    f"defaults.branch_per_task: true; parallel commits "
+                    f"to a single branch race and lose work. Set "
+                    f"defaults.branch_per_task: true explicitly."
+                )
+
+            unsafe = sorted(
+                s.name for s in self.services
+                if s.lifetime in ("task", "gate", "phase")
+            )
+            if unsafe:
+                raise ValueError(
+                    f"defaults.parallelism = {parallelism} is incompatible "
+                    f"with services declaring lifetime in (task, gate, "
+                    f"phase). Only lifetime=run is safe under parallelism. "
+                    f"Found: {unsafe}."
                 )
         return self
 

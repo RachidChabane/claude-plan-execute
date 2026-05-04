@@ -41,6 +41,9 @@ phases:
   - id: cross-task-memory
     title: "Cross-task learning via Claude Code memory"
     defaults: { task_class: feature }
+  - id: recovery
+    title: "Auto-recovery via splitter agent"
+    defaults: { task_class: feature }
   - id: documentation
     title: "v0.3 release docs + recipes"
     defaults: { task_class: docs }
@@ -800,6 +803,7 @@ tasks:
   - id: 13
     phase: parallelism
     title: "feat: parallel task execution with key_files contention guard"
+    implement_timeout_minutes: 120
     description: |
       Closes v0.3-scope §2.5. Allow multiple tasks to run
       concurrently when independent AND not sharing key_files. Opt-in
@@ -1150,6 +1154,205 @@ tasks:
     commit_message: "feat: memory-curate agent gate for AI-driven memory pruning"
     depends_on: [11, 15]
 
+  # ── Phase: recovery ──────────────────────────────────────────────────────
+  - id: 17
+    phase: recovery
+    title: "feat: auto-split blocked tasks via splitter agent"
+    description: |
+      Recovery mechanism for tasks that hit max_review_rounds_exhausted
+      or implementer_max_turns. Instead of just blocking and waiting for
+      human intervention, spawn a splitter agent that reads the task's
+      planning/review/failure history and proposes a split into smaller,
+      independently-implementable child tasks. The runner appends the
+      children to tasks.yaml; the next slate launch picks them up.
+
+      WHY (the failure mode we're seeing):
+        T13 (parallel scheduler) and T16 (memory-curate gate) both hit
+        max-rounds repeatedly during the v0.3 slate. The reviewer kept
+        finding new issues each round — the tasks were genuinely too
+        big for the planner to fully address in 3 rounds AND too big
+        for revise to converge in 8 rounds. Manual scope-split is the
+        only working remedy. Automating it removes the human from the
+        loop, which is the entire system's value prop.
+
+      TRIGGER:
+        Configurable via:
+          defaults.auto_split_on_max_rounds: bool = False  # opt-in
+          defaults.auto_split_failure_classes: list[str] = [
+            "review_rejected_after_max_rounds",
+            "implementer_max_turns",
+          ]
+        Add to KEYS_TO_AUDIT in config.py so per-task and per-phase
+        overrides work.
+
+        In runner.execute_task, AFTER the existing
+        state.set_status(tid, "blocked", ...) +
+        state.record_failure(...) calls for these failure classes,
+        AND IF auto_split is enabled,
+        AND IF the current task's split_depth < max_split_depth,
+        invoke run_splitter(task, state, file_defaults, cli) before
+        returning.
+
+      RECURSION GUARD:
+        defaults.max_split_depth: int = 1
+        Each task entry in tasks.yaml may have an optional
+        `parent_task: <id>` (for children) and `split_depth: int`.
+        Children inherit parent_split_depth + 1. When split_depth
+        reaches max_split_depth, the runner skips the split and
+        leaves the task blocked. Prevents runaway fragmentation.
+
+      SPLITTER MODULE (new src/claude_plan_execute/splitter.py):
+
+        run_splitter(task, state, file_defaults, cli) -> None
+          Reads:
+            - The original task entry (description, key_files, etc.).
+            - {plans_dir}/task-{id}/plan.md (most-recent revision).
+            - All {plans_dir}/task-{id}/review-*.md files in order.
+            - state.json's tasks[<id>].attempts[] FailureRecords.
+            - Project's persona.md + decisions/ via existing loaders
+              (auto-injected into the splitter's prompt body).
+          Builds a prompt from the splitter template (loaded from
+          gates/templates/splitter.md). Composition order:
+            failure_context + persona + decisions + body
+          Same as build_plan_prompt — the agent benefits from full
+          project context.
+
+          Invokes claude via run_claude:
+            model: sonnet (sufficient for splitting; saves Opus tokens)
+            effort: medium
+            max_turns: 60
+            timeout_minutes: 30
+
+          Parses the response for the JSON appendix using T11's
+          <!-- BEGIN_FINDINGS_JSON --> marker convention. Schema:
+            {
+              "decision": "split" | "keep",
+              "reason": "<one-paragraph rationale>",
+              "children": [
+                {
+                  "id": "<parent_id>a" | "<parent_id>b" | ...,
+                    # str-typed; let the model pick suffixes
+                  "title": "...",
+                  "description": "...",
+                  "key_files": [...],
+                  "depends_on": [...],
+                    # may include parent's depends_on; usually
+                    # children depend on each other in order
+                  "phase": "<inherits parent's>"
+                }
+              ]
+            }
+
+          If decision == "keep": no-op. Logs "splitter judged the task
+          tractable; leaving blocked for human review." This is the
+          escape hatch when the failure is reviewer-being-unreasonable
+          rather than scope-too-big.
+
+          If decision == "split": apply the children to tasks.yaml.
+
+      TASKS.YAML MUTATION (the dangerous part):
+
+        MUST preserve comments. PyYAML strips them; ruamel.yaml does
+        not. Add `ruamel.yaml` to install_requires in pyproject.toml.
+
+        Algorithm:
+          1. Load tasks.yaml with ruamel.yaml.
+          2. Find the parent task entry by id.
+          3. Insert children IMMEDIATELY AFTER the parent in the
+             tasks: list. Preserve the parent in place — its status
+             becomes 'split' but the entry stays so depends_on:[parent]
+             references in downstream tasks still resolve. Add
+             `split_depth: <parent_depth + 1>` and
+             `parent_task: <parent_id>` to each child.
+          4. Update downstream tasks: any task whose depends_on
+             contains the parent's id gets that ref REPLACED by the
+             id of the LAST child. Reason: the last child is
+             topologically last in the parent's split chain; downstream
+             waits on the whole chain.
+          5. Write back atomically (tempfile + rename, same pattern
+             as state.save).
+
+        Edge case: if downstream depends_on:[parent, X] (compound),
+        only the parent ref is replaced; X remains.
+
+      STATE TRANSITIONS:
+
+        Add 'split' to state.STATUSES.
+        On successful split:
+          state.set_status(parent_id, 'split',
+                           split_children=[id1, id2, ...])
+        Children get default 'pending' (created fresh; the runner
+        will see them on next launch and execute_task them normally).
+
+      SAFETY:
+
+        - Splitter agent failures (subprocess crash, malformed JSON,
+          file write errors): log warning, leave parent blocked,
+          continue the slate. Never raise out of run_splitter.
+        - Idempotency: if a parent is already 'split', skip.
+        - Concurrency: not safe to split the same task twice. Use a
+          file lock on tasks.yaml during mutation (fcntl.flock or
+          os.O_EXLOCK on the temp file).
+
+      DASHBOARD:
+
+        New surface in the existing task panel: tasks with status
+        'split' show "split → [13a, 13b, 13c]" with hyperlinks to
+        the children's panels. The children's panels show
+        "split from [13]" reciprocal link. Out of scope: visualizing
+        the split-tree as a graph.
+
+      INTERACTION WITH EXISTING SLATE:
+
+        The current run is in-memory; tasks.yaml mutation does NOT
+        affect it. The blocked parent stays blocked for the rest of
+        the run. Children become eligible on the NEXT slate launch
+        (when tasks.yaml is re-read). The user sees the parent
+        blocked, decides whether to launch again — same workflow as
+        the current "retry the slate" pattern, just with new tasks
+        in flight.
+
+      OUT OF SCOPE for v0.3.1 (defer to v0.4):
+        - Triggering split mid-run (re-reading tasks.yaml inside the
+          for-loop). Adds restart-loop complexity for marginal gain.
+        - Multi-pass split (children fail → split again until depth
+          cap). max_split_depth=1 is the common case; deeper trees
+          probably indicate a project-design problem.
+        - Adversarial scoping (splitting tasks the planner thought
+          were already-split). The splitter agent decides; if it
+          says 'keep', we trust it.
+
+      Tests in tests/test_splitter.py:
+        (a) run_splitter with a fixture failed-task setup invokes
+            claude with the right prompt context (plan + reviews +
+            failure verbatim).
+        (b) JSON appendix parsing: well-formed → applied; malformed
+            → logged warning, no mutation.
+        (c) decision='keep' → no tasks.yaml mutation.
+        (d) decision='split' → children appended in correct slot,
+            comments preserved, downstream depends_on rewired.
+        (e) max_split_depth guard: depth >= max → skip split, leave
+            blocked.
+        (f) Already-split parent → skip (idempotency).
+        (g) File lock: concurrent split attempts serialize.
+        (h) Schema additions validate (auto_split_*, max_split_depth,
+            Task.parent_task, Task.split_depth, status='split').
+    key_files:
+      - src/claude_plan_execute/splitter.py
+      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/schema.py
+      - src/claude_plan_execute/config.py
+      - src/claude_plan_execute/state.py
+      - src/claude_plan_execute/server.py
+      - src/claude_plan_execute/dashboard/index.html
+      - src/claude_plan_execute/gates/templates/splitter.md
+      - pyproject.toml
+      - tests/test_splitter.py
+      - tests/test_schema.py
+      - tests/test_runner.py
+    commit_message: "feat: auto-split blocked tasks via splitter agent"
+    depends_on: [11, 15]
+
   # ── Phase: documentation ─────────────────────────────────────────────────
   - id: 14
     phase: documentation
@@ -1157,7 +1360,7 @@ tasks:
     description: |
       Closes v0.3-scope §§2.1, 2.8, 2.9, 2.10 (already-handled
       patterns made discoverable via recipes) plus complete
-      documentation for everything T1–T13 + T15 + T16 shipped.
+      documentation for everything T1–T13 + T15 + T16 + T17 shipped.
 
       Updates:
         - README.md: new sections for services, branch_per_task,
@@ -1236,6 +1439,16 @@ tasks:
           prune + memory-curate gate compose to keep MEMORY.md
           honest; the threshold knob; merge-suggestion review
           flow in the dashboard.
+        - auto-split.md (T17): why scope-too-big is the failure
+          mode auto-split addresses (real example from v0.3 slate:
+          T13 parallel scheduler hit max-rounds twice); the
+          opt-in flag; the trigger failure classes; max_split_depth;
+          the splitter agent's contract (read plan + reviews +
+          attempts → emit JSON proposal); the keep/split decision;
+          tasks.yaml mutation safety (ruamel.yaml, file lock,
+          atomic write); the parent_task / split_depth fields;
+          downstream depends_on rewiring; dashboard surface; how
+          children land on next slate launch.
 
       No source tests changed in this task. The slate's existing
       test gate runs; this task's only gate change is "tests +
@@ -1258,5 +1471,6 @@ tasks:
       - docs/recipes/resume-on-context-fill.md
       - docs/recipes/rate-limit-and-tokens.md
       - docs/recipes/cross-task-memory.md
+      - docs/recipes/auto-split.md
     commit_message: "docs: v0.3 release notes, migration, recipes"
-    depends_on: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16]
+    depends_on: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17]

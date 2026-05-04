@@ -6,6 +6,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from claude_plan_execute import claude
@@ -88,9 +91,59 @@ def check_verdict(review_path: Path) -> tuple[bool, str]:
 
 
 # Globals for SIGINT handler — execute_task sets, handle_sigint reads.
+# T13 (v0.3 §2.5): per-thread task/phase tracking via dict keyed on
+# `threading.get_ident()` so SIGINT iterates ALL in-flight workers.
+# `_current_state` stays as a single shared global (the State object
+# is shared across workers in a slate run); only the per-task / phase
+# tracking is per-thread.
 _current_state: State | None = None
-_current_task_id: int | str = 0
-_current_phase: str = "plan"
+_current_tasks: dict[int, tuple[int | str, str]] = {}
+_current_tasks_lock = threading.Lock()
+# T13 §F4.7 — per-thread worker_id storage for log line prefixes.
+_worker_ids: dict[int, int | str] = {}
+
+
+def _set_current_task(task_id: int | str, phase: str) -> None:
+    with _current_tasks_lock:
+        _current_tasks[threading.get_ident()] = (task_id, phase)
+
+
+def _clear_current_task() -> None:
+    with _current_tasks_lock:
+        _current_tasks.pop(threading.get_ident(), None)
+
+
+def _set_current_phase(phase: str) -> None:
+    """Update the phase-only field for the current thread; preserve task_id."""
+    with _current_tasks_lock:
+        ident = threading.get_ident()
+        if ident in _current_tasks:
+            tid, _ = _current_tasks[ident]
+            _current_tasks[ident] = (tid, phase)
+
+
+def _set_worker_id(worker_id: int | str | None) -> None:
+    if worker_id is None:
+        _worker_ids.pop(threading.get_ident(), None)
+    else:
+        _worker_ids[threading.get_ident()] = worker_id
+
+
+def _wprint(*args, **kwargs) -> None:
+    """print() wrapper that prepends [task-N] when worker_id is set.
+
+    Use for every operator-visible line in the runner. Single-worker
+    paths (worker_id=None) pass through to the bare print — observable
+    output is byte-identical to v0.2.0.
+    """
+    wid = _worker_ids.get(threading.get_ident())
+    if wid is None:
+        print(*args, **kwargs)
+    else:
+        sep = kwargs.get("sep", " ")
+        text = sep.join(str(a) for a in args)
+        print(f"[task-{wid}] {text}",
+              **{k: v for k, v in kwargs.items() if k != "sep"})
 
 
 def _resolve_gate_specs(
@@ -177,11 +230,52 @@ def execute_task(
     dry_run: bool = False,
     service_manager: "ServiceManager | None" = None,
     all_task_ids: list[int | str] | None = None,
+    worker_id: int | str | None = None,
 ):
-    global _current_state, _current_task_id, _current_phase
-    _current_state = state
-    _current_task_id = task["id"]
+    """Run a single task through plan/review/implement/gates phases.
 
+    T13 §F4.8 — `worker_id`: when set, every operator-visible line
+    inside this call gets a `[task-N]` prefix via `_wprint`. Single-
+    worker / direct callers leave `worker_id=None` and observe
+    byte-identical v0.2.0 output.
+
+    The function body lives in `_execute_task_body`; the outer
+    try/finally wrapper here records / clears the per-thread SIGINT
+    tracking entries (`_set_current_task` / `_set_worker_id`) so a
+    crashed worker does not leak its task id into the next iteration.
+    """
+    global _current_state
+    try:
+        _set_worker_id(worker_id)
+        _current_state = state
+        _set_current_task(task["id"], "plan")
+        _execute_task_body(
+            task, state, file_defaults, cli,
+            phases_by_id=phases_by_id,
+            task_class_models=task_class_models,
+            skip_to=skip_to,
+            dry_run=dry_run,
+            service_manager=service_manager,
+            all_task_ids=all_task_ids,
+        )
+    finally:
+        _clear_current_task()
+        _set_worker_id(None)
+
+
+def _execute_task_body(
+    task: dict,
+    state: State,
+    file_defaults: dict,
+    cli: dict,
+    *,
+    phases_by_id: dict[str, dict] | None = None,
+    task_class_models: dict[str, dict] | None = None,
+    skip_to: str | None = None,
+    dry_run: bool = False,
+    service_manager: "ServiceManager | None" = None,
+    all_task_ids: list[int | str] | None = None,
+):
     # Build per-task layer dicts. Empty when None (v1 path) or unmatched.
     phase_dict: dict = {}
     phase_id = task.get("phase")
@@ -290,7 +384,7 @@ def execute_task(
                 reason=str(exc),
                 artifacts={"task_dir": str(task_dir)},
             ))
-            print(red(
+            _wprint(red(
                 f"\n  Task {tid} blocked: branch checkout "
                 f"failed: {exc}"
             ))
@@ -326,7 +420,7 @@ def execute_task(
                         "services_status": str(plans_dir / "services.json"),
                     },
                 ))
-                print(red(f"\n  Task {tid} blocked: {exc}"))
+                _wprint(red(f"\n  Task {tid} blocked: {exc}"))
                 return
             for ev in events:
                 if ev["event"] == "crashed_restarted":
@@ -355,7 +449,7 @@ def execute_task(
                             "services_status": str(plans_dir / "services.json"),
                         },
                     ))
-                    print(red(f"\n  Task {tid} blocked: {exc}"))
+                    _wprint(red(f"\n  Task {tid} blocked: {exc}"))
                     return
 
         # Snapshot prior failures for resume-context (task 10). The same
@@ -436,9 +530,9 @@ def execute_task(
     
         commit_msg = task.get("commit_message", f"task-{tid}: {task['title']}")
     
-        print(f"\n{bold('=' * 60)}")
-        print(bold(f"TASK {tid}: {task['title']}"))
-        print(bold("=" * 60))
+        _wprint(f"\n{bold('=' * 60)}")
+        _wprint(bold(f"TASK {tid}: {task['title']}"))
+        _wprint(bold("=" * 60))
     
         run_kwargs = dict(
             model=model, effort=effort,
@@ -449,8 +543,8 @@ def execute_task(
     
         # --- PHASE 1: PLAN ---
         if skip_to not in ("review", "implement") and resume_mode == "fresh":
-            _current_phase = "plan"
-            print(f"\n{bold('--- Phase 1: Planning ---')}")
+            _set_current_phase("plan")
+            _wprint(f"\n{bold('--- Phase 1: Planning ---')}")
             state.set_status(tid, "planning", plan_path=str(plan_path))
     
             prompt = build_plan_prompt(
@@ -460,8 +554,8 @@ def execute_task(
                 failure_context=failure_context_section,
             )
             if dry_run:
-                print(dim(f"  [DRY RUN] {len(prompt)} char prompt"))
-                print(prompt[:800])
+                _wprint(dim(f"  [DRY RUN] {len(prompt)} char prompt"))
+                _wprint(prompt[:800])
                 return
     
             code, _ = run_claude(
@@ -469,26 +563,26 @@ def execute_task(
                 phase="plan", usage_jsonl_path=usage_path,
                 **run_kwargs,
             )
-            if claude._last_run_rate_limited:
+            if claude._last_run("rate_limited", False):
                 _record_rate_limited_and_block(
                     state, tid, phase="plan", plan_path=None,
                     max_rate_limit_retries=max_rate_limit_retries,
                 )
                 return
             if not plan_path.exists():
-                print(red(f"  Plan file not created at {plan_path}"))
+                _wprint(red(f"  Plan file not created at {plan_path}"))
                 save_error_output(task_dir, code, _)
                 return
     
         # --- PHASE 2: REVIEW LOOP ---
         if skip_to != "implement" and resume_mode == "fresh":
-            _current_phase = "review"
-            print(f"\n{bold('--- Phase 2: Review Loop ---')}")
+            _set_current_phase("review")
+            _wprint(f"\n{bold('--- Phase 2: Review Loop ---')}")
             prev_feedback = ""
     
             for round_num in range(1, max_review_rounds + 1):
                 review_path = task_dir / f"review-{round_num}.md"
-                print(f"\n  {bold(f'Review round {round_num}/{max_review_rounds}')}")
+                _wprint(f"\n  {bold(f'Review round {round_num}/{max_review_rounds}')}")
     
                 state.set_status(tid, "reviewing", review_round=round_num)
                 prompt = build_review_prompt(
@@ -496,7 +590,7 @@ def execute_task(
                     prev_feedback, persona=persona_section,
                 )
                 if dry_run:
-                    print(dim(f"  [DRY RUN] Review prompt: {len(prompt)} chars"))
+                    _wprint(dim(f"  [DRY RUN] Review prompt: {len(prompt)} chars"))
                     return
     
                 run_claude(
@@ -504,20 +598,20 @@ def execute_task(
                     phase="review", usage_jsonl_path=usage_path,
                     **run_kwargs,
                 )
-                if claude._last_run_rate_limited:
+                if claude._last_run("rate_limited", False):
                     _record_rate_limited_and_block(
                         state, tid, phase="review", plan_path=plan_path,
                         max_rate_limit_retries=max_rate_limit_retries,
                     )
                     return
-    
+
                 approved, feedback = check_verdict(review_path)
                 if approved:
-                    print(green(f"  APPROVED at round {round_num}"))
+                    _wprint(green(f"  APPROVED at round {round_num}"))
                     state.set_status(tid, "approved")
                     break
                 else:
-                    print(yellow(f"  NEEDS REVISION"))
+                    _wprint(yellow(f"  NEEDS REVISION"))
                     prev_feedback = feedback
     
                     # Revise
@@ -532,7 +626,7 @@ def execute_task(
                         phase="revise", usage_jsonl_path=usage_path,
                         **run_kwargs,
                     )
-                    if claude._last_run_rate_limited:
+                    if claude._last_run("rate_limited", False):
                         _record_rate_limited_and_block(
                             state, tid, phase="review", plan_path=plan_path,
                             max_rate_limit_retries=max_rate_limit_retries,
@@ -540,7 +634,7 @@ def execute_task(
                         return
             else:
                 if on_max_review_rounds == "fail":
-                    print(red(
+                    _wprint(red(
                         f"  Max review rounds reached ({max_review_rounds}). "
                         f"on_max_review_rounds: fail — stopping; Implement skipped."
                     ))
@@ -579,21 +673,21 @@ def execute_task(
                     ))
                     return
                 # auto_approve (legacy v1 default)
-                print(yellow(
+                _wprint(yellow(
                     f"  Max review rounds reached. Proceeding with current "
                     f"plan (on_max_review_rounds: auto_approve)."
                 ))
                 state.set_status(tid, "approved")
     
         # --- PHASE 3: IMPLEMENT ---
-        _current_phase = "implement"
+        _set_current_phase("implement")
         if resume_mode == "all_done":
-            print(f"\n{bold('--- Phase 3: Implementation (skipped) ---')}")
-            print(green(
+            _wprint(f"\n{bold('--- Phase 3: Implementation (skipped) ---')}")
+            _wprint(green(
                 f"  All progress.md items marked [x]; gates will validate."
             ))
         else:
-            print(f"\n{bold('--- Phase 3: Implementation ---')}")
+            _wprint(f"\n{bold('--- Phase 3: Implementation ---')}")
             state.set_status(tid, "implementing")
             if resume_mode == "mid_list":
                 porcelain = _capture_git_porcelain()
@@ -610,7 +704,7 @@ def execute_task(
                     failure_context=failure_context_section,
                 )
             if dry_run:
-                print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
+                _wprint(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
                 return
     
             run_claude(
@@ -619,14 +713,14 @@ def execute_task(
                 **run_kwargs,
             )
     
-            if claude._last_run_rate_limited:
+            if claude._last_run("rate_limited", False):
                 _record_rate_limited_and_block(
                     state, tid, phase="implement", plan_path=plan_path,
                     max_rate_limit_retries=max_rate_limit_retries,
                 )
                 return
-    
-            if claude._last_run_timed_out:
+
+            if claude._last_run("timed_out", False):
                 state.set_status(
                     tid, "blocked",
                     block_reason="implementer_timeout",
@@ -640,10 +734,10 @@ def execute_task(
                     ),
                     artifacts={"plan": str(plan_path)},
                 ))
-                print(red(f"\n  Task {tid} blocked: implementer timeout."))
+                _wprint(red(f"\n  Task {tid} blocked: implementer timeout."))
                 return
     
-            if claude._last_run_subtype == "error_max_turns":
+            if claude._last_run("subtype") == "error_max_turns":
                 state.set_status(
                     tid, "blocked",
                     block_reason="implementer_max_turns",
@@ -657,7 +751,7 @@ def execute_task(
                     ),
                     artifacts={"plan": str(plan_path)},
                 ))
-                print(red(f"\n  Task {tid} blocked: implementer max-turns."))
+                _wprint(red(f"\n  Task {tid} blocked: implementer max-turns."))
                 return
     
         # --- POST-IMPLEMENT: precompute diff for agent gates (task 7 v0.3) ---
@@ -692,7 +786,7 @@ def execute_task(
                         "services_status": str(plans_dir / "services.json"),
                     },
                 ))
-                print(red(f"\n  Task {tid} blocked: {exc}"))
+                _wprint(red(f"\n  Task {tid} blocked: {exc}"))
                 return
             for ev in events:
                 if ev["event"] == "crashed_restarted":
@@ -721,7 +815,7 @@ def execute_task(
                             "services_status": str(plans_dir / "services.json"),
                         },
                     ))
-                    print(red(f"\n  Task {tid} blocked: {exc}"))
+                    _wprint(red(f"\n  Task {tid} blocked: {exc}"))
                     return
 
         # --- PHASE 4: GATES (task 11) ---
@@ -769,21 +863,21 @@ def execute_task(
                 registry=registry,
             )
             if unconfigured_lint:
-                print(yellow(
+                _wprint(yellow(
                     "  Skipping gate 'lint': no defaults.lint_command configured."
                 ))
             if unconfigured_untranslated_strings:
-                print(yellow(
+                _wprint(yellow(
                     "  Skipping gate 'untranslated-strings': no "
                     "defaults.untranslated_strings_command configured."
                 ))
             if unknown_gates:
-                print(yellow(
+                _wprint(yellow(
                     f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
                     f"(not registered; check spelling)"
                 ))
             if resolved_gates:
-                print(f"\n{bold('--- Phase 4: Gates ---')}")
+                _wprint(f"\n{bold('--- Phase 4: Gates ---')}")
                 # Augment the task dict so phase-inherited task_class
                 # is visible to gate `when` filters (task 20 §D9).
                 task_for_gates = {**task, "task_class": task_class_name}
@@ -818,7 +912,7 @@ def execute_task(
                         findings=curate_result.findings or [],
                         suggestions_path=suggestions_path,
                     )
-                    print(dim(
+                    _wprint(dim(
                         f"  [memory] curate: "
                         f"{counts['kept']} kept, "
                         f"{counts['dropped']} dropped, "
@@ -882,7 +976,7 @@ def execute_task(
                         verbatim=verbatim,
                         artifacts=artifacts,
                     ))
-                    print(red(
+                    _wprint(red(
                         f"\n  Task {tid} blocked: gate(s) failed "
                         f"({', '.join(r.name for r in blocking)})."
                     ))
@@ -915,7 +1009,7 @@ def execute_task(
                     ),
                     artifacts={"plan": str(plan_path)},
                 ))
-                print(red(
+                _wprint(red(
                     f"\n  Task {tid} blocked: git push failed."
                 ))
                 return
@@ -938,7 +1032,7 @@ def execute_task(
                     reason=str(exc),
                     artifacts={"plan": str(plan_path)},
                 ))
-                print(red(
+                _wprint(red(
                     f"\n  Task {tid} blocked: gh pr create failed."
                 ))
                 return
@@ -965,7 +1059,7 @@ def execute_task(
                             "pr_url": pr_url,
                         },
                     ))
-                    print(red(
+                    _wprint(red(
                         f"\n  Task {tid} blocked: gh pr merge failed."
                     ))
                     return
@@ -1015,18 +1109,18 @@ def execute_task(
                         n_distinct = sum(
                             1 for v in counted.values() if v > 0
                         )
-                        print(dim(
+                        _wprint(dim(
                             f"  [memory] {n_total} citation(s) "
                             f"incremented across {n_distinct} memor"
                             f"{'y' if n_distinct == 1 else 'ies'}."
                         ))
             except OSError as exc:
-                print(yellow(
+                _wprint(yellow(
                     f"  [memory] citation pass skipped: {exc}"
                 ))
 
         state.set_status(tid, "done", **done_extras)
-        print(green(f"\n  Task {tid} complete."))
+        _wprint(green(f"\n  Task {tid} complete."))
 
         # Lifecycle prune — runs AFTER set_status(done) so this task's
         # transition is visible to slate-completion detection and to
@@ -1050,13 +1144,13 @@ def execute_task(
                 slate_complete=slate_complete,
             )
             if deleted:
-                print(dim(
+                _wprint(dim(
                     f"  [memory] pruned {len(deleted)} expired "
                     f"memor{'y' if len(deleted) == 1 else 'ies'}: "
                     f"{', '.join(deleted)}"
                 ))
         except OSError as exc:
-            print(yellow(
+            _wprint(yellow(
                 f"  [memory] lifecycle prune skipped: {exc}"
             ))
 
@@ -1071,7 +1165,7 @@ def execute_task(
         try:
             current_count = count_memory_entries(memory_dir)
         except OSError as exc:
-            print(yellow(
+            _wprint(yellow(
                 f"  [memory] curate-threshold check skipped: {exc}"
             ))
             current_count = 0
@@ -1079,7 +1173,7 @@ def execute_task(
             if not state.data.get("pending_memory_curate"):
                 state.data["pending_memory_curate"] = True
                 state.save()
-                print(dim(
+                _wprint(dim(
                     f"  [memory] curate threshold crossed "
                     f"({current_count} > {threshold}); "
                     f"memory-curate will run on the next task."
@@ -1098,7 +1192,7 @@ def execute_task(
 def save_error_output(task_dir: Path, code: int, output: str):
     err_path = task_dir / "error-output.txt"
     err_path.write_text(f"Exit code: {code}\n\n{output}")
-    print(yellow(f"  Raw output saved to {err_path}"))
+    _wprint(yellow(f"  Raw output saved to {err_path}"))
 
 
 def _record_rate_limited_and_block(
@@ -1108,7 +1202,7 @@ def _record_rate_limited_and_block(
     """Record a `rate_limited` FailureRecord and set status to blocked.
 
     Called from each `run_claude` call site when
-    `claude._last_run_rate_limited` is True after the call. `plan_path`
+    `claude._last_run("rate_limited", False)` is True after the call. `plan_path`
     may be `None` (plan-phase failure where the plan never materialized).
     """
     artifacts: dict[str, str] = {}
@@ -1124,7 +1218,7 @@ def _record_rate_limited_and_block(
         ),
         artifacts=artifacts,
     ))
-    print(red(f"\n  Task {tid} blocked: rate-limit retries exhausted."))
+    _wprint(red(f"\n  Task {tid} blocked: rate-limit retries exhausted."))
 
 
 def _read_progress_text(progress_path: Path) -> str:
@@ -1677,36 +1771,316 @@ def explain_task(
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# T13 (v0.3 §2.5) — parallel slate scheduler
+# ---------------------------------------------------------------------------
+
+
+class _SlateScheduler:
+    """Owns the eligibility lock + in-flight set for a slate run."""
+
+    def __init__(
+        self,
+        *,
+        ordered_tasks: list[dict],
+        all_task_ids: list[int | str],
+        state: State,
+        file_defaults: dict,
+        cli_overrides: dict,
+        phases_by_id: dict[str, dict],
+        task_class_models: dict[str, dict],
+        service_manager: "ServiceManager",
+        dry_run: bool,
+        parallelism: int,
+        skip_to: str | None = None,
+    ) -> None:
+        self.ordered_tasks = ordered_tasks
+        self.all_task_ids = all_task_ids
+        self.state = state
+        self.file_defaults = file_defaults
+        self.cli_overrides = cli_overrides
+        self.phases_by_id = phases_by_id
+        self.task_class_models = task_class_models
+        self.service_manager = service_manager
+        self.dry_run = dry_run
+        self.parallelism = parallelism
+        self.skip_to = skip_to
+        self._lock = threading.Lock()
+        self._in_flight: set = set()
+        # Per-run "already attempted" set: prevents re-claim loops when
+        # a task returns without flipping status to done/blocked. The
+        # canonical case is dry_run, where execute_task sets
+        # status="planning" then short-circuits — without this set the
+        # scheduler would re-claim the same task forever. (Plan §B4
+        # anticipates blocked retry-loops; this covers the planning-
+        # left-over symmetry.)
+        self._attempted: set = set()
+        # O(1) lookup table for the key_files contention pass — see plan.
+        self._tasks_by_id: dict = {t["id"]: t for t in ordered_tasks}
+
+    def _key_files(self, task: dict) -> set[str]:
+        kf = task.get("key_files") or []
+        return set(kf)
+
+    def _is_eligible(self, task: dict) -> bool:
+        """Pure: assumes caller holds self._lock."""
+        tid = task["id"]
+        # Already attempted in this slate run? skip. Prevents an
+        # infinite re-claim loop when execute_task returns without
+        # flipping status to done/blocked (canonical: dry_run).
+        if tid in self._attempted:
+            return False
+        s = self.state.get(tid)["status"]
+        if s == "done":
+            return False
+        # Already blocked? skip — without this, a worker_exception path
+        # would release the task back to the eligibility pool and the
+        # same worker (or another) would re-claim and re-fail in a
+        # tight loop. See plan §B4.
+        if s == "blocked":
+            return False
+        if tid in self._in_flight:
+            return False
+        # In dry-run, parents never reach status="done" (execute_task
+        # short-circuits after `set_status("planning", ...)`), so the
+        # strict depends_on filter would prevent every dependent from
+        # ever running. v0.2.0 dry-run iterated all tasks once; we
+        # preserve that — dry-run is a preview, not a real execution,
+        # so dep ordering doesn't matter.
+        if not self.dry_run:
+            for d in (task.get("depends_on") or []):
+                if self.state.get(d)["status"] != "done":
+                    return False
+        my_kf = self._key_files(task)
+        if my_kf:
+            for in_flight_id in self._in_flight:
+                t = self._tasks_by_id.get(in_flight_id)
+                if t is None:
+                    continue
+                their_kf = self._key_files(t)
+                if my_kf & their_kf:
+                    return False
+        return True
+
+    def _claim_next_eligible(self) -> dict | None:
+        """Atomically find an eligible task and add to in_flight."""
+        with self._lock:
+            for t in self.ordered_tasks:
+                if self._is_eligible(t):
+                    self._in_flight.add(t["id"])
+                    return t
+            return None
+
+    def _release(self, task_id) -> None:
+        with self._lock:
+            self._in_flight.discard(task_id)
+
+    def run_serial_with_phase_tracking(self) -> None:
+        """parallelism=1 path. Mirrors v0.2.0's serial loop verbatim
+        except the `for task in ordered_tasks` is replaced with a
+        claim loop so the eligibility predicate is exercised in
+        single-worker mode too (deduplication of code paths)."""
+        prev_phase: str | None = None
+        while True:
+            candidate = self._claim_next_eligible()
+            if candidate is None:
+                break
+            try:
+                cur_phase = candidate.get("phase")
+                if cur_phase != prev_phase:
+                    if prev_phase is not None:
+                        self.service_manager.tear_down_for_scope("phase")
+                    if cur_phase is not None:
+                        pdict = (
+                            (self.phases_by_id.get(cur_phase) or {})
+                            .get("defaults") or {}
+                        )
+                        phase_required = list(
+                            pdict.get("services_required_extra") or []
+                        )
+                        phase_scope = [
+                            n for n in phase_required
+                            if self.service_manager.spec_lifetime(n) == "phase"
+                        ]
+                        if not self.dry_run:
+                            try:
+                                self.service_manager.ensure(phase_scope)
+                            except ServiceUnavailableError as exc:
+                                print(red(
+                                    f"Error: phase '{cur_phase}' service "
+                                    f"start failed: {exc}"
+                                ), file=sys.stderr)
+                                prev_phase = cur_phase
+                                continue
+                    prev_phase = cur_phase
+                execute_task(
+                    candidate, self.state, self.file_defaults,
+                    self.cli_overrides,
+                    phases_by_id=self.phases_by_id,
+                    task_class_models=self.task_class_models,
+                    skip_to=self.skip_to,
+                    dry_run=self.dry_run,
+                    service_manager=self.service_manager,
+                    all_task_ids=self.all_task_ids,
+                    worker_id=None,
+                )
+            finally:
+                with self._lock:
+                    self._attempted.add(candidate["id"])
+                self._release(candidate["id"])
+
+    def run_parallel(self) -> None:
+        """parallelism>1 path. No phase tracking — schema interlock
+        forbids lifetime=phase services. Worker exceptions are caught
+        and recorded; one worker's failure does not stop others."""
+        with ThreadPoolExecutor(max_workers=self.parallelism) as ex:
+            futures = {
+                ex.submit(self._worker_loop)
+                for _ in range(self.parallelism)
+            }
+            for fut in as_completed(futures):
+                fut.result()  # propagate unhandled (shouldn't happen)
+
+    def _worker_loop(self) -> None:
+        while True:
+            candidate = self._claim_next_eligible()
+            if candidate is None:
+                with self._lock:
+                    if not self._in_flight:
+                        return
+                # Brief sleep before retrying — phase boundaries last
+                # minutes, 1s granularity is fine.
+                time.sleep(1.0)
+                continue
+            tid = candidate["id"]
+            try:
+                execute_task(
+                    candidate, self.state, self.file_defaults,
+                    self.cli_overrides,
+                    phases_by_id=self.phases_by_id,
+                    task_class_models=self.task_class_models,
+                    skip_to=self.skip_to,
+                    dry_run=self.dry_run,
+                    service_manager=self.service_manager,
+                    all_task_ids=self.all_task_ids,
+                    worker_id=tid,
+                )
+            except Exception as exc:
+                # Defensive: any uncaught exception → mark blocked +
+                # log + keep worker alive. (See plan §D8.)
+                self.state.set_status(
+                    tid, "blocked", block_reason="worker_exception",
+                )
+                self.state.record_failure(tid, make_failure_record(
+                    failure_class="worker_exception",
+                    phase="worker",
+                    reason=f"{type(exc).__name__}: {exc}",
+                ))
+                print(red(
+                    f"[task-{tid}] Worker exception: "
+                    f"{type(exc).__name__}: {exc}"
+                ))
+            finally:
+                with self._lock:
+                    self._attempted.add(tid)
+                self._release(tid)
+
+
+def run_slate(
+    *,
+    parallelism: int,
+    ordered_tasks: list[dict],
+    all_task_ids: list[int | str],
+    state: State,
+    file_defaults: dict,
+    cli_overrides: dict,
+    phases_by_id: dict[str, dict],
+    task_class_models: dict[str, dict],
+    service_manager: "ServiceManager",
+    dry_run: bool,
+    skip_to: str | None = None,
+) -> None:
+    """Run a slate of tasks through the worker pool.
+
+    `parallelism=1` runs serially with one worker — observable
+    behavior matches v0.2.0 (same task order via topological sort,
+    same phase-tear-down hook between phases, same state writes).
+
+    `parallelism>1` runs up to N tasks concurrently. Eligibility
+    (depends_on done + no key_files conflict with in-flight tasks)
+    is re-evaluated under a single scheduler lock after each task
+    completes.
+
+    `all_task_ids` is the full slate's task-id list, threaded through
+    to every `execute_task` call so T15's `slate_complete` gate fires
+    correctly.
+
+    `skip_to` is the operator's `--skip-to <phase>` argparse value
+    (None when unset). Forwarded to every `execute_task` call so
+    slate-mode `--skip-to` continues to work.
+    """
+    sched = _SlateScheduler(
+        ordered_tasks=ordered_tasks,
+        all_task_ids=all_task_ids,
+        state=state,
+        file_defaults=file_defaults,
+        cli_overrides=cli_overrides,
+        phases_by_id=phases_by_id,
+        task_class_models=task_class_models,
+        service_manager=service_manager,
+        dry_run=dry_run,
+        parallelism=parallelism,
+        skip_to=skip_to,
+    )
+    if parallelism == 1:
+        sched.run_serial_with_phase_tracking()
+    else:
+        sched.run_parallel()
+
+
 def handle_sigint(signum, frame):
     _kill_child()  # Kill any running claude process and its children
 
-    # Best-effort: record a manual_stop FailureRecord when a task is
-    # genuinely in flight. Status check filters out completed/idle
-    # tasks (the global _current_task_id is not reset on execute_task
-    # exit). All I/O wrapped — signal handlers must never raise.
-    if _current_state is not None and _current_task_id:
+    # T13 §F4.5: snapshot the per-thread current-task dict and iterate
+    # ALL in-flight workers. The state-mutating block is guarded by
+    # `_current_state is not None`, but the resume print runs
+    # unconditionally (matches v0.2.0's print-always shape).
+    with _current_tasks_lock:
+        snapshot = list(_current_tasks.values())
+
+    if _current_state is not None:
+        for tid, phase in snapshot:
+            try:
+                entry = _current_state.get(tid)
+                if entry["status"] in (
+                    "planning", "reviewing", "revising",
+                    "approved", "implementing", "awaiting_human",
+                ):
+                    _current_state.record_failure(
+                        tid,
+                        make_failure_record(
+                            failure_class="manual_stop",
+                            phase=phase,
+                            reason="User-initiated SIGINT during execution.",
+                        ),
+                    )
+            except Exception:
+                pass
+        # Belt-and-suspenders flush.
         try:
-            entry = _current_state.get(_current_task_id)
-            if entry["status"] in (
-                "planning", "reviewing", "revising",
-                "approved", "implementing",
-            ):
-                _current_state.record_failure(
-                    _current_task_id,
-                    make_failure_record(
-                        failure_class="manual_stop",
-                        phase=_current_phase,
-                        reason="User-initiated SIGINT during execution.",
-                    ),
-                )
+            _current_state.save()
         except Exception:
             pass
 
-    # Belt-and-suspenders save: covers the path where `record_failure`
-    # was skipped (status mismatch) but earlier state mutations need
-    # to flush.
-    if _current_state:
-        _current_state.save()
     print(f"\n{yellow('Interrupted.')} Resume with:")
-    print(f"  claude-plan-execute --task {_current_task_id} --skip-to {_current_phase}")
+    if len(snapshot) == 1:
+        tid, phase = snapshot[0]
+        print(f"  claude-plan-execute --task {tid} --skip-to {phase}")
+    elif len(snapshot) > 1:
+        print(
+            f"  ({len(snapshot)} tasks were in flight; "
+            f"resume each individually)"
+        )
+        for tid, phase in snapshot:
+            print(f"  claude-plan-execute --task {tid} --skip-to {phase}")
     sys.exit(130)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,6 +50,7 @@ FAILURE_CLASSES = (
     "push_failed",                        # v0.3 task 9 — Post-Phase-4 git push -u origin <branch>
     "pr_create_failed",                   # v0.3 task 9 — Post-Phase-4 gh pr create / list failure
     "merge_failed",                       # v0.3 task 9 — Post-Phase-4 gh pr merge --auto --squash failure
+    "worker_exception",                   # v0.3 task 13 — uncaught exception in slate worker loop
 )
 
 
@@ -138,6 +140,7 @@ class State:
     """Persistent state tracker with atomic writes."""
 
     def __init__(self, path: Path):
+        self._lock = threading.RLock()
         self.path = path
         self.data: dict = {
             "schema_version": SCHEMA_VERSION,
@@ -157,20 +160,22 @@ class State:
                     entry.setdefault("current_attempt", 1)
 
     def get(self, task_id: int | str) -> dict:
-        key = str(task_id)
-        if key not in self.data["tasks"]:
-            self.data["tasks"][key] = {
-                "status": "pending",
-                "attempts": [],
-                "current_attempt": 1,
-            }
-        return self.data["tasks"][key]
+        with self._lock:
+            key = str(task_id)
+            if key not in self.data["tasks"]:
+                self.data["tasks"][key] = {
+                    "status": "pending",
+                    "attempts": [],
+                    "current_attempt": 1,
+                }
+            return self.data["tasks"][key]
 
     def set_status(self, task_id: int | str, status: str, **extra):
-        entry = self.get(task_id)
-        entry["status"] = status
-        entry.update(extra)
-        self.save()
+        with self._lock:
+            entry = self.get(task_id)
+            entry["status"] = status
+            entry.update(extra)
+            self.save()
 
     def record_failure(
         self, task_id: int | str, failure_record: dict,
@@ -181,36 +186,39 @@ class State:
         The caller is responsible for those (typically a sibling
         `set_status(tid, "blocked", block_reason=...)` call).
         """
-        entry = self.get(task_id)
-        entry.setdefault("attempts", []).append(failure_record)
-        self.save()
+        with self._lock:
+            entry = self.get(task_id)
+            entry.setdefault("attempts", []).append(failure_record)
+            self.save()
 
     def save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(self.data, f, indent=2)
-            os.rename(tmp, self.path)
-        except BaseException:
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self.data, f, indent=2)
+                os.rename(tmp, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
     def reset(self, task_id: int | str | None = None):
-        if task_id is not None:
-            self.data["tasks"][str(task_id)] = {
-                "status": "pending",
-                "attempts": [],
-                "current_attempt": 1,
-            }
-        else:
-            for k in self.data["tasks"]:
-                self.data["tasks"][k] = {
+        with self._lock:
+            if task_id is not None:
+                self.data["tasks"][str(task_id)] = {
                     "status": "pending",
                     "attempts": [],
                     "current_attempt": 1,
                 }
-        self.save()
+            else:
+                for k in self.data["tasks"]:
+                    self.data["tasks"][k] = {
+                        "status": "pending",
+                        "attempts": [],
+                        "current_attempt": 1,
+                    }
+            self.save()
