@@ -25,6 +25,100 @@ _VERBATIM_LABEL_HINTS: dict[str, str] = {
 }
 
 
+# T15 (v0.3 §"cross-task-memory"). Each per-phase block is injected
+# inside the body string of its respective builder. Keep wording
+# tight — every byte ships in every prompt.
+
+_MEMORY_SECTION_PLAN = """## Memory
+
+You have a project memory directory auto-loaded by Claude Code at
+session start (`~/.claude/projects/<encoded-cwd>/memory/MEMORY.md`).
+Before planning:
+1. Read the loaded MEMORY.md, especially entries with type `feedback`
+   or `project` — these capture pitfalls and constraints discovered
+   in earlier tasks.
+2. Apply any learnings that bear on this task's design choices.
+3. When a memory drives a step in your plan, ANNOTATE that step with
+   `[MEM: <memory_name>]` (using the exact memory file's `name`
+   slug). The runner counts these citations to decide which memories
+   stay relevant.
+
+"""
+
+_MEMORY_SECTION_REVIEW = """## Memory
+
+The project memory directory (`~/.claude/projects/<encoded-cwd>/
+memory/`) is auto-loaded for this session. Before reviewing:
+1. Cross-check the plan against MEMORY.md, especially entries with
+   type `feedback` or `project`. Flag plans that contradict an
+   accepted learning (e.g., "the plan does X, but memory entry
+   `feedback_pydantic_v2` says Y").
+2. Verify every `[MEM: <name>]` citation in the plan resolves to a
+   real, currently-live memory file in the directory. Hallucinated
+   names are a NEEDS_REVISION issue.
+
+"""
+
+_MEMORY_SECTION_IMPLEMENT = """## Memory
+
+You have four prompt-overlay layers feeding this session. Pick the
+right one when persisting knowledge:
+
+  1. `docs/persona.md` (hand-curated): stable conventions.
+  2. `docs/decisions/` (hand-curated): ADR-style architectural
+     choices.
+  3. `~/.claude/projects/<encoded-cwd>/memory/MEMORY.md` + per-memory
+     files (agent-curated, auto-loaded): tactical pitfalls discovered
+     in flight. THIS is the layer you write to.
+  4. failure_context (runner-injected, transient): per-attempt prior
+     failure verbatim.
+
+If during this implementation you discover a non-obvious pitfall,
+gotcha, or trick worth saving for future tasks, save it as a memory
+using the standard Claude Code pattern.
+
+FRONTMATTER REQUIRED on every new memory:
+
+```
+---
+name: <slug>
+description: <one-line — used to decide relevance in future tasks>
+type: user|feedback|project|reference
+lifecycle: evergreen | slate:<slate-id> | task:<id>
+citation_count: 0
+---
+```
+
+DEFAULT LIFECYCLE BY TYPE (override only when you know better):
+  - type=project   -> lifecycle: slate:$CLAUDE_PLAN_EXECUTE_SLATE_ID
+  - type=feedback  -> lifecycle: evergreen
+  - type=reference -> lifecycle: evergreen
+  - type=user      -> lifecycle: evergreen
+
+The current slate id is exposed via the env var
+`CLAUDE_PLAN_EXECUTE_SLATE_ID`. Read it with `echo
+$CLAUDE_PLAN_EXECUTE_SLATE_ID` (or via Bash). Override default ->
+explicit (e.g., `lifecycle: task:8`) when the lesson applies only
+until a specific task lands.
+
+WARNING — `lifecycle: task:<N>` footgun: N must be STRICTLY GREATER
+than the current task id. Memories scoped to the CURRENT task
+(`task:<self>`) are pruned at this task's success boundary and will
+NEVER reach the next planner. If your lesson is meant to die at the
+end of this task, just don't write it; if it should survive into the
+next planning round, choose `evergreen` or `task:<future_id>`.
+
+TERSENESS BUDGET: title <= 60 chars, body <= 5 lines.
+
+DO NOT SAVE:
+  - trivia or one-off task state;
+  - restated `docs/persona.md` content;
+  - project-state recap of what just changed in code (that belongs
+    in commit messages, not memory).
+
+"""
+
+
 def build_persona_section(persona: str, persona_extra: str = "") -> str:
     """Compose the project-conventions block for a prompt.
 
@@ -194,6 +288,7 @@ def build_plan_prompt(
         )
 
     return failure_context + persona + decisions + (
+        _MEMORY_SECTION_PLAN +
         f"You are planning the implementation of a task in this codebase.\n"
         f"Read all relevant files before producing your plan.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"
@@ -224,6 +319,7 @@ def build_review_prompt(task: dict, plan_path: str, review_path: str,
         )
 
     return persona + (
+        _MEMORY_SECTION_REVIEW +
         f"You are reviewing an implementation plan.\n"
         f"Your job is to find problems, gaps, and risks BEFORE implementation.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"
@@ -266,6 +362,7 @@ def build_implement_prompt(task: dict, plan_path: str,
     tid = task["id"]
     progress_path = f"plans/task-{tid}/progress.md"
     return failure_context + persona + (
+        _MEMORY_SECTION_IMPLEMENT +
         f"You are implementing a validated plan.\n"
         f"The plan has been reviewed and approved. Follow it precisely.\n\n"
         f"TASK {tid}: {task['title']}\n\n"

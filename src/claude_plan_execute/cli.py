@@ -82,6 +82,55 @@ def run_preflight(file_defaults: dict) -> int:
     return 1
 
 
+def _resolve_slate_id(state: State, tasks_path: Path) -> str:
+    """Resolve a stable slate id for the current run.
+
+    Priority:
+      1. `state.data["slate_id"]` if already set (sticky across re-runs).
+      2. `git rev-parse --abbrev-ref HEAD` if it succeeds AND returns
+         a non-detached, non-task-prefixed branch name. We exclude
+         names starting with `task/` (per-task branch from T9
+         branch_per_task) — otherwise the slate id would change
+         per task, defeating slate-scoped memory pruning.
+      3. Modification-time of `tasks_path` formatted as
+         `mtime-<int>` (epoch seconds floor) — deterministic for the
+         lifetime of the file but stable enough for memory-scoping.
+
+    Persists to `state.data["slate_id"]` on first compute and saves.
+    """
+    cached = state.data.get("slate_id")
+    if cached:
+        return str(cached)
+
+    slate_id: str | None = None
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            branch = proc.stdout.strip()
+            if (
+                branch
+                and branch != "HEAD"
+                and not branch.startswith("task/")
+            ):
+                slate_id = branch
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    if slate_id is None:
+        try:
+            mtime = int(tasks_path.stat().st_mtime)
+            slate_id = f"mtime-{mtime}"
+        except OSError:
+            slate_id = "unknown"
+
+    state.data["slate_id"] = slate_id
+    state.save()
+    return slate_id
+
+
 def cmd_decisions_index(args) -> int:
     """Rebuild `<decisions_dir>/index.md` from per-file frontmatter.
 
@@ -523,6 +572,14 @@ def main():
     # Install SIGINT handler
     signal.signal(signal.SIGINT, handle_sigint)
 
+    # T15: resolve a stable slate id once at slate-runner entry, persist
+    # it on `state.json` (sticky across re-runs), and expose it via the
+    # process env so the implement-phase prompt overlay can interpolate
+    # it as the default `lifecycle:` value for newly-saved memories.
+    slate_id = _resolve_slate_id(state, tasks_path)
+    os.environ["CLAUDE_PLAN_EXECUTE_SLATE_ID"] = slate_id
+    all_task_ids: list[int | str] = [t["id"] for t in ordered_tasks]
+
     # v0.3 task 8 (Plan §D5.2): compute the union of services_required
     # across every task in the slate, even in --task mode (see §11.14
     # for the documented rationale — run-scope services are reused
@@ -588,6 +645,7 @@ def main():
                 skip_to=args.skip_to,
                 dry_run=args.dry_run,
                 service_manager=service_manager,
+                all_task_ids=all_task_ids,
             )
         else:
             for task in ordered_tasks:
@@ -633,6 +691,7 @@ def main():
                     task_class_models=task_class_models,
                     dry_run=args.dry_run,
                     service_manager=service_manager,
+                    all_task_ids=all_task_ids,
                 )
     finally:
         # Unconditional cleanup: idempotent on stopped services, so a

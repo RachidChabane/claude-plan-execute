@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -11,6 +12,11 @@ from claude_plan_execute import claude
 from claude_plan_execute.claude import _kill_child, run_claude
 from claude_plan_execute.colors import bold, dim, green, red, yellow
 from claude_plan_execute.config import resolve_task_config
+from claude_plan_execute.memory import (
+    increment_citations_for_plan,
+    memory_dir_for_cwd,
+    prune_expired_memories,
+)
 from claude_plan_execute.gates import Gate, default_registry, run_gates
 from claude_plan_execute.gates import _when_matches as _gate_when_matches
 from claude_plan_execute.gates.shell import _tail_cap
@@ -169,6 +175,7 @@ def execute_task(
     skip_to: str | None = None,
     dry_run: bool = False,
     service_manager: "ServiceManager | None" = None,
+    all_task_ids: list[int | str] | None = None,
 ):
     global _current_state, _current_task_id, _current_phase
     _current_state = state
@@ -229,6 +236,12 @@ def execute_task(
     )
     # Track the path on the per-task state entry so the dashboard can find it.
     entry = state.get(tid)
+    # T15: snapshot status BEFORE any phase mutates it (Phase 3 flips
+    # it to "implementing" at line 570). Used by the citation pass at
+    # the success-path trailer to avoid double-counting on a re-run of
+    # an already-done task. Read as a string -> immutable -> unaffected
+    # by later set_status calls on the same entry dict.
+    prior_status = entry["status"]
     entry["resolved_config_path"] = str(resolved_config_path)
     state.save()
 
@@ -908,8 +921,70 @@ def execute_task(
                     service_manager.reset_crash_count(name)
         _service_teardown_after_task(service_manager)
 
+        # ----- T15: cross-task memory passes -------------------------
+        # `memory_dir_for_cwd` is pure (does not require dir to exist);
+        # both helpers below short-circuit when the dir is missing.
+        memory_dir = memory_dir_for_cwd(Path.cwd())
+
+        # Citation pass — uses `prior_status` snapshotted at line 231
+        # (BEFORE Phase 3 mutated status to "implementing"). Re-running
+        # a task whose status was already "done" must NOT double-count.
+        if prior_status != "done":
+            try:
+                if plan_path.is_file():
+                    plan_text = plan_path.read_text(encoding="utf-8")
+                    counted = increment_citations_for_plan(
+                        memory_dir, plan_text,
+                    )
+                    n_total = sum(counted.values())
+                    if n_total > 0:
+                        n_distinct = sum(
+                            1 for v in counted.values() if v > 0
+                        )
+                        print(dim(
+                            f"  [memory] {n_total} citation(s) "
+                            f"incremented across {n_distinct} memor"
+                            f"{'y' if n_distinct == 1 else 'ies'}."
+                        ))
+            except OSError as exc:
+                print(yellow(
+                    f"  [memory] citation pass skipped: {exc}"
+                ))
+
         state.set_status(tid, "done", **done_extras)
         print(green(f"\n  Task {tid} complete."))
+
+        # Lifecycle prune — runs AFTER set_status(done) so this task's
+        # transition is visible to slate-completion detection and to
+        # `is_task_done(this_tid)`.
+        slate_id = os.environ.get("CLAUDE_PLAN_EXECUTE_SLATE_ID", "")
+        slate_complete = (
+            all(
+                state.get(t_id)["status"] == "done"
+                for t_id in all_task_ids
+            )
+            if all_task_ids is not None
+            else False
+        )
+        try:
+            deleted = prune_expired_memories(
+                memory_dir,
+                is_task_done=lambda t: (
+                    state.get(t)["status"] == "done"
+                ),
+                slate_id=slate_id,
+                slate_complete=slate_complete,
+            )
+            if deleted:
+                print(dim(
+                    f"  [memory] pruned {len(deleted)} expired "
+                    f"memor{'y' if len(deleted) == 1 else 'ies'}: "
+                    f"{', '.join(deleted)}"
+                ))
+        except OSError as exc:
+            print(yellow(
+                f"  [memory] lifecycle prune skipped: {exc}"
+            ))
         return
     finally:
         # v0.3 task 8 (Plan §D4.6): defensive teardown for every

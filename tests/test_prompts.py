@@ -212,10 +212,11 @@ def test_plan_prompt_persona_appears_before_body():
 
 
 def test_plan_prompt_byte_length_unchanged_when_persona_empty():
-    """Pin (D7): with persona='', output is byte-identical to pre-task-7.
-    test_runner.py::test_plan_prompt_byte_length_matches_baseline asserts 734."""
+    """Pin (D7): with persona='', output is byte-identical to the
+    post-T15 baseline (3 builders gained `_MEMORY_SECTION_*`).
+    test_runner.py::test_plan_prompt_byte_length_matches_baseline asserts 1341."""
     out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
-    assert len(out) == 734
+    assert len(out) == 1341
 
 
 def test_review_prompt_default_persona_is_empty():
@@ -274,14 +275,15 @@ def test_implement_prompt_prepends_persona_when_supplied():
 
 
 def test_implement_prompt_byte_length_unchanged_when_persona_empty():
-    """Pin: post-task-6-v0.3 baseline preserved when persona defaults to ''.
+    """Pin: post-T15 baseline preserved when persona defaults to ''.
 
     Task 6 v0.3 §D1 added the WIP-commit / progress.md instruction block.
+    T15 (v0.3 §"cross-task-memory") added _MEMORY_SECTION_IMPLEMENT.
     """
     out = build_implement_prompt(
         {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 1129
+    assert len(out) == 3255
 
 
 def test_implement_prompt_no_longer_mentions_tests():
@@ -413,11 +415,11 @@ def test_plan_prompt_accepts_decisions_kwarg():
 
 
 def test_plan_prompt_byte_length_unchanged_when_decisions_empty():
-    """Pin (D9): with decisions='' (and persona='' default), output is
-    byte-identical to pre-task-7. Same fixed input as
+    """Pin (D9): with decisions='' (and persona='' default), output
+    matches the post-T15 baseline. Same fixed input as
     test_plan_prompt_byte_length_matches_baseline in test_runner.py."""
     out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
-    assert len(out) == 734
+    assert len(out) == 1341
 
 
 # ---------------------------------------------------------------------------
@@ -800,9 +802,9 @@ def test_plan_prompt_failure_context_keyword_only():
 
 def test_plan_prompt_byte_length_unchanged_when_failure_context_empty():
     """Pin (D10): with failure_context='' (and persona/decisions defaults),
-    the byte count matches the existing 734 baseline."""
+    the byte count matches the post-T15 baseline."""
     out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
-    assert len(out) == 734
+    assert len(out) == 1341
 
 
 def test_implement_prompt_default_failure_context_is_empty():
@@ -843,14 +845,15 @@ def test_implement_prompt_failure_context_keyword_only():
 
 
 def test_implement_prompt_byte_length_unchanged_when_failure_context_empty():
-    """Pin: post-task-6-v0.3 baseline preserved when failure_context defaults to ''.
+    """Pin: post-T15 baseline preserved when failure_context defaults to ''.
 
     Task 6 v0.3 §D1 added the WIP-commit / progress.md instruction block.
+    T15 (v0.3 §"cross-task-memory") added _MEMORY_SECTION_IMPLEMENT.
     """
     out = build_implement_prompt(
         {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 1129
+    assert len(out) == 3255
 
 
 # ---------------------------------------------------------------------------
@@ -1047,3 +1050,123 @@ def test_resume_prompt_does_not_accept_decisions_kwarg():
             "p.md", "prog.md", "- [~] x", "", "msg",
             decisions="should not be accepted",
         )
+
+
+# ---------------------------------------------------------------------------
+# G. Memory section in plan/review/implement prompts (task 15)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_prompt_includes_memory_section():
+    out = build_plan_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md",
+    )
+    assert "## Memory" in out
+    assert "MEMORY.md" in out
+    assert "[MEM:" in out                 # the citation directive
+
+
+def test_plan_prompt_memory_section_after_decisions_before_body():
+    """The Memory section lives INSIDE the body — between decisions
+    and the 'You are planning' line."""
+    decisions = "## Architectural decisions on file\n\nDECISIONSMARKER\n\n"
+    out = build_plan_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md",
+        decisions=decisions,
+    )
+    d_idx = out.index("DECISIONSMARKER")
+    m_idx = out.index("## Memory")
+    body_idx = out.index("You are planning")
+    assert d_idx < m_idx < body_idx
+
+
+def test_plan_prompt_memory_section_after_failure_context():
+    """failure_context still wraps everything (the four-prepend
+    composition order is unchanged)."""
+    fc = "FCMARKER\n\n"
+    out = build_plan_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md",
+        failure_context=fc,
+    )
+    fc_idx = out.index("FCMARKER")
+    m_idx = out.index("## Memory")
+    assert fc_idx < m_idx
+
+
+def test_plan_prompt_memory_section_after_persona():
+    persona = "## Project conventions\n\nPERSONAMARKER\n\n"
+    out = build_plan_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md",
+        persona=persona,
+    )
+    p_idx = out.index("PERSONAMARKER")
+    m_idx = out.index("## Memory")
+    assert p_idx < m_idx
+
+
+def test_review_prompt_includes_memory_section():
+    out = build_review_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "r.md",
+    )
+    assert "## Memory" in out
+    # The reviewer-specific directive: verify cited names exist.
+    assert "[MEM:" in out
+    assert "currently-live" in out or "live memory" in out
+    # Contradiction-flag directive.
+    assert "contradict" in out
+
+
+def test_implement_prompt_includes_memory_section():
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
+    )
+    assert "## Memory" in out
+    # Four-layer taxonomy
+    assert "persona.md" in out
+    assert "docs/decisions" in out
+    assert "MEMORY.md" in out
+    assert "failure_context" in out
+    # Frontmatter schema
+    assert "lifecycle:" in out
+    assert "citation_count" in out
+    # Default lifecycles by type
+    assert "type=project" in out
+    assert "type=feedback" in out
+    # Don't-save list
+    assert "DO NOT SAVE" in out
+    # Slate id env var name
+    assert "CLAUDE_PLAN_EXECUTE_SLATE_ID" in out
+    # T15 review-1 fix: footgun warning against scoping a memory to
+    # the current task (would be pruned before the next planner sees it).
+    assert "footgun" in out
+    assert "task:<self>" in out
+
+
+def test_implement_prompt_memory_section_appears_before_step_1():
+    """The Memory section is body-internal — it precedes the
+    'You are implementing' line and the step list."""
+    out = build_implement_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
+    )
+    m_idx = out.index("## Memory")
+    body_idx = out.index("You are implementing")
+    assert m_idx < body_idx
+
+
+def test_resume_prompt_does_NOT_include_memory_section():
+    """T15 §C.5: resume is mid-implement; memory directives ship in
+    the original implement prompt only."""
+    out = build_resume_prompt(
+        {"id": 1, "title": "T", "description": "D"},
+        "p.md", "prog.md", "- [~] x", "", "msg",
+    )
+    assert "## Memory" not in out
+
+
+def test_revise_prompt_does_NOT_include_memory_section():
+    """T15 §C.6: revise reuses Plan's citations. No new memory
+    section needed."""
+    out = build_revise_prompt(
+        {"id": 1, "title": "T", "description": "D"}, "p.md", "r.md",
+    )
+    assert "## Memory" not in out

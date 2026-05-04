@@ -25,10 +25,16 @@ from claude_plan_execute.state import State
 
 
 @pytest.fixture(autouse=True)
-def _reset_module_globals():
+def _reset_module_globals(monkeypatch, tmp_path_factory):
     """Reset claude._active_child, claude._last_run_*, and runner._current_*
     between tests. Without the claude flag reset, a test that sets
-    _last_run_timed_out via a stub leaks the flag into subsequent tests."""
+    _last_run_timed_out via a stub leaks the flag into subsequent tests.
+
+    T15: also default-stub runner.memory_dir_for_cwd to an absent
+    path, so the cross-task memory passes never touch the operator's
+    real ~/.claude/projects/... directory. Tests that need a writable
+    memdir opt in via _stub_memory_dir(monkeypatch, tmp_path).
+    """
     claude._active_child = None
     claude._last_run_timed_out = False
     claude._last_run_subtype = None
@@ -42,6 +48,16 @@ def _reset_module_globals():
     runner._current_state = None
     runner._current_task_id = 0
     runner._current_phase = "plan"
+
+    # T15: default isolation. Each test gets a fresh non-existent path
+    # so neither citation pass nor lifecycle prune ever touches the
+    # operator's real ~/.claude/projects/<encoded-cwd>/memory/.
+    isolated_absent = tmp_path_factory.mktemp("memdir_iso") / "absent"
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.memory_dir_for_cwd",
+        lambda _cwd: isolated_absent,
+    )
+
     yield
     claude._active_child = None
     claude._last_run_timed_out = False
@@ -138,8 +154,9 @@ def test_plan_prompt_renders_each_key_file_with_dash_indent():
 def test_plan_prompt_byte_length_matches_baseline():
     # Pin: byte-identical output for fixed input. If this fails, the format
     # changed — verify the change is intentional before updating the integer.
+    # T15 (v0.3 §"cross-task-memory") added _MEMORY_SECTION_PLAN to the body.
     out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
-    assert len(out) == 734
+    assert len(out) == 1341
 
 
 def test_review_prompt_includes_review_path():
@@ -196,10 +213,11 @@ def test_implement_prompt_includes_commit_message_verbatim():
 
 def test_implement_prompt_byte_length_matches_baseline():
     # Task 6 v0.3 §D1: WIP-commit + progress.md instructions added.
+    # T15 (v0.3 §"cross-task-memory") added _MEMORY_SECTION_IMPLEMENT.
     out = build_implement_prompt(
         {"id": 1, "title": "T", "description": "D"}, "p.md", "msg",
     )
-    assert len(out) == 1129
+    assert len(out) == 3255
 
 
 # ---------------------------------------------------------------------------
@@ -9064,3 +9082,466 @@ def test_runner_keeps_block_reason_gate_failed_for_non_timeout_blocking_gates(
     assert entry["block_reason"] == "gate_failed"
     rec = entry["attempts"][0]
     assert rec["failure_class"] == "gate_failed"
+
+
+# ===========================================================================
+# CC. Memory passes (task 15 v0.3 §"cross-task-memory")
+# ===========================================================================
+
+import os
+import yaml
+from claude_plan_execute import memory as memory_mod
+from claude_plan_execute.cli import _resolve_slate_id
+
+
+def _write_memory_file(
+    memory_dir: Path, name: str, *,
+    type: str = "feedback",
+    lifecycle: str = "evergreen",
+    citation_count: int = 0,
+    description: str = "test memory",
+) -> Path:
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    fm = {
+        "name": name, "description": description, "type": type,
+        "lifecycle": lifecycle, "citation_count": citation_count,
+    }
+    body = "Body line 1.\nBody line 2.\n"
+    text = "---\n" + yaml.safe_dump(fm, sort_keys=False) + "---\n\n" + body
+    p = memory_dir / f"{name}.md"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _read_citation_count_from_file(p: Path) -> int:
+    fm, _ = memory_mod.parse_memory_frontmatter(p.read_text())
+    return int(fm.get("citation_count", 0))
+
+
+def _stub_memory_dir(monkeypatch, tmp_path) -> Path:
+    """Patch memory_dir_for_cwd in runner so execute_task uses tmp_path."""
+    fake_dir = tmp_path / "memdir"
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.memory_dir_for_cwd",
+        lambda cwd: fake_dir,
+    )
+    return fake_dir
+
+
+# CC.1 — citation pass
+
+
+def test_citation_pass_increments_for_single_reference(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    mem_path = _write_memory_file(mem_dir, "foo_lesson", citation_count=2)
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text(
+        "Step 1: do thing [MEM: foo_lesson].\n"
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+
+    assert _read_citation_count_from_file(mem_path) == 3
+
+
+def test_citation_pass_counts_multiple_references_in_one_plan(
+    monkeypatch, tmp_path,
+):
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    mem_path = _write_memory_file(mem_dir, "foo_lesson", citation_count=0)
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text(
+        "Step 1: [MEM: foo_lesson]\n"
+        "Step 2: see also [MEM: foo_lesson]\n"
+        "Step 3: revisit [MEM: foo_lesson]\n"
+    )
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+
+    assert _read_citation_count_from_file(mem_path) == 3
+
+
+def test_citation_pass_silently_ignores_unknown_memory_names(
+    monkeypatch, tmp_path,
+):
+    """Pin: hallucinated [MEM: ghost] must NOT raise. The reviewer
+    catches it earlier; the runner doesn't double-fault."""
+    _no_run_claude_called(monkeypatch)
+    _stub_memory_dir(monkeypatch, tmp_path)
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("[MEM: ghost]")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+
+
+def test_citation_pass_is_idempotent_on_already_done_task(
+    monkeypatch, tmp_path,
+):
+    """Re-running a task whose status is already 'done' must NOT
+    increment citation counts a second time."""
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    mem_path = _write_memory_file(
+        mem_dir, "foo_lesson", citation_count=0,
+    )
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("[MEM: foo_lesson]")
+
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "done")  # pre-mark
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    # No increment — task was already done.
+    assert _read_citation_count_from_file(mem_path) == 0
+
+
+def test_citation_pass_skipped_when_plan_md_missing(monkeypatch, tmp_path):
+    """No plan.md (e.g., dry-run never wrote one) → no-op, no error."""
+    _no_run_claude_called(monkeypatch)
+    _stub_memory_dir(monkeypatch, tmp_path)
+    state = State(tmp_path / "state.json")
+    # Must not raise.
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+
+
+# CC.2 — lifecycle prune
+
+
+def test_lifecycle_prune_deletes_task_scoped_when_task_done(
+    monkeypatch, tmp_path,
+):
+    """A memory with `lifecycle: task:5` is deleted when task 5
+    transitions to done."""
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    target = _write_memory_file(
+        mem_dir, "lesson_for_t5", lifecycle="task:5",
+    )
+
+    task_dir = tmp_path / "task-5"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("plan")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=5), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert not target.exists()
+
+
+def test_lifecycle_prune_keeps_task_scoped_when_task_not_done(
+    monkeypatch, tmp_path,
+):
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    target = _write_memory_file(
+        mem_dir, "lesson_for_t99", lifecycle="task:99",
+    )
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("plan")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert target.exists()
+
+
+def test_lifecycle_prune_evergreen_never_deleted(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    target = _write_memory_file(mem_dir, "everlasting", lifecycle="evergreen")
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("plan")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+        all_task_ids=[1],   # slate-complete after this task
+    )
+    assert target.exists()
+
+
+def test_lifecycle_prune_slate_scoped_when_slate_complete(
+    monkeypatch, tmp_path,
+):
+    """A `lifecycle: slate:foo` memory is deleted when the env-var
+    slate id matches AND every task in all_task_ids is done."""
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_PLAN_EXECUTE_SLATE_ID", "foo")
+    target = _write_memory_file(
+        mem_dir, "slate_lesson", lifecycle="slate:foo",
+    )
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("plan")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+        all_task_ids=[1],   # slate-complete after this task
+    )
+    assert not target.exists()
+
+
+def test_lifecycle_prune_slate_scoped_kept_when_other_tasks_pending(
+    monkeypatch, tmp_path,
+):
+    """all_task_ids contains tasks 1 + 2; only task 1 runs in this
+    test → slate is incomplete → slate-scoped memory survives."""
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_PLAN_EXECUTE_SLATE_ID", "foo")
+    target = _write_memory_file(
+        mem_dir, "slate_lesson", lifecycle="slate:foo",
+    )
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("plan")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+        all_task_ids=[1, 2],   # task 2 still pending
+    )
+    assert target.exists()
+
+
+def test_lifecycle_prune_slate_scoped_other_slate_id_never_pruned(
+    monkeypatch, tmp_path,
+):
+    """A `lifecycle: slate:other` memory is NEVER pruned by a
+    different slate's run, even when slate_complete=True for `foo`."""
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_PLAN_EXECUTE_SLATE_ID", "foo")
+    other = _write_memory_file(
+        mem_dir, "x_lesson", lifecycle="slate:other",
+    )
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("plan")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+        all_task_ids=[1],
+    )
+    assert other.exists()
+
+
+def test_lifecycle_prune_removes_memory_md_index_line(
+    monkeypatch, tmp_path,
+):
+    """When a memory file is deleted, its line in MEMORY.md must
+    also be removed."""
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    _write_memory_file(mem_dir, "lesson_for_t5", lifecycle="task:5")
+    _write_memory_file(mem_dir, "keeper", lifecycle="evergreen")
+    (mem_dir / "MEMORY.md").write_text(
+        "- [Drop me](lesson_for_t5.md) — should be removed\n"
+        "- [Keep me](keeper.md) — must survive\n"
+    )
+
+    task_dir = tmp_path / "task-5"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("plan")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=5), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+
+    text = (mem_dir / "MEMORY.md").read_text()
+    assert "lesson_for_t5.md" not in text
+    assert "keeper.md" in text
+
+
+def test_runner_passes_through_when_memory_dir_missing(
+    monkeypatch, tmp_path,
+):
+    """No memory dir on disk (typical first run on a fresh project) →
+    citation pass and prune pass are silent no-ops; task completes."""
+    _no_run_claude_called(monkeypatch)
+    fake_dir = tmp_path / "definitely_missing_memdir"
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.memory_dir_for_cwd",
+        lambda cwd: fake_dir,
+    )
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("[MEM: ghost]")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"
+
+
+def test_runner_does_not_run_slate_prune_when_all_task_ids_is_None(
+    monkeypatch, tmp_path,
+):
+    """The default kwarg path (all_task_ids=None, used by every
+    existing test) must NEVER prune slate-scoped memories."""
+    _no_run_claude_called(monkeypatch)
+    mem_dir = _stub_memory_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_PLAN_EXECUTE_SLATE_ID", "foo")
+    target = _write_memory_file(
+        mem_dir, "slate_lesson", lifecycle="slate:foo",
+    )
+
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    (task_dir / "plan.md").write_text("plan")
+
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+        # NOT passing all_task_ids — slate detection should
+        # short-circuit.
+    )
+    assert target.exists()
+
+
+# CC.3 — slate-id resolution
+
+
+def test_resolve_slate_id_caches_in_state(tmp_path, monkeypatch):
+    state = State(tmp_path / "state.json")
+    tasks_path = tmp_path / "tasks.yaml"
+    tasks_path.write_text("tasks: []")
+
+    # Force the no-git fallback by patching cli.subprocess.run.
+    def fake_run(cmd, **kw):
+        return type("P", (), {
+            "returncode": 1, "stdout": "", "stderr": "",
+        })()
+    monkeypatch.setattr("claude_plan_execute.cli.subprocess.run", fake_run)
+
+    first = _resolve_slate_id(state, tasks_path)
+    assert first.startswith("mtime-")
+
+    # Sticky on second call — the patched subprocess returns 1, so
+    # without caching we'd get a fresh mtime; equality proves cache
+    # was used.
+    second = _resolve_slate_id(state, tasks_path)
+    assert second == first
+    assert state.data["slate_id"] == first
+
+
+def test_resolve_slate_id_uses_branch_name_when_available(
+    tmp_path, monkeypatch,
+):
+    state = State(tmp_path / "state.json")
+    tasks_path = tmp_path / "tasks.yaml"
+    tasks_path.write_text("tasks: []")
+
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return type("P", (), {
+                "returncode": 0, "stdout": "feat/foo\n", "stderr": "",
+            })()
+        return type("P", (), {
+            "returncode": 0, "stdout": "", "stderr": "",
+        })()
+
+    monkeypatch.setattr("claude_plan_execute.cli.subprocess.run", fake_run)
+    sid = _resolve_slate_id(state, tasks_path)
+    assert sid == "feat/foo"
+
+
+def test_resolve_slate_id_skips_task_branches(tmp_path, monkeypatch):
+    """If the current branch is `task/5-foo` (per-task branch from
+    T9), we fall through to mtime — otherwise slate id would change
+    per task."""
+    state = State(tmp_path / "state.json")
+    tasks_path = tmp_path / "tasks.yaml"
+    tasks_path.write_text("tasks: []")
+
+    def fake_run(cmd, **kw):
+        return type("P", (), {
+            "returncode": 0, "stdout": "task/5-foo\n", "stderr": "",
+        })()
+
+    monkeypatch.setattr("claude_plan_execute.cli.subprocess.run", fake_run)
+    sid = _resolve_slate_id(state, tasks_path)
+    assert sid.startswith("mtime-")
+
+
+def test_resolve_slate_id_skips_detached_HEAD(tmp_path, monkeypatch):
+    """git rev-parse --abbrev-ref HEAD on a detached HEAD prints
+    'HEAD' verbatim; treat as no-branch and fall through."""
+    state = State(tmp_path / "state.json")
+    tasks_path = tmp_path / "tasks.yaml"
+    tasks_path.write_text("tasks: []")
+
+    def fake_run(cmd, **kw):
+        return type("P", (), {
+            "returncode": 0, "stdout": "HEAD\n", "stderr": "",
+        })()
+
+    monkeypatch.setattr("claude_plan_execute.cli.subprocess.run", fake_run)
+    sid = _resolve_slate_id(state, tasks_path)
+    assert sid.startswith("mtime-")

@@ -471,11 +471,11 @@ def test_plan_prompt_decisions_appears_after_persona_and_before_body():
 
 
 def test_plan_prompt_byte_length_unchanged_when_persona_and_decisions_empty():
-    """Pin (D9): with persona='' and decisions='', output is byte-identical
-    to pre-task-7 (734 bytes). Same fixed input as
+    """Pin (D9): with persona='' and decisions='', output matches the
+    post-T15 baseline (1341 bytes). Same fixed input as
     test_plan_prompt_byte_length_matches_baseline in test_runner.py."""
     out = build_plan_prompt({"id": 1, "title": "T", "description": "D"}, "p.md")
-    assert len(out) == 734
+    assert len(out) == 1341
 
 
 def test_plan_prompt_decisions_kwarg_is_keyword_only():
