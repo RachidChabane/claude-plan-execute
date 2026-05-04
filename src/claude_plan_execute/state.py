@@ -39,6 +39,9 @@ FAILURE_CLASSES = (
     "test_failed",                        # subtype of gate_failed; task 12+
     "budget_exceeded",                    # NOT written in task 9 (max_attempts deferred)
     "rate_limited",                       # v0.3 task 1 — Claude-API rate-limit retries exhausted (§2.15)
+    "service_unavailable",                # v0.3 task 8 — ServiceUnavailableError
+    "service_crashed",                    # v0.3 task 8 — single crash auto-recovered
+    "service_unstable",                   # v0.3 task 8 — 3 consecutive crashes
 )
 
 

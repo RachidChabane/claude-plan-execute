@@ -1151,7 +1151,10 @@ def test_execute_task_resolved_config_contains_all_audit_keys(monkeypatch, tmp_p
     )
     cfg = _read_resolved_config(tmp_path, 1)
     from claude_plan_execute.config import KEYS_TO_AUDIT
-    assert set(cfg.keys()) == set(KEYS_TO_AUDIT)
+    assert set(KEYS_TO_AUDIT) <= set(cfg.keys())
+    # v0.3 task 8: a services_required sibling is allowed
+    # (deliberately NOT in KEYS_TO_AUDIT — see Plan §1 Non-goals
+    # and §D9 for the rationale).
 
 
 def test_execute_task_resolved_config_provenance_for_task_override(monkeypatch, tmp_path):
@@ -7064,3 +7067,633 @@ def test_execute_task_done_status_set_when_no_summary(
         cli={}, skip_to="implement",
     )
     assert state.get(1)["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# v0.3 task 8: services integration (Plan §D4 / §D10.4)
+# ---------------------------------------------------------------------------
+
+from claude_plan_execute.runner import (  # noqa: E402
+    _resolve_services_required,
+    _service_teardown_after_task,
+)
+from claude_plan_execute.services import (  # noqa: E402
+    ServiceUnavailableError,
+    ServiceUnstableError,
+)
+
+
+# --- Audit-artifact extension (§D4.3) --------------------------------------
+
+
+def test_execute_task_resolved_config_includes_services_required(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.3: the audit artifact gains a top-level
+    services_required field with {value, from_layers}. Layer-merge is
+    verified in test_resolve_services_required_*; this test only pins
+    the shape on the audit."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, services_required_extra=["redis"]), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["postgres"],
+        },
+        cli={}, dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert "services_required" in cfg
+    assert "value" in cfg["services_required"]
+    assert "from_layers" in cfg["services_required"]
+    assert set(cfg["services_required"]["from_layers"].keys()) == {
+        "defaults", "phase", "task",
+    }
+    assert cfg["services_required"]["value"] == ["postgres", "redis"]
+
+
+# --- _resolve_services_required pure helper (§D4.1) ------------------------
+
+
+def test_resolve_services_required_empty_returns_empty():
+    """No layers contribute → []."""
+    assert _resolve_services_required(
+        task={}, file_defaults={}, phase_dict={},
+    ) == []
+
+
+def test_resolve_services_required_defaults_only():
+    """defaults.services_required only."""
+    out = _resolve_services_required(
+        task={},
+        file_defaults={"services_required": ["a", "b"]},
+        phase_dict={},
+    )
+    assert out == ["a", "b"]
+
+
+def test_resolve_services_required_phase_extra_appended():
+    """phase.services_required_extra is appended after defaults."""
+    out = _resolve_services_required(
+        task={},
+        file_defaults={"services_required": ["a"]},
+        phase_dict={"services_required_extra": ["b"]},
+    )
+    assert out == ["a", "b"]
+
+
+def test_resolve_services_required_task_extra_appended():
+    """task.services_required_extra is appended last."""
+    out = _resolve_services_required(
+        task={"services_required_extra": ["c"]},
+        file_defaults={"services_required": ["a"]},
+        phase_dict={"services_required_extra": ["b"]},
+    )
+    assert out == ["a", "b", "c"]
+
+
+def test_resolve_services_required_dedupes_first_seen_order():
+    """Duplicates are dropped; first-seen order is preserved."""
+    out = _resolve_services_required(
+        task={"services_required_extra": ["a", "x"]},
+        file_defaults={"services_required": ["a", "b"]},
+        phase_dict={"services_required_extra": ["b", "c"]},
+    )
+    assert out == ["a", "b", "c", "x"]
+
+
+def test_resolve_services_required_overlay_three_layers():
+    """All three layers contribute distinct names in order."""
+    out = _resolve_services_required(
+        task={"services_required_extra": ["t"]},
+        file_defaults={"services_required": ["d1", "d2"]},
+        phase_dict={"services_required_extra": ["p"]},
+    )
+    assert out == ["d1", "d2", "p", "t"]
+
+
+# --- _StubServiceManager + integration tests (§D10.4) ----------------------
+
+
+class _StubServiceManager:
+    def __init__(self, *, ensure_raises=None, poll_returns=None,
+                 poll_raises=None):
+        self.ensure_calls: list[list[str]] = []
+        self.tear_down_calls: list[str] = []
+        self.reset_count_calls: list[str] = []
+        self._ensure_raises = ensure_raises
+        self._poll_returns = poll_returns or []
+        self._poll_raises = poll_raises
+
+    def names(self):
+        return []
+
+    def spec_lifetime(self, n):
+        return "run"
+
+    def is_running(self, n):
+        return True
+
+    def reset_crash_count(self, n):
+        self.reset_count_calls.append(n)
+
+    def ensure(self, required):
+        self.ensure_calls.append(list(required))
+        if self._ensure_raises:
+            raise self._ensure_raises
+
+    def poll_health(self):
+        if self._poll_raises:
+            raise self._poll_raises
+        return list(self._poll_returns)
+
+    def tear_down_for_scope(self, scope):
+        self.tear_down_calls.append(scope)
+
+    def tear_down_all(self):
+        self.tear_down_calls.append("all")
+
+
+def test_execute_task_calls_ensure_at_task_entry_with_required_services(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.4: the task-entry block calls ensure() with the
+    resolved required-services list."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["dev"],
+        },
+        cli={}, skip_to="implement",
+        service_manager=stub,
+    )
+    # The task-entry ensure runs first; the pre-Phase-4 ensure runs
+    # second. Both with the same required set.
+    assert stub.ensure_calls == [["dev"], ["dev"]]
+
+
+def test_execute_task_calls_ensure_again_before_phase_4(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.5: a second ensure() fires right before Phase 4."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["dev"],
+        },
+        cli={}, skip_to="implement",
+        service_manager=stub,
+    )
+    assert len(stub.ensure_calls) == 2
+
+
+def test_execute_task_blocks_on_service_unavailable_at_entry(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.4: ServiceUnavailableError at task-entry blocks the
+    task with block_reason=service_unavailable."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager(
+        ensure_raises=ServiceUnavailableError("dev", "boom"),
+    )
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["dev"],
+        },
+        cli={}, skip_to="implement",
+        service_manager=stub,
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "service_unavailable"
+
+
+def test_execute_task_records_service_unavailable_failure_record(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.4: the failure_class on the recorded record is
+    'service_unavailable'."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager(
+        ensure_raises=ServiceUnavailableError("dev", "boom"),
+    )
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["dev"],
+        },
+        cli={}, skip_to="implement",
+        service_manager=stub,
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "service_unavailable"
+    assert attempts[0]["phase"] == "services"
+
+
+def test_execute_task_blocks_on_service_unstable_from_poll_health(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.4: ServiceUnstableError from poll_health() at task
+    entry blocks with block_reason=service_unstable."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager(
+        poll_raises=ServiceUnstableError("dev", "3 crashes"),
+    )
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["dev"],
+        },
+        cli={}, skip_to="implement",
+        service_manager=stub,
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "service_unstable"
+    attempts = state.get(1)["attempts"]
+    assert attempts[0]["failure_class"] == "service_unstable"
+
+
+def test_execute_task_records_service_crashed_for_auto_recovered_event(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.4: a crashed_restarted poll event creates a
+    service_crashed FailureRecord (informational, non-blocking)."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager(
+        poll_returns=[{
+            "name": "dev", "event": "crashed_restarted",
+            "exit_code": 1, "crash_count": 1,
+        }],
+    )
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["dev"],
+        },
+        cli={}, skip_to="implement",
+        service_manager=stub,
+    )
+    entry = state.get(1)
+    # A crashed_restarted record was added but the task still completes
+    assert entry["status"] == "done"
+    crashed = [a for a in entry["attempts"]
+               if a["failure_class"] == "service_crashed"]
+    assert len(crashed) >= 1
+
+
+def test_execute_task_tears_down_gate_then_task_on_success(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.6: success-path explicit teardown calls
+    tear_down_for_scope('gate') then tear_down_for_scope('task'),
+    then the finally re-calls them as no-ops."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+        service_manager=stub,
+    )
+    # Both explicit (success) and finally tear-downs fire.
+    assert stub.tear_down_calls.count("gate") >= 1
+    assert stub.tear_down_calls.count("task") >= 1
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_tears_down_on_blocked_path_too(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.6: even when the task is blocked, the finally clause
+    runs the gate/task tear-downs."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager(
+        ensure_raises=ServiceUnavailableError("dev", "boom"),
+    )
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["dev"],
+        },
+        cli={}, skip_to="implement",
+        service_manager=stub,
+    )
+    assert "gate" in stub.tear_down_calls
+    assert "task" in stub.tear_down_calls
+
+
+def test_execute_task_skips_service_logic_when_manager_is_None(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.4: with manager=None, no AttributeError; the runner
+    behaves as in the legacy path."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+        service_manager=None,
+    )
+    assert state.get(1)["status"] == "done"
+
+
+def test_execute_task_finally_tears_down_on_uncaught_exception(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.6 (review-2 C4): an uncaught exception mid-Phase-3
+    propagates out, but the finally clause still tears down gate/task
+    scopes."""
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager()
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("boom from claude")
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", boom)
+    with pytest.raises(RuntimeError):
+        execute_task(
+            _make_task(id=1), state,
+            file_defaults={"plans_dir": str(tmp_path)},
+            cli={}, skip_to="implement",
+            service_manager=stub,
+        )
+    assert "gate" in stub.tear_down_calls
+    assert "task" in stub.tear_down_calls
+
+
+def test_execute_task_skips_service_block_in_dry_run(
+    monkeypatch, tmp_path,
+):
+    """Plan §D4.4 (review-2 Issue 1): with dry_run=True, the
+    task-entry service block is skipped — ensure() / poll_health()
+    are NOT called even when manager is non-None and required is
+    non-empty. Tear-downs still fire (no-ops)."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    stub = _StubServiceManager()
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "services_required": ["dev"],
+        },
+        cli={}, dry_run=True,
+        service_manager=stub,
+    )
+    assert stub.ensure_calls == []
+    # tear_down_for_scope IS called via the finally
+    assert "gate" in stub.tear_down_calls
+    assert "task" in stub.tear_down_calls
+
+
+# --- cli.main integration (Plan §D5 / §D10.4) ------------------------------
+
+
+def _write_minimal_tasks_yaml_with_service(tmp_path: Path) -> Path:
+    """Write a tasks.yaml fixture declaring one lifetime=run service
+    and a single task that requires it via defaults.services_required."""
+    p = tmp_path / "tasks.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  services_required: [dev]\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: \"true\"\n"
+        "    lifetime: run\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n",
+    )
+    return p
+
+
+def _write_two_phase_tasks_yaml_with_phase_services(tmp_path: Path) -> Path:
+    """Write a tasks.yaml fixture with two phases each declaring a
+    lifetime=phase service in their defaults.services_required_extra."""
+    p = tmp_path / "tasks.yaml"
+    p.write_text(
+        "version: 2\n"
+        "phases:\n"
+        "  - id: a\n"
+        "    defaults:\n"
+        "      services_required_extra: [svc-a]\n"
+        "  - id: b\n"
+        "    defaults:\n"
+        "      services_required_extra: [svc-b]\n"
+        "services:\n"
+        "  - name: svc-a\n"
+        "    command: \"true\"\n"
+        "    lifetime: phase\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "  - name: svc-b\n"
+        "    command: \"true\"\n"
+        "    lifetime: phase\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T1, description: D, phase: a }\n"
+        "  - { id: 2, title: T2, description: D, phase: b, depends_on: [1] }\n",
+    )
+    return p
+
+
+def _patch_service_manager_recording(monkeypatch):
+    """Replace cli.ServiceManager with a stub that records calls.
+    Returns the stub instance after construction (set on the first call)."""
+    captured: dict = {"stub": None}
+
+    class _Recorder:
+        def __init__(self, services, plans_dir):
+            self.services = services
+            self.plans_dir = plans_dir
+            self.ensure_calls: list[list[str]] = []
+            self.tear_down_calls: list[str] = []
+            self._lifetime_by_name = {
+                s["name"]: s.get("lifetime", "run") for s in services
+            }
+            captured["stub"] = self
+
+        def names(self):
+            return list(self._lifetime_by_name.keys())
+
+        def spec_lifetime(self, name):
+            return self._lifetime_by_name.get(name, "run")
+
+        def is_running(self, name):
+            return False
+
+        def ensure(self, required):
+            self.ensure_calls.append(list(required))
+
+        def tear_down_for_scope(self, scope):
+            self.tear_down_calls.append(scope)
+
+        def tear_down_all(self):
+            self.tear_down_calls.append("all")
+
+        def poll_health(self):
+            return []
+
+        def reset_crash_count(self, name):
+            pass
+
+    monkeypatch.setattr(
+        "claude_plan_execute.cli.ServiceManager", _Recorder,
+    )
+    return captured
+
+
+def _patch_cli_external_dependencies(monkeypatch):
+    """Stub external CLI deps so cli.main can run without claude
+    binary, real preflight commands, or signals."""
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/true")
+    monkeypatch.setattr(
+        "claude_plan_execute.cli.signal.signal",
+        lambda *_a, **_kw: None,
+    )
+    # Force preflight short-circuit via --skip-preflight (we'll add
+    # to argv in each test).
+
+
+def test_cli_main_does_not_start_services_in_dry_run(
+    monkeypatch, tmp_path,
+):
+    """Plan §D5.2 (review-2 Issue 1): --dry-run must NOT call
+    ensure() at the run-scope layer."""
+    from claude_plan_execute import cli
+
+    _write_minimal_tasks_yaml_with_service(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _patch_cli_external_dependencies(monkeypatch)
+    cap = _patch_service_manager_recording(monkeypatch)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["claude-plan-execute", "--dry-run", "--skip-preflight"],
+    )
+    cli.main()
+    stub = cap["stub"]
+    assert stub is not None
+    assert stub.ensure_calls == []
+    # tear_down_all must still run via the finally
+    assert "all" in stub.tear_down_calls
+
+
+def test_cli_main_starts_run_scope_services_in_real_run(
+    monkeypatch, tmp_path,
+):
+    """Plan §D5.2 positive complement: a non-dry-run invocation
+    triggers ensure(['dev']) before the task loop."""
+    from claude_plan_execute import cli
+
+    _write_minimal_tasks_yaml_with_service(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _patch_cli_external_dependencies(monkeypatch)
+    cap = _patch_service_manager_recording(monkeypatch)
+
+    # Mark the only task as done so execute_task is skipped (we're
+    # only verifying the run-scope ensure here).
+    state_path = tmp_path / "plans" / "state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({
+            "schema_version": 3,
+            "tasks": {"1": {"status": "done", "attempts": [],
+                            "current_attempt": 1}},
+        }),
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["claude-plan-execute", "--skip-preflight"],
+    )
+    cli.main()
+    stub = cap["stub"]
+    assert stub is not None
+    assert stub.ensure_calls == [["dev"]]
+    assert "all" in stub.tear_down_calls
+
+
+def test_cli_main_skips_phase_scope_ensure_in_dry_run(
+    monkeypatch, tmp_path,
+):
+    """Plan §D5.3 (review-2 Issue 1): in --dry-run, phase-boundary
+    ensure() is NOT called even when phase-scope services are
+    declared. tear_down_for_scope('phase') IS called between phases
+    (idempotent no-op)."""
+    from claude_plan_execute import cli
+
+    _write_two_phase_tasks_yaml_with_phase_services(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _patch_cli_external_dependencies(monkeypatch)
+    cap = _patch_service_manager_recording(monkeypatch)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["claude-plan-execute", "--dry-run", "--skip-preflight"],
+    )
+    cli.main()
+    stub = cap["stub"]
+    assert stub is not None
+    # No ensure() at any level in dry-run
+    assert stub.ensure_calls == []
+    # tear_down_for_scope('phase') fires on phase change (between t1 and t2)
+    assert "phase" in stub.tear_down_calls
+    assert "all" in stub.tear_down_calls
+
+
+def test_single_task_phase_scope_service_torn_down_only_at_run_end(
+    monkeypatch, tmp_path,
+):
+    """Plan §11.13: a single --task invocation does NOT iterate over
+    `ordered_tasks` and therefore never observes a phase transition.
+    A lifetime=phase service started by execute_task's task-entry
+    ensure is reaped only by the final tear_down_all (the §D5.3
+    finally), NOT by a mid-task tear_down_for_scope('phase').
+    Documented as intentional — bounded leak in single-task mode."""
+    from claude_plan_execute import cli
+
+    _write_two_phase_tasks_yaml_with_phase_services(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _patch_cli_external_dependencies(monkeypatch)
+    cap = _patch_service_manager_recording(monkeypatch)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["claude-plan-execute", "--task", "1",
+         "--dry-run", "--skip-preflight"],
+    )
+    cli.main()
+    stub = cap["stub"]
+    assert stub is not None
+    # Single-task branch has no phase tracking — phase-scope tear-down
+    # is NOT called mid-task.
+    assert "phase" not in stub.tear_down_calls
+    # tear_down_all IS called via the §D5.3 outer finally — this is
+    # what cleans up phase-scope services in single-task mode.
+    assert "all" in stub.tear_down_calls
+

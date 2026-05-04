@@ -888,3 +888,146 @@ tasks:
         r = client.get("/api/gates/1/tests")
         assert r.status_code == 200
         assert r.json()["content"] == "ok\n"
+
+
+# ---------------------------------------------------------------------------
+# v0.3 task 8: services endpoints (Plan §D6 / §D10.6)
+# ---------------------------------------------------------------------------
+
+
+def _write_services_json(work_dir: Path, services: list[dict]) -> Path:
+    """Write a services.json fixture matching the schema_version=1 shape."""
+    p = work_dir / "plans" / "services.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_json.dumps({
+        "schema_version": 1, "services": services,
+    }))
+    return p
+
+
+class TestGetServices:
+    def test_get_services_returns_empty_when_no_status_file(self, client, tmp_path):
+        """Plan §D6.1: missing services.json yields []."""
+        _write_tasks_yaml(tmp_path)
+        r = client.get("/api/services")
+        assert r.status_code == 200
+        assert r.json() == {"services": []}
+
+    def test_get_services_returns_status_from_services_json(self, client, tmp_path):
+        """Plan §D6.1: the live snapshot is returned verbatim."""
+        _write_tasks_yaml(tmp_path)
+        _write_services_json(tmp_path, [{
+            "name": "dev", "command": "npm run dev",
+            "lifetime": "run",
+            "ready_check": {"kind": "tcp", "port": 5173},
+            "log_file": None, "status": "running",
+            "pid": 12345, "crash_count": 0, "depends_on": [],
+        }])
+        r = client.get("/api/services")
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["services"]) == 1
+        svc = body["services"][0]
+        assert svc["name"] == "dev"
+        assert svc["pid"] == 12345
+        assert svc["status"] == "running"
+
+    def test_get_services_includes_log_tail_when_log_file_present(
+        self, client, tmp_path,
+    ):
+        """Plan §D6.1: each service gets a log_tail (last 200 lines)."""
+        _write_tasks_yaml(tmp_path)
+        log_path = tmp_path / "plans" / "dev.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("line-a\nline-b\nline-c\n")
+        _write_services_json(tmp_path, [{
+            "name": "dev", "command": "x", "lifetime": "run",
+            "ready_check": {"kind": "tcp", "port": 80},
+            "log_file": str(log_path), "status": "running",
+            "pid": 1, "crash_count": 0, "depends_on": [],
+        }])
+        r = client.get("/api/services")
+        body = r.json()
+        assert body["services"][0]["log_tail"] == ["line-a", "line-b", "line-c"]
+
+    def test_get_services_handles_missing_log_file_gracefully(
+        self, client, tmp_path,
+    ):
+        """Plan §D6.1: a non-existent log_file yields log_tail=[]."""
+        _write_tasks_yaml(tmp_path)
+        _write_services_json(tmp_path, [{
+            "name": "dev", "command": "x", "lifetime": "run",
+            "ready_check": {"kind": "tcp", "port": 80},
+            "log_file": str(tmp_path / "missing.log"),
+            "status": "running",
+            "pid": 1, "crash_count": 0, "depends_on": [],
+        }])
+        r = client.get("/api/services")
+        body = r.json()
+        assert body["services"][0]["log_tail"] == []
+
+
+class TestPostServiceRestart:
+    def test_post_service_restart_sends_sigterm_to_pid(
+        self, client, tmp_path, monkeypatch,
+    ):
+        """Plan §D6.2: restart sends SIGTERM to the recorded pid's
+        process group (mirrors the runner's kill ladder)."""
+        _write_tasks_yaml(tmp_path)
+        _write_services_json(tmp_path, [{
+            "name": "dev", "command": "x", "lifetime": "run",
+            "ready_check": {"kind": "tcp", "port": 80},
+            "log_file": None, "status": "running",
+            "pid": 12345, "crash_count": 0, "depends_on": [],
+        }])
+        calls: list[tuple] = []
+
+        def fake_killpg(pgid, sig):
+            calls.append((pgid, sig))
+
+        monkeypatch.setattr(server.os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(server.os, "killpg", fake_killpg)
+
+        r = client.post("/api/services/dev/restart")
+        assert r.status_code == 200
+        assert calls == [(12345, signal.SIGTERM)]
+        assert r.json()["pid"] == 12345
+
+    def test_post_service_restart_returns_404_when_unknown_name(
+        self, client, tmp_path,
+    ):
+        """Plan §D6.2: unknown service name → 404."""
+        _write_tasks_yaml(tmp_path)
+        _write_services_json(tmp_path, [{
+            "name": "dev", "command": "x", "lifetime": "run",
+            "ready_check": {"kind": "tcp", "port": 80},
+            "log_file": None, "status": "running",
+            "pid": 1, "crash_count": 0, "depends_on": [],
+        }])
+        r = client.post("/api/services/missing/restart")
+        assert r.status_code == 404
+
+    def test_post_service_restart_returns_409_when_pid_null(
+        self, client, tmp_path,
+    ):
+        """Plan §D6.2: a service with no pid (stopped) → 409."""
+        _write_tasks_yaml(tmp_path)
+        _write_services_json(tmp_path, [{
+            "name": "dev", "command": "x", "lifetime": "run",
+            "ready_check": {"kind": "tcp", "port": 80},
+            "log_file": None, "status": "stopped",
+            "pid": None, "crash_count": 0, "depends_on": [],
+        }])
+        r = client.post("/api/services/dev/restart")
+        assert r.status_code == 409
+
+    def test_post_service_restart_rejects_invalid_name_chars(
+        self, client, tmp_path,
+    ):
+        """Plan §D6.2: defense-in-depth name regex rejects bad chars
+        (also blocked by the ServiceSpec.name pattern at load time)."""
+        _write_tasks_yaml(tmp_path)
+        # Path traversal attempt → 400 (per regex) or 404/422 from
+        # FastAPI routing depending on the raw segment shape.
+        r = client.post("/api/services/bad..name/restart")
+        assert r.status_code in (400, 404, 422)

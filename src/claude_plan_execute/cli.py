@@ -22,6 +22,10 @@ from claude_plan_execute.loader import (
     scan_decisions,
 )
 from claude_plan_execute.runner import execute_task, handle_sigint
+from claude_plan_execute.services import (
+    ServiceManager,
+    ServiceUnavailableError,
+)
 from claude_plan_execute.state import State
 
 
@@ -224,7 +228,9 @@ def main():
         for name, cfg in (tasks_file_obj.defaults.task_class_models or {}).items()
     }
 
-    # Resolve plans_dir
+    # v0.3 task 8: hoist cli_overrides + plans_dir upward (Plan §D5.1)
+    # so the ServiceManager has plans_dir for services.json placement.
+    # Both names move together — resolve() reads cli_overrides.
     cli_overrides = {
         "model": args.model,
         "effort": args.effort,
@@ -233,6 +239,17 @@ def main():
     }
     plans_dir = Path(resolve("plans_dir", {}, file_defaults, cli_overrides))
     state = State(plans_dir / "state.json")
+
+    # v0.3 task 8 (Plan §D5.1): construct the ServiceManager. Empty
+    # spec list when no `services:` block is declared — manager is
+    # still instantiated but has no work to do (zero overhead). The
+    # manager's __init__ does NOT write services.json or mkdir
+    # services/ (Plan §D2.3 — read-only commands stay read-only).
+    service_specs: list[dict] = [
+        s.model_dump(exclude_none=False)
+        for s in (tasks_file_obj.services or [])
+    ]
+    service_manager = ServiceManager(service_specs, plans_dir)
 
     # Handle --reset
     if args.reset is not None:
@@ -284,40 +301,121 @@ def main():
     # Install SIGINT handler
     signal.signal(signal.SIGINT, handle_sigint)
 
-    # Select tasks to run
-    if args.task:
-        task = next((t for t in tasks if t["id"] == args.task), None)
-        if not task:
-            print(red(f"Error: Task {args.task} not found"), file=sys.stderr)
-            sys.exit(1)
-
-        # Check dependencies
-        deps = task.get("depends_on", [])
-        unmet = [d for d in deps if state.get(d)["status"] != "done"]
-        if unmet:
-            print(red(f"Error: Task {args.task} has unmet dependencies: {unmet}"), file=sys.stderr)
-            print(f"Run those tasks first, or use --reset to clear state.")
-            sys.exit(1)
-
-        execute_task(
-            task, state, file_defaults, cli_overrides,
-            phases_by_id=phases_by_id,
-            task_class_models=task_class_models,
-            skip_to=args.skip_to,
-            dry_run=args.dry_run,
+    # v0.3 task 8 (Plan §D5.2): compute the union of services_required
+    # across every task in the slate, even in --task mode (see §11.14
+    # for the documented rationale — run-scope services are reused
+    # across tasks). The loop re-implements
+    # runner._resolve_services_required by hand; if the layering rules
+    # ever grow, both sites must move together.
+    union_required: set[str] = set()
+    for t in ordered_tasks:
+        phase_id = t.get("phase")
+        pdict = (
+            (phases_by_id.get(phase_id) or {}).get("defaults") or {}
+            if phase_id else {}
         )
-    else:
-        for task in ordered_tasks:
-            s = state.get(task["id"])["status"]
-            if s == "done":
-                print(dim(f"\n  Skipping task {task['id']} (done)"))
-                continue
+        for name in (
+            list(file_defaults.get("services_required") or [])
+            + list(pdict.get("services_required_extra") or [])
+            + list(t.get("services_required_extra") or [])
+        ):
+            union_required.add(name)
+
+    run_scope_required = [
+        n for n in service_manager.names()
+        if n in union_required
+        and service_manager.spec_lifetime(n) == "run"
+    ]
+
+    # v0.3 task 8 (Plan §D5.3): wrap run-scope ensure + the task loop
+    # in try/finally so tear_down_all() runs on SIGINT, exit, or
+    # uncaught exception. The dry-run guard around ensure() mirrors
+    # the §D4.4 / §D4.5 guards in the runner — no service work fires
+    # in dry-run mode at any layer.
+    prev_phase: str | None = None
+    try:
+        if not args.dry_run:
+            try:
+                service_manager.ensure(run_scope_required)
+            except ServiceUnavailableError as exc:
+                print(red(
+                    f"Error: could not start run-scope services: {exc}"
+                ), file=sys.stderr)
+                print(red("Aborting before task loop."), file=sys.stderr)
+                sys.exit(1)
+
+        # Select tasks to run
+        if args.task:
+            task = next((t for t in tasks if t["id"] == args.task), None)
+            if not task:
+                print(red(f"Error: Task {args.task} not found"), file=sys.stderr)
+                sys.exit(1)
+
+            # Check dependencies
+            deps = task.get("depends_on", [])
+            unmet = [d for d in deps if state.get(d)["status"] != "done"]
+            if unmet:
+                print(red(f"Error: Task {args.task} has unmet dependencies: {unmet}"), file=sys.stderr)
+                print(f"Run those tasks first, or use --reset to clear state.")
+                sys.exit(1)
+
             execute_task(
                 task, state, file_defaults, cli_overrides,
                 phases_by_id=phases_by_id,
                 task_class_models=task_class_models,
+                skip_to=args.skip_to,
                 dry_run=args.dry_run,
+                service_manager=service_manager,
             )
+        else:
+            for task in ordered_tasks:
+                s = state.get(task["id"])["status"]
+                if s == "done":
+                    print(dim(f"\n  Skipping task {task['id']} (done)"))
+                    continue
+                # Phase-boundary detection (Plan §D5.3): on phase
+                # change, tear down the previous phase's services and
+                # ensure the new phase's. Tear-downs are unconditional
+                # (no-op on stopped services); ensure() is dry-run
+                # guarded.
+                cur_phase = task.get("phase")
+                if cur_phase != prev_phase:
+                    if prev_phase is not None:
+                        service_manager.tear_down_for_scope("phase")
+                    if cur_phase is not None:
+                        pdict = (
+                            (phases_by_id.get(cur_phase) or {})
+                            .get("defaults") or {}
+                        )
+                        phase_required = list(
+                            pdict.get("services_required_extra") or []
+                        )
+                        phase_scope = [
+                            n for n in phase_required
+                            if service_manager.spec_lifetime(n) == "phase"
+                        ]
+                        if not args.dry_run:
+                            try:
+                                service_manager.ensure(phase_scope)
+                            except ServiceUnavailableError as exc:
+                                print(red(
+                                    f"Error: phase '{cur_phase}' service "
+                                    f"start failed: {exc}"
+                                ), file=sys.stderr)
+                                prev_phase = cur_phase
+                                continue
+                    prev_phase = cur_phase
+                execute_task(
+                    task, state, file_defaults, cli_overrides,
+                    phases_by_id=phases_by_id,
+                    task_class_models=task_class_models,
+                    dry_run=args.dry_run,
+                    service_manager=service_manager,
+                )
+    finally:
+        # Unconditional cleanup: idempotent on stopped services, so a
+        # dry-run that started nothing pays zero cost here.
+        service_manager.tear_down_all()
 
     print(f"\n{bold('=' * 60)}")
     print(bold("ALL TASKS COMPLETE"))

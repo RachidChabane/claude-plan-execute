@@ -106,6 +106,46 @@ def load_state() -> dict:
     return State(state_path).data
 
 
+def load_services() -> list[dict]:
+    """Read services.json (live snapshot) and tail each log_file.
+
+    Returns [] when services.json is missing (no services declared,
+    or the runner hasn't started any yet).
+    """
+    defaults = load_tasks().get("defaults", {})
+    plans_dir = defaults.get("plans_dir", "plans")
+    status_path = work_dir / plans_dir / "services.json"
+    if not status_path.exists():
+        return []
+    try:
+        with open(status_path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    services = payload.get("services") or []
+    for s in services:
+        s["log_tail"] = _tail_log_lines(s.get("log_file"), lines=200)
+    return services
+
+
+def _tail_log_lines(log_file: str | None, *, lines: int) -> list[str]:
+    if not log_file:
+        return []
+    p = Path(log_file)
+    if not p.exists():
+        return []
+    try:
+        size = p.stat().st_size
+        cap = 64 * 1024
+        with open(p, "rb") as f:
+            if size > cap:
+                f.seek(size - cap)
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    return tail.splitlines()[-lines:]
+
+
 async def broadcast(msg: dict):
     dead = []
     for ws in ws_clients:
@@ -220,6 +260,51 @@ async def get_gate_output(task_id: str, gate_name: str):
         return JSONResponse({"content": gate_path.read_text(encoding="utf-8")})
     except OSError as exc:
         return JSONResponse({"error": f"Could not read file: {exc}"}, status_code=500)
+
+
+# v0.3 task 8 (Plan §D6.2): services endpoints. Reuse
+# _SAFE_TASK_ID_RE for the name guard — the pattern is identical
+# and ServiceSpec.name (Plan §D1.2) enforces the same character
+# whitelist at load time. The endpoint check is defense-in-depth.
+
+@app.get("/api/services")
+async def get_services():
+    """Return [{name, status, pid, lifetime, log_file, log_tail,
+    crash_count, depends_on, command, ready_check}].
+
+    Empty list when services.json is missing.
+    """
+    return JSONResponse({"services": load_services()})
+
+
+@app.post("/api/services/{name}/restart")
+async def restart_service(name: str):
+    """Send SIGTERM to the service's recorded PID.
+
+    Trade-off (Plan §D2.6): the runner's next poll_health() sees
+    the dead process and auto-restarts via the SAME crash-counter
+    codepath. So a restart click = one crash-count tick.
+    """
+    if not _SAFE_TASK_ID_RE.fullmatch(name):
+        return JSONResponse(
+            {"error": "Invalid service name"}, status_code=400,
+        )
+    services = load_services()
+    target = next((s for s in services if s.get("name") == name), None)
+    if target is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    pid = target.get("pid")
+    if not pid:
+        return JSONResponse(
+            {"error": "Service is not running"}, status_code=409,
+        )
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError) as exc:
+        # Process already dead — no-op success.
+        return JSONResponse({"ok": True, "note": str(exc)})
+    return JSONResponse({"ok": True, "pid": pid})
 
 
 @app.get("/api/config")

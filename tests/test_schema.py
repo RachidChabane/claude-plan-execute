@@ -793,3 +793,393 @@ def test_defaults_rejects_unknown_dev_server_url_typo():
     suggested-correction message."""
     with pytest.raises(ValidationError):
         Defaults(dev_servr_url="http://localhost:3000")
+
+
+# --- K. ReadyCheck shape (v0.3 task 8 §D1.1) -------------------------------
+
+from claude_plan_execute.schema import ReadyCheck, ServiceSpec
+
+
+def test_ready_check_kind_http_requires_url():
+    """Plan §D1.1: kind=http must set 'url'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="http")
+
+
+def test_ready_check_kind_http_rejects_port():
+    """Plan §D1.1: kind=http must NOT set 'port'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="http", url="http://x", port=80)
+
+
+def test_ready_check_kind_http_rejects_command():
+    """Plan §D1.1: kind=http must NOT set 'command'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="http", url="http://x", command="true")
+
+
+def test_ready_check_kind_tcp_requires_port():
+    """Plan §D1.1: kind=tcp must set 'port'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="tcp")
+
+
+def test_ready_check_kind_tcp_rejects_url():
+    """Plan §D1.1: kind=tcp must NOT set 'url'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="tcp", port=5432, url="http://x")
+
+
+def test_ready_check_port_out_of_range_rejected():
+    """Plan §D1.1: port must be 1-65535."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="tcp", port=0)
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="tcp", port=70000)
+
+
+def test_ready_check_kind_shell_requires_command():
+    """Plan §D1.1: kind=shell must set 'command'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="shell")
+
+
+def test_ready_check_typo_url_rejected():
+    """Plan §D1.1: extra='forbid' on ReadyCheck rejects typos."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="http", urll="http://x")  # type: ignore[call-arg]
+
+
+# --- L. ServiceSpec shape (v0.3 task 8 §D1.2) ------------------------------
+
+def test_service_spec_minimal_validates():
+    """Plan §D1.2: a minimal ServiceSpec validates."""
+    s = ServiceSpec(
+        name="dev",
+        command="npm run dev",
+        ready_check=ReadyCheck(kind="http", url="http://x"),
+    )
+    assert s.name == "dev"
+    assert s.command == "npm run dev"
+
+
+def test_service_spec_default_lifetime_is_run():
+    """Plan §D1.2: lifetime defaults to 'run'."""
+    s = ServiceSpec(
+        name="dev",
+        command="x",
+        ready_check=ReadyCheck(kind="tcp", port=80),
+    )
+    assert s.lifetime == "run"
+
+
+def test_service_spec_default_ready_timeout_is_60():
+    """Plan §D1.2: ready_timeout_seconds defaults to 60."""
+    s = ServiceSpec(
+        name="dev",
+        command="x",
+        ready_check=ReadyCheck(kind="tcp", port=80),
+    )
+    assert s.ready_timeout_seconds == 60
+
+
+def test_service_spec_typo_lifetim_rejected_with_suggestion(tmp_path, capsys):
+    """Plan §D1.2: extra='forbid' on ServiceSpec catches typos with a
+    'Did you mean' suggestion."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    lifetim: run\n"  # typo
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lifetim" in err
+    assert "Did you mean 'lifetime'?" in err
+
+
+def test_service_spec_empty_name_rejected():
+    """Plan §D1.2: name has min_length=1."""
+    with pytest.raises(ValidationError):
+        ServiceSpec(
+            name="",
+            command="x",
+            ready_check=ReadyCheck(kind="tcp", port=80),
+        )
+
+
+def test_service_spec_invalid_name_chars_rejected():
+    """Plan §D1.2: name pattern rejects shell-meta and quote chars."""
+    with pytest.raises(ValidationError):
+        ServiceSpec(
+            name="bad name",
+            command="x",
+            ready_check=ReadyCheck(kind="tcp", port=80),
+        )
+
+
+# --- M. TasksFile.services (v0.3 task 8 §D1.4) -----------------------------
+
+def test_tasks_file_accepts_services_block(tmp_path):
+    """Plan §D1.4: top-level `services:` accepts a list of ServiceSpec."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: npm run dev\n"
+        "    ready_check: { kind: http, url: http://localhost:5173 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert len(tf.services) == 1
+    assert tf.services[0].name == "dev"
+
+
+def test_tasks_file_services_default_to_empty_list(tmp_path):
+    """Plan §D1.4: `services` defaults to []."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.services == []
+
+
+def test_top_level_typo_servicse_rejected(tmp_path, capsys):
+    """Plan §D1.5: top-level typo `servicse` is rejected with a
+    'Did you mean services?' suggestion."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "servicse: []\n"  # typo
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "servicse" in err
+    assert "Did you mean 'services'?" in err
+
+
+# --- N. Defaults / Task field additions (§D1.3) ----------------------------
+
+def test_defaults_accepts_services_required():
+    """Plan §D1.3: Defaults.services_required is a list[str] | None."""
+    d = Defaults(services_required=["dev", "postgres"])
+    assert d.services_required == ["dev", "postgres"]
+
+
+def test_defaults_services_required_defaults_to_None():
+    """Plan §D1.3: Defaults.services_required defaults to None when unset."""
+    d = Defaults()
+    assert d.services_required is None
+
+
+def test_task_accepts_services_required_extra():
+    """Plan §D1.3: Task.services_required_extra is a list[str] | None."""
+    t = Task(id=1, title="T", description="D",
+             services_required_extra=["redis"])
+    assert t.services_required_extra == ["redis"]
+
+
+# --- O. Cross-references (§D1.6) -------------------------------------------
+
+def _yaml_with_services_and_required(svc_block: str, defaults_extra: str = "") -> str:
+    return (
+        "version: 2\n"
+        f"defaults:\n  {defaults_extra}\n" if defaults_extra
+        else "version: 2\n"
+    ) + (
+        f"services:\n{svc_block}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+
+
+def test_services_required_unknown_name_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 7: defaults.services_required name must exist."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  services_required: [missing]\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "defaults.services_required" in err
+    assert "missing" in err
+
+
+def test_task_services_required_extra_unknown_name_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 8a: task.services_required_extra name must exist."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "tasks:\n"
+        "  - id: 1\n"
+        "    title: T\n"
+        "    description: D\n"
+        "    services_required_extra: [missing]\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Task 1" in err
+    assert "missing" in err
+
+
+def test_phase_services_required_extra_unknown_name_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 8b: phase.defaults.services_required_extra name
+    must exist (loose dict)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "phases:\n"
+        "  - id: p1\n"
+        "    defaults:\n"
+        "      services_required_extra: [missing]\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D, phase: p1 }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Phase 'p1'" in err
+    assert "missing" in err
+
+
+def test_service_depends_on_unknown_name_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 5: depends_on must reference a declared service."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "    depends_on: [missing]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Service 'dev'" in err
+    assert "missing" in err
+
+
+def test_service_depends_on_cycle_two_node_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 6: a -> b -> a cycle is rejected."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: a\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "    depends_on: [b]\n"
+        "  - name: b\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 81 }\n"
+        "    depends_on: [a]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Cycle" in err
+    assert "a" in err and "b" in err
+
+
+def test_service_depends_on_cycle_three_node_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 6: a -> b -> c -> a cycle is rejected."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: a\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "    depends_on: [b]\n"
+        "  - name: b\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 81 }\n"
+        "    depends_on: [c]\n"
+        "  - name: c\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 82 }\n"
+        "    depends_on: [a]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Cycle" in err
+
+
+def test_service_depends_on_self_cycle_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 6: self-cycle a -> a is rejected."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: a\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "    depends_on: [a]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Cycle" in err
+
+
+def test_duplicate_service_names_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 4: two services with the same name are rejected."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "  - name: dev\n"
+        "    command: y\n"
+        "    ready_check: { kind: tcp, port: 81 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Duplicate service names" in err

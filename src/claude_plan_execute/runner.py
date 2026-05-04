@@ -33,6 +33,11 @@ from claude_plan_execute.prompts import (
     build_revise_prompt,
     parse_progress_status,
 )
+from claude_plan_execute.services import (
+    ServiceManager,
+    ServiceUnavailableError,
+    ServiceUnstableError,
+)
 from claude_plan_execute.state import (
     State, make_failure_record, summarize_usage,
 )
@@ -72,6 +77,7 @@ def execute_task(
     task_class_models: dict[str, dict] | None = None,
     skip_to: str | None = None,
     dry_run: bool = False,
+    service_manager: "ServiceManager | None" = None,
 ):
     global _current_state, _current_task_id, _current_phase
     _current_state = state
@@ -106,182 +112,232 @@ def execute_task(
     task_dir.mkdir(parents=True, exist_ok=True)
     usage_path = task_dir / "usage.jsonl"
 
-    # Audit artifact — written before any phase. (Plan §D6.)
+    # v0.3 task 8: compute services_required for this task. Always
+    # computed (cheap dict ops) so the audit artifact has a stable
+    # field shape even when no manager is wired.
+    required_services = _resolve_services_required(
+        task=task, file_defaults=file_defaults, phase_dict=phase_dict,
+    )
+
+    # Audit artifact — written before any phase. (Plan §D6.) The
+    # services_required sibling field is added by T8 (see Plan §D9);
+    # KEYS_TO_AUDIT is unchanged because the value is a per-layer
+    # union, not a winner-takes-all resolver key.
     resolved_config_path = task_dir / "resolved-config.json"
+    audit_payload: dict = dict(resolved)
+    audit_payload["services_required"] = {
+        "value": list(required_services),
+        "from_layers": {
+            "defaults": list(file_defaults.get("services_required") or []),
+            "phase":    list(phase_dict.get("services_required_extra") or []),
+            "task":     list(task.get("services_required_extra") or []),
+        },
+    }
     resolved_config_path.write_text(
-        json.dumps(resolved, indent=2, sort_keys=False) + "\n"
+        json.dumps(audit_payload, indent=2, sort_keys=False) + "\n"
     )
     # Track the path on the per-task state entry so the dashboard can find it.
     entry = state.get(tid)
     entry["resolved_config_path"] = str(resolved_config_path)
     state.save()
 
-    # Snapshot prior failures for resume-context (task 10). The same
-    # section is reused across the Plan and Implement builders below;
-    # any failure recorded mid-run is for FUTURE re-runs, not this one.
-    prior_attempts = list(entry.get("attempts", []))
-    failure_context_section = build_failure_context_section(prior_attempts)
+    # v0.3 task 8 (Plan §D4.6): wrap the body in try/finally so
+    # gate- and task-scope services are torn down on every exit
+    # path — success, blocked, dry-run early-return, uncaught
+    # exception. The audit write above stays OUTSIDE the try so
+    # /api/resolved-config/{task_id} works even if the service
+    # block raises.
+    try:
+        # v0.3 task 8 (Plan §D4.4): task-entry service block.
+        # Skipped entirely when no manager is supplied (legacy
+        # path) OR in dry-run mode (no real work happens, no need
+        # to spin services up). The §D4.6 finally still runs but
+        # is a no-op for services that never started.
+        if service_manager is not None and not dry_run:
+            try:
+                events = service_manager.poll_health()
+            except ServiceUnstableError as exc:
+                state.set_status(
+                    tid, "blocked", block_reason="service_unstable",
+                )
+                state.record_failure(tid, make_failure_record(
+                    failure_class="service_unstable",
+                    phase="services",
+                    reason=str(exc),
+                    artifacts={
+                        "services_status": str(plans_dir / "services.json"),
+                    },
+                ))
+                print(red(f"\n  Task {tid} blocked: {exc}"))
+                return
+            for ev in events:
+                if ev["event"] == "crashed_restarted":
+                    state.record_failure(tid, make_failure_record(
+                        failure_class="service_crashed",
+                        phase="services",
+                        reason=(
+                            f"Service '{ev['name']}' crashed (exit "
+                            f"{ev['exit_code']}); auto-restarted "
+                            f"(crash {ev['crash_count']}/3)."
+                        ),
+                    ))
+            if required_services:
+                try:
+                    service_manager.ensure(required_services)
+                except ServiceUnavailableError as exc:
+                    state.set_status(
+                        tid, "blocked",
+                        block_reason="service_unavailable",
+                    )
+                    state.record_failure(tid, make_failure_record(
+                        failure_class="service_unavailable",
+                        phase="services",
+                        reason=str(exc),
+                        artifacts={
+                            "services_status": str(plans_dir / "services.json"),
+                        },
+                    ))
+                    print(red(f"\n  Task {tid} blocked: {exc}"))
+                    return
 
-    # Resume routing (task 6 v0.3 §D4). progress.md is the sidecar
-    # checklist the implementer maintains across chunks. Existence +
-    # at-least-one-active-item ([~] or [ ]) → "resume in progress;
-    # skip Plan + Review and use the resume builder for Implement."
-    # Existence + zero-active-items + at-least-one-done → "all work
-    # done pending gates" — skip Plan + Review + Implement and fall to
-    # Phase 4. No file (or empty checklist) → fresh run.
-    progress_path = task_dir / "progress.md"
-    progress_text = _read_progress_text(progress_path)
-    n_done, n_in_progress, n_pending = parse_progress_status(progress_text)
-    has_active = n_in_progress > 0 or n_pending > 0
-    if not progress_text or (n_done == 0 and not has_active):
-        resume_mode = "fresh"
-    elif has_active:
-        resume_mode = "mid_list"
-    else:
-        resume_mode = "all_done"
-    state.set_status(
-        tid, state.get(tid)["status"],
-        progress_path=str(progress_path),
-    )
-
-    plan_path = task_dir / "plan.md"
-
-    model = resolved["model"]["value"]
-    effort = resolved["effort"]["value"]
-    max_review_rounds = int(resolved["max_review_rounds"]["value"])
-    plan_timeout = int(resolved["plan_timeout_minutes"]["value"])
-    review_timeout = int(resolved["review_timeout_minutes"]["value"])
-    impl_timeout = int(resolved["implement_timeout_minutes"]["value"])
-    impl_turns = int(resolved["implement_max_turns"]["value"])
-    test_command = resolved["test_command"]["value"]
-    lint_command = resolved["lint_command"]["value"]
-    untranslated_strings_command = resolved["untranslated_strings_command"]["value"]
-    dev_server_url = resolved["dev_server_url"]["value"]
-    on_max_review_rounds = resolved["on_max_review_rounds"]["value"]
-    max_rate_limit_retries = int(resolved["max_rate_limit_retries"]["value"])
-    rate_limit_base_backoff_seconds = int(
-        resolved["rate_limit_base_backoff_seconds"]["value"]
-    )
-    skip_perms = cli.get("skip_permissions", False)
-    verbose = cli.get("verbose", False)
-
-    # Persona prompt fragment (task 7).
-    # Read once per execute_task; reused across plan/review/revise/implement
-    # prompts. (Plan §D3.) The path comes from the resolver chain
-    # (HARDCODED_DEFAULTS["persona_file"] = "docs/persona.md" if unset);
-    # persona_extra is per-phase, read directly from the phase's loose
-    # dict (Plan §D5).
-    persona_path = resolved["persona_file"]["value"]
-    persona_extra_path = phase_dict.get("persona_extra")
-    persona_text = load_persona_fragment(persona_path)
-    extra_text = load_persona_fragment(persona_extra_path)
-    persona_section = build_persona_section(persona_text, extra_text)
-
-    # Architectural decisions index (task 8).
-    # Read once per execute_task; reused only for the Plan prompt
-    # (§D1). The path comes from the resolver chain
-    # (HARDCODED_DEFAULTS["decisions_dir"] = "docs/decisions" if
-    # unset). No per-phase overlay (§"Non-goals").
-    decisions_dir = resolved["decisions_dir"]["value"]
-    decisions_text = load_decisions_index(decisions_dir)
-    decisions_section = build_decisions_section(decisions_text)
-
-    commit_msg = task.get("commit_message", f"task-{tid}: {task['title']}")
-
-    print(f"\n{bold('=' * 60)}")
-    print(bold(f"TASK {tid}: {task['title']}"))
-    print(bold("=" * 60))
-
-    run_kwargs = dict(
-        model=model, effort=effort,
-        skip_permissions=skip_perms, verbose=verbose,
-        max_rate_limit_retries=max_rate_limit_retries,
-        rate_limit_base_backoff_seconds=rate_limit_base_backoff_seconds,
-    )
-
-    # --- PHASE 1: PLAN ---
-    if skip_to not in ("review", "implement") and resume_mode == "fresh":
-        _current_phase = "plan"
-        print(f"\n{bold('--- Phase 1: Planning ---')}")
-        state.set_status(tid, "planning", plan_path=str(plan_path))
-
-        prompt = build_plan_prompt(
-            task, str(plan_path),
-            persona=persona_section,
-            decisions=decisions_section,
-            failure_context=failure_context_section,
+        # Snapshot prior failures for resume-context (task 10). The same
+        # section is reused across the Plan and Implement builders below;
+        # any failure recorded mid-run is for FUTURE re-runs, not this one.
+        prior_attempts = list(entry.get("attempts", []))
+        failure_context_section = build_failure_context_section(prior_attempts)
+    
+        # Resume routing (task 6 v0.3 §D4). progress.md is the sidecar
+        # checklist the implementer maintains across chunks. Existence +
+        # at-least-one-active-item ([~] or [ ]) → "resume in progress;
+        # skip Plan + Review and use the resume builder for Implement."
+        # Existence + zero-active-items + at-least-one-done → "all work
+        # done pending gates" — skip Plan + Review + Implement and fall to
+        # Phase 4. No file (or empty checklist) → fresh run.
+        progress_path = task_dir / "progress.md"
+        progress_text = _read_progress_text(progress_path)
+        n_done, n_in_progress, n_pending = parse_progress_status(progress_text)
+        has_active = n_in_progress > 0 or n_pending > 0
+        if not progress_text or (n_done == 0 and not has_active):
+            resume_mode = "fresh"
+        elif has_active:
+            resume_mode = "mid_list"
+        else:
+            resume_mode = "all_done"
+        state.set_status(
+            tid, state.get(tid)["status"],
+            progress_path=str(progress_path),
         )
-        if dry_run:
-            print(dim(f"  [DRY RUN] {len(prompt)} char prompt"))
-            print(prompt[:800])
-            return
-
-        code, _ = run_claude(
-            prompt, max_turns=100, timeout_minutes=plan_timeout,
-            phase="plan", usage_jsonl_path=usage_path,
-            **run_kwargs,
+    
+        plan_path = task_dir / "plan.md"
+    
+        model = resolved["model"]["value"]
+        effort = resolved["effort"]["value"]
+        max_review_rounds = int(resolved["max_review_rounds"]["value"])
+        plan_timeout = int(resolved["plan_timeout_minutes"]["value"])
+        review_timeout = int(resolved["review_timeout_minutes"]["value"])
+        impl_timeout = int(resolved["implement_timeout_minutes"]["value"])
+        impl_turns = int(resolved["implement_max_turns"]["value"])
+        test_command = resolved["test_command"]["value"]
+        lint_command = resolved["lint_command"]["value"]
+        untranslated_strings_command = resolved["untranslated_strings_command"]["value"]
+        dev_server_url = resolved["dev_server_url"]["value"]
+        on_max_review_rounds = resolved["on_max_review_rounds"]["value"]
+        max_rate_limit_retries = int(resolved["max_rate_limit_retries"]["value"])
+        rate_limit_base_backoff_seconds = int(
+            resolved["rate_limit_base_backoff_seconds"]["value"]
         )
-        if claude._last_run_rate_limited:
-            _record_rate_limited_and_block(
-                state, tid, phase="plan", plan_path=None,
-                max_rate_limit_retries=max_rate_limit_retries,
-            )
-            return
-        if not plan_path.exists():
-            print(red(f"  Plan file not created at {plan_path}"))
-            save_error_output(task_dir, code, _)
-            return
-
-    # --- PHASE 2: REVIEW LOOP ---
-    if skip_to != "implement" and resume_mode == "fresh":
-        _current_phase = "review"
-        print(f"\n{bold('--- Phase 2: Review Loop ---')}")
-        prev_feedback = ""
-
-        for round_num in range(1, max_review_rounds + 1):
-            review_path = task_dir / f"review-{round_num}.md"
-            print(f"\n  {bold(f'Review round {round_num}/{max_review_rounds}')}")
-
-            state.set_status(tid, "reviewing", review_round=round_num)
-            prompt = build_review_prompt(
-                task, str(plan_path), str(review_path),
-                prev_feedback, persona=persona_section,
+        skip_perms = cli.get("skip_permissions", False)
+        verbose = cli.get("verbose", False)
+    
+        # Persona prompt fragment (task 7).
+        # Read once per execute_task; reused across plan/review/revise/implement
+        # prompts. (Plan §D3.) The path comes from the resolver chain
+        # (HARDCODED_DEFAULTS["persona_file"] = "docs/persona.md" if unset);
+        # persona_extra is per-phase, read directly from the phase's loose
+        # dict (Plan §D5).
+        persona_path = resolved["persona_file"]["value"]
+        persona_extra_path = phase_dict.get("persona_extra")
+        persona_text = load_persona_fragment(persona_path)
+        extra_text = load_persona_fragment(persona_extra_path)
+        persona_section = build_persona_section(persona_text, extra_text)
+    
+        # Architectural decisions index (task 8).
+        # Read once per execute_task; reused only for the Plan prompt
+        # (§D1). The path comes from the resolver chain
+        # (HARDCODED_DEFAULTS["decisions_dir"] = "docs/decisions" if
+        # unset). No per-phase overlay (§"Non-goals").
+        decisions_dir = resolved["decisions_dir"]["value"]
+        decisions_text = load_decisions_index(decisions_dir)
+        decisions_section = build_decisions_section(decisions_text)
+    
+        commit_msg = task.get("commit_message", f"task-{tid}: {task['title']}")
+    
+        print(f"\n{bold('=' * 60)}")
+        print(bold(f"TASK {tid}: {task['title']}"))
+        print(bold("=" * 60))
+    
+        run_kwargs = dict(
+            model=model, effort=effort,
+            skip_permissions=skip_perms, verbose=verbose,
+            max_rate_limit_retries=max_rate_limit_retries,
+            rate_limit_base_backoff_seconds=rate_limit_base_backoff_seconds,
+        )
+    
+        # --- PHASE 1: PLAN ---
+        if skip_to not in ("review", "implement") and resume_mode == "fresh":
+            _current_phase = "plan"
+            print(f"\n{bold('--- Phase 1: Planning ---')}")
+            state.set_status(tid, "planning", plan_path=str(plan_path))
+    
+            prompt = build_plan_prompt(
+                task, str(plan_path),
+                persona=persona_section,
+                decisions=decisions_section,
+                failure_context=failure_context_section,
             )
             if dry_run:
-                print(dim(f"  [DRY RUN] Review prompt: {len(prompt)} chars"))
+                print(dim(f"  [DRY RUN] {len(prompt)} char prompt"))
+                print(prompt[:800])
                 return
-
-            run_claude(
-                prompt, max_turns=60, timeout_minutes=review_timeout,
-                phase="review", usage_jsonl_path=usage_path,
+    
+            code, _ = run_claude(
+                prompt, max_turns=100, timeout_minutes=plan_timeout,
+                phase="plan", usage_jsonl_path=usage_path,
                 **run_kwargs,
             )
             if claude._last_run_rate_limited:
                 _record_rate_limited_and_block(
-                    state, tid, phase="review", plan_path=plan_path,
+                    state, tid, phase="plan", plan_path=None,
                     max_rate_limit_retries=max_rate_limit_retries,
                 )
                 return
-
-            approved, feedback = check_verdict(review_path)
-            if approved:
-                print(green(f"  APPROVED at round {round_num}"))
-                state.set_status(tid, "approved")
-                break
-            else:
-                print(yellow(f"  NEEDS REVISION"))
-                prev_feedback = feedback
-
-                # Revise
-                state.set_status(tid, "revising", review_round=round_num)
-                revise_prompt = build_revise_prompt(
+            if not plan_path.exists():
+                print(red(f"  Plan file not created at {plan_path}"))
+                save_error_output(task_dir, code, _)
+                return
+    
+        # --- PHASE 2: REVIEW LOOP ---
+        if skip_to != "implement" and resume_mode == "fresh":
+            _current_phase = "review"
+            print(f"\n{bold('--- Phase 2: Review Loop ---')}")
+            prev_feedback = ""
+    
+            for round_num in range(1, max_review_rounds + 1):
+                review_path = task_dir / f"review-{round_num}.md"
+                print(f"\n  {bold(f'Review round {round_num}/{max_review_rounds}')}")
+    
+                state.set_status(tid, "reviewing", review_round=round_num)
+                prompt = build_review_prompt(
                     task, str(plan_path), str(review_path),
-                    persona=persona_section,
+                    prev_feedback, persona=persona_section,
                 )
+                if dry_run:
+                    print(dim(f"  [DRY RUN] Review prompt: {len(prompt)} chars"))
+                    return
+    
                 run_claude(
-                    revise_prompt, max_turns=60,
-                    timeout_minutes=review_timeout,
-                    phase="revise", usage_jsonl_path=usage_path,
+                    prompt, max_turns=60, timeout_minutes=review_timeout,
+                    phase="review", usage_jsonl_path=usage_path,
                     **run_kwargs,
                 )
                 if claude._last_run_rate_limited:
@@ -290,263 +346,362 @@ def execute_task(
                         max_rate_limit_retries=max_rate_limit_retries,
                     )
                     return
-        else:
-            if on_max_review_rounds == "fail":
-                print(red(
-                    f"  Max review rounds reached ({max_review_rounds}). "
-                    f"on_max_review_rounds: fail — stopping; Implement skipped."
-                ))
-                # When max_review_rounds == 0 the for-loop never bound
-                # round_num; guard the path construction.
-                if max_review_rounds > 0:
-                    last_review_path = task_dir / f"review-{round_num}.md"
-                    try:
-                        last_review_text = (
-                            last_review_path.read_text(encoding="utf-8")
-                            if last_review_path.exists()
-                            else ""
-                        )
-                    except OSError:
-                        last_review_text = ""
-                    artifacts = {
-                        "plan": str(plan_path),
-                        "last_review": str(last_review_path),
-                    }
+    
+                approved, feedback = check_verdict(review_path)
+                if approved:
+                    print(green(f"  APPROVED at round {round_num}"))
+                    state.set_status(tid, "approved")
+                    break
                 else:
-                    last_review_text = ""
-                    artifacts = {"plan": str(plan_path)}
+                    print(yellow(f"  NEEDS REVISION"))
+                    prev_feedback = feedback
+    
+                    # Revise
+                    state.set_status(tid, "revising", review_round=round_num)
+                    revise_prompt = build_revise_prompt(
+                        task, str(plan_path), str(review_path),
+                        persona=persona_section,
+                    )
+                    run_claude(
+                        revise_prompt, max_turns=60,
+                        timeout_minutes=review_timeout,
+                        phase="revise", usage_jsonl_path=usage_path,
+                        **run_kwargs,
+                    )
+                    if claude._last_run_rate_limited:
+                        _record_rate_limited_and_block(
+                            state, tid, phase="review", plan_path=plan_path,
+                            max_rate_limit_retries=max_rate_limit_retries,
+                        )
+                        return
+            else:
+                if on_max_review_rounds == "fail":
+                    print(red(
+                        f"  Max review rounds reached ({max_review_rounds}). "
+                        f"on_max_review_rounds: fail — stopping; Implement skipped."
+                    ))
+                    # When max_review_rounds == 0 the for-loop never bound
+                    # round_num; guard the path construction.
+                    if max_review_rounds > 0:
+                        last_review_path = task_dir / f"review-{round_num}.md"
+                        try:
+                            last_review_text = (
+                                last_review_path.read_text(encoding="utf-8")
+                                if last_review_path.exists()
+                                else ""
+                            )
+                        except OSError:
+                            last_review_text = ""
+                        artifacts = {
+                            "plan": str(plan_path),
+                            "last_review": str(last_review_path),
+                        }
+                    else:
+                        last_review_text = ""
+                        artifacts = {"plan": str(plan_path)}
+                    state.set_status(
+                        tid, "blocked",
+                        block_reason="max_review_rounds_exhausted",
+                    )
+                    state.record_failure(tid, make_failure_record(
+                        failure_class="review_rejected_after_max_rounds",
+                        phase="review",
+                        reason=(
+                            f"Reviewer rejected the plan {max_review_rounds} "
+                            f"round{'s' if max_review_rounds != 1 else ''} in a row."
+                        ),
+                        verbatim=last_review_text,
+                        artifacts=artifacts,
+                    ))
+                    return
+                # auto_approve (legacy v1 default)
+                print(yellow(
+                    f"  Max review rounds reached. Proceeding with current "
+                    f"plan (on_max_review_rounds: auto_approve)."
+                ))
+                state.set_status(tid, "approved")
+    
+        # --- PHASE 3: IMPLEMENT ---
+        _current_phase = "implement"
+        if resume_mode == "all_done":
+            print(f"\n{bold('--- Phase 3: Implementation (skipped) ---')}")
+            print(green(
+                f"  All progress.md items marked [x]; gates will validate."
+            ))
+        else:
+            print(f"\n{bold('--- Phase 3: Implementation ---')}")
+            state.set_status(tid, "implementing")
+            if resume_mode == "mid_list":
+                porcelain = _capture_git_porcelain()
+                prompt = build_resume_prompt(
+                    task, str(plan_path), str(progress_path),
+                    progress_text, porcelain, commit_msg,
+                    persona=persona_section,
+                    failure_context=failure_context_section,
+                )
+            else:  # "fresh"
+                prompt = build_implement_prompt(
+                    task, str(plan_path), commit_msg,
+                    persona=persona_section,
+                    failure_context=failure_context_section,
+                )
+            if dry_run:
+                print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
+                return
+    
+            run_claude(
+                prompt, max_turns=impl_turns, timeout_minutes=impl_timeout,
+                phase="implement", usage_jsonl_path=usage_path,
+                **run_kwargs,
+            )
+    
+            if claude._last_run_rate_limited:
+                _record_rate_limited_and_block(
+                    state, tid, phase="implement", plan_path=plan_path,
+                    max_rate_limit_retries=max_rate_limit_retries,
+                )
+                return
+    
+            if claude._last_run_timed_out:
                 state.set_status(
                     tid, "blocked",
-                    block_reason="max_review_rounds_exhausted",
+                    block_reason="implementer_timeout",
                 )
                 state.record_failure(tid, make_failure_record(
-                    failure_class="review_rejected_after_max_rounds",
-                    phase="review",
+                    failure_class="implementer_timeout",
+                    phase="implement",
                     reason=(
-                        f"Reviewer rejected the plan {max_review_rounds} "
-                        f"round{'s' if max_review_rounds != 1 else ''} in a row."
+                        f"Implementer exceeded the {impl_timeout}-minute "
+                        f"wall-clock timeout."
                     ),
-                    verbatim=last_review_text,
-                    artifacts=artifacts,
+                    artifacts={"plan": str(plan_path)},
                 ))
+                print(red(f"\n  Task {tid} blocked: implementer timeout."))
                 return
-            # auto_approve (legacy v1 default)
-            print(yellow(
-                f"  Max review rounds reached. Proceeding with current "
-                f"plan (on_max_review_rounds: auto_approve)."
-            ))
-            state.set_status(tid, "approved")
+    
+            if claude._last_run_subtype == "error_max_turns":
+                state.set_status(
+                    tid, "blocked",
+                    block_reason="implementer_max_turns",
+                )
+                state.record_failure(tid, make_failure_record(
+                    failure_class="implementer_max_turns",
+                    phase="implement",
+                    reason=(
+                        f"Implementer hit the {impl_turns}-turn cap "
+                        f"(CLI subtype 'error_max_turns')."
+                    ),
+                    artifacts={"plan": str(plan_path)},
+                ))
+                print(red(f"\n  Task {tid} blocked: implementer max-turns."))
+                return
+    
+        # --- POST-IMPLEMENT: precompute diff for agent gates (task 7 v0.3) ---
+        # Runs unconditionally before Phase 4 (even when no gates are
+        # configured) so the artifact has standalone operator-debug
+        # value. Empty diff → empty file; templates handle that branch.
+        # T9 will pass branch_per_task / base_branch kwargs once the
+        # branch primitives ship; T7's call uses the HEAD~1..HEAD
+        # default. (Plan §D1 / §D6.)
+        diff_text = _capture_implement_diff()
+        (task_dir / "diff.patch").write_text(diff_text, encoding="utf-8")
 
-    # --- PHASE 3: IMPLEMENT ---
-    _current_phase = "implement"
-    if resume_mode == "all_done":
-        print(f"\n{bold('--- Phase 3: Implementation (skipped) ---')}")
-        print(green(
-            f"  All progress.md items marked [x]; gates will validate."
-        ))
-    else:
-        print(f"\n{bold('--- Phase 3: Implementation ---')}")
-        state.set_status(tid, "implementing")
-        if resume_mode == "mid_list":
-            porcelain = _capture_git_porcelain()
-            prompt = build_resume_prompt(
-                task, str(plan_path), str(progress_path),
-                progress_text, porcelain, commit_msg,
-                persona=persona_section,
-                failure_context=failure_context_section,
-            )
-        else:  # "fresh"
-            prompt = build_implement_prompt(
-                task, str(plan_path), commit_msg,
-                persona=persona_section,
-                failure_context=failure_context_section,
-            )
-        if dry_run:
-            print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
-            return
-
-        run_claude(
-            prompt, max_turns=impl_turns, timeout_minutes=impl_timeout,
-            phase="implement", usage_jsonl_path=usage_path,
-            **run_kwargs,
-        )
-
-        if claude._last_run_rate_limited:
-            _record_rate_limited_and_block(
-                state, tid, phase="implement", plan_path=plan_path,
-                max_rate_limit_retries=max_rate_limit_retries,
-            )
-            return
-
-        if claude._last_run_timed_out:
-            state.set_status(
-                tid, "blocked",
-                block_reason="implementer_timeout",
-            )
-            state.record_failure(tid, make_failure_record(
-                failure_class="implementer_timeout",
-                phase="implement",
-                reason=(
-                    f"Implementer exceeded the {impl_timeout}-minute "
-                    f"wall-clock timeout."
-                ),
-                artifacts={"plan": str(plan_path)},
-            ))
-            print(red(f"\n  Task {tid} blocked: implementer timeout."))
-            return
-
-        if claude._last_run_subtype == "error_max_turns":
-            state.set_status(
-                tid, "blocked",
-                block_reason="implementer_max_turns",
-            )
-            state.record_failure(tid, make_failure_record(
-                failure_class="implementer_max_turns",
-                phase="implement",
-                reason=(
-                    f"Implementer hit the {impl_turns}-turn cap "
-                    f"(CLI subtype 'error_max_turns')."
-                ),
-                artifacts={"plan": str(plan_path)},
-            ))
-            print(red(f"\n  Task {tid} blocked: implementer max-turns."))
-            return
-
-    # --- POST-IMPLEMENT: precompute diff for agent gates (task 7 v0.3) ---
-    # Runs unconditionally before Phase 4 (even when no gates are
-    # configured) so the artifact has standalone operator-debug
-    # value. Empty diff → empty file; templates handle that branch.
-    # T9 will pass branch_per_task / base_branch kwargs once the
-    # branch primitives ship; T7's call uses the HEAD~1..HEAD
-    # default. (Plan §D1 / §D6.)
-    diff_text = _capture_implement_diff()
-    (task_dir / "diff.patch").write_text(diff_text, encoding="utf-8")
-
-    # --- PHASE 4: GATES (task 11) ---
-    # `defaults.gates` (project-level list of names) + `phases[i].
-    # defaults.gates_extra` (phase overlay). Names are resolved
-    # against the default registry; unknown names produce a single
-    # warning and are skipped (forward-compat with task 12+
-    # registering built-ins).
-    gate_names_project = list(file_defaults.get("gates") or [])
-    gate_names_phase = list(phase_dict.get("gates_extra") or [])
-    gate_names = gate_names_project + gate_names_phase
-    if gate_names:
-        from claude_plan_execute.gates.invariants import loaded_invariant_names
-        invariant_names = loaded_invariant_names()
-        registry = default_registry()
-        resolved_gates: list[tuple[str, Gate]] = []
-        unknown_gates: list[str] = []
-        unconfigured_lint = False
-        unconfigured_untranslated_strings = False
-        for name in gate_names:
-            if name == "tests":
-                resolved_gates.append((name, make_tests_gate(test_command)))
-            elif name == "lint":
-                if lint_command is None:
-                    unconfigured_lint = True
-                else:
-                    resolved_gates.append((name, make_lint_gate(lint_command)))
-            elif name == "untranslated-strings":
-                if untranslated_strings_command is None:
-                    unconfigured_untranslated_strings = True
-                else:
-                    resolved_gates.append((
-                        name,
-                        make_untranslated_strings_gate(
-                            untranslated_strings_command,
+        # v0.3 task 8 (Plan §D4.5): ensure gate-scoped services are
+        # up before Phase 4. poll_health may have detected a crash
+        # that happened during the implement phase.
+        if service_manager is not None:
+            try:
+                events = service_manager.poll_health()
+            except ServiceUnstableError as exc:
+                state.set_status(
+                    tid, "blocked", block_reason="service_unstable",
+                )
+                state.record_failure(tid, make_failure_record(
+                    failure_class="service_unstable",
+                    phase="gate",
+                    reason=str(exc),
+                    artifacts={
+                        "services_status": str(plans_dir / "services.json"),
+                    },
+                ))
+                print(red(f"\n  Task {tid} blocked: {exc}"))
+                return
+            for ev in events:
+                if ev["event"] == "crashed_restarted":
+                    state.record_failure(tid, make_failure_record(
+                        failure_class="service_crashed",
+                        phase="gate",
+                        reason=(
+                            f"Service '{ev['name']}' crashed (exit "
+                            f"{ev['exit_code']}); auto-restarted "
+                            f"(crash {ev['crash_count']}/3)."
                         ),
                     ))
-            elif name == "design-fidelity":
-                resolved_gates.append((
-                    name,
-                    make_design_fidelity_gate(
-                        dev_server_url=dev_server_url,
-                        persona=persona_section,
-                    ),
-                ))
-            elif name == "invariant-grep":
-                for inv_name in invariant_names:
-                    g = registry.get(inv_name)
-                    if g is not None:
-                        resolved_gates.append((inv_name, g))
-            else:
-                g = registry.get(name)
-                if g is None:
-                    unknown_gates.append(name)
-                else:
-                    resolved_gates.append((name, g))
-        if unconfigured_lint:
-            print(yellow(
-                "  Skipping gate 'lint': no defaults.lint_command configured."
-            ))
-        if unconfigured_untranslated_strings:
-            print(yellow(
-                "  Skipping gate 'untranslated-strings': no "
-                "defaults.untranslated_strings_command configured."
-            ))
-        if unknown_gates:
-            print(yellow(
-                f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
-                f"(not registered; check spelling)"
-            ))
-        if resolved_gates:
-            print(f"\n{bold('--- Phase 4: Gates ---')}")
-            # Augment the task dict so phase-inherited task_class
-            # is visible to gate `when` filters (task 20 §D9).
-            task_for_gates = {**task, "task_class": task_class_name}
-            gate_results = run_gates(
-                resolved_gates,
-                task=task_for_gates,
-                task_dir=task_dir,
-                cli=cli,
-            )
-            blocking = [
-                r for r in gate_results
-                if not r.passed and r.on_failure == "block"
-            ]
-            if blocking:
-                verbatim = "\n\n".join(
-                    f"--- {r.name} ---\n{r.output}"
-                    for r in blocking
-                )
-                artifacts: dict[str, str] = {
-                    "plan": str(plan_path),
-                    "gates_dir": str(task_dir / "gates"),
-                }
-                for r in blocking:
-                    if r.output_path:
-                        artifacts[f"gate:{r.name}"] = r.output_path
-                state.set_status(
-                    tid, "blocked",
-                    block_reason="gate_failed",
-                )
-                state.record_failure(tid, make_failure_record(
-                    failure_class="gate_failed",
-                    phase="gate",
-                    reason=(
-                        f"{len(blocking)} gate(s) failed: "
-                        f"{', '.join(r.name for r in blocking)}"
-                    ),
-                    verbatim=verbatim,
-                    artifacts=artifacts,
-                ))
-                print(red(
-                    f"\n  Task {tid} blocked: gate(s) failed "
-                    f"({', '.join(r.name for r in blocking)})."
-                ))
-                return
+            if required_services:
+                try:
+                    service_manager.ensure(required_services)
+                except ServiceUnavailableError as exc:
+                    state.set_status(
+                        tid, "blocked",
+                        block_reason="service_unavailable",
+                    )
+                    state.record_failure(tid, make_failure_record(
+                        failure_class="service_unavailable",
+                        phase="gate",
+                        reason=str(exc),
+                        artifacts={
+                            "services_status": str(plans_dir / "services.json"),
+                        },
+                    ))
+                    print(red(f"\n  Task {tid} blocked: {exc}"))
+                    return
 
-    # T2 §D8: roll up per-run usage rows into the per-task summary.
-    # Failed / blocked tasks short-circuit before this point; they
-    # do NOT get a usage_summary. Re-running a done task overwrites
-    # the summary (cumulative over the append-only JSONL).
-    summary = summarize_usage(usage_path)
-    done_extras: dict = {}
-    if summary["total_runs"] > 0:
-        done_extras["usage_summary"] = summary
-    state.set_status(tid, "done", **done_extras)
-    print(green(f"\n  Task {tid} complete."))
+        # --- PHASE 4: GATES (task 11) ---
+        # `defaults.gates` (project-level list of names) + `phases[i].
+        # defaults.gates_extra` (phase overlay). Names are resolved
+        # against the default registry; unknown names produce a single
+        # warning and are skipped (forward-compat with task 12+
+        # registering built-ins).
+        gate_names_project = list(file_defaults.get("gates") or [])
+        gate_names_phase = list(phase_dict.get("gates_extra") or [])
+        gate_names = gate_names_project + gate_names_phase
+        if gate_names:
+            from claude_plan_execute.gates.invariants import loaded_invariant_names
+            invariant_names = loaded_invariant_names()
+            registry = default_registry()
+            resolved_gates: list[tuple[str, Gate]] = []
+            unknown_gates: list[str] = []
+            unconfigured_lint = False
+            unconfigured_untranslated_strings = False
+            for name in gate_names:
+                if name == "tests":
+                    resolved_gates.append((name, make_tests_gate(test_command)))
+                elif name == "lint":
+                    if lint_command is None:
+                        unconfigured_lint = True
+                    else:
+                        resolved_gates.append((name, make_lint_gate(lint_command)))
+                elif name == "untranslated-strings":
+                    if untranslated_strings_command is None:
+                        unconfigured_untranslated_strings = True
+                    else:
+                        resolved_gates.append((
+                            name,
+                            make_untranslated_strings_gate(
+                                untranslated_strings_command,
+                            ),
+                        ))
+                elif name == "design-fidelity":
+                    resolved_gates.append((
+                        name,
+                        make_design_fidelity_gate(
+                            dev_server_url=dev_server_url,
+                            persona=persona_section,
+                        ),
+                    ))
+                elif name == "invariant-grep":
+                    for inv_name in invariant_names:
+                        g = registry.get(inv_name)
+                        if g is not None:
+                            resolved_gates.append((inv_name, g))
+                else:
+                    g = registry.get(name)
+                    if g is None:
+                        unknown_gates.append(name)
+                    else:
+                        resolved_gates.append((name, g))
+            if unconfigured_lint:
+                print(yellow(
+                    "  Skipping gate 'lint': no defaults.lint_command configured."
+                ))
+            if unconfigured_untranslated_strings:
+                print(yellow(
+                    "  Skipping gate 'untranslated-strings': no "
+                    "defaults.untranslated_strings_command configured."
+                ))
+            if unknown_gates:
+                print(yellow(
+                    f"  Unknown gate(s) skipped: {', '.join(unknown_gates)} "
+                    f"(not registered; check spelling)"
+                ))
+            if resolved_gates:
+                print(f"\n{bold('--- Phase 4: Gates ---')}")
+                # Augment the task dict so phase-inherited task_class
+                # is visible to gate `when` filters (task 20 §D9).
+                task_for_gates = {**task, "task_class": task_class_name}
+                gate_results = run_gates(
+                    resolved_gates,
+                    task=task_for_gates,
+                    task_dir=task_dir,
+                    cli=cli,
+                )
+                blocking = [
+                    r for r in gate_results
+                    if not r.passed and r.on_failure == "block"
+                ]
+                if blocking:
+                    verbatim = "\n\n".join(
+                        f"--- {r.name} ---\n{r.output}"
+                        for r in blocking
+                    )
+                    artifacts: dict[str, str] = {
+                        "plan": str(plan_path),
+                        "gates_dir": str(task_dir / "gates"),
+                    }
+                    for r in blocking:
+                        if r.output_path:
+                            artifacts[f"gate:{r.name}"] = r.output_path
+                    state.set_status(
+                        tid, "blocked",
+                        block_reason="gate_failed",
+                    )
+                    state.record_failure(tid, make_failure_record(
+                        failure_class="gate_failed",
+                        phase="gate",
+                        reason=(
+                            f"{len(blocking)} gate(s) failed: "
+                            f"{', '.join(r.name for r in blocking)}"
+                        ),
+                        verbatim=verbatim,
+                        artifacts=artifacts,
+                    ))
+                    print(red(
+                        f"\n  Task {tid} blocked: gate(s) failed "
+                        f"({', '.join(r.name for r in blocking)})."
+                    ))
+                    return
+    
+        # T2 §D8: roll up per-run usage rows into the per-task summary.
+        # Failed / blocked tasks short-circuit before this point; they
+        # do NOT get a usage_summary. Re-running a done task overwrites
+        # the summary (cumulative over the append-only JSONL).
+        summary = summarize_usage(usage_path)
+        done_extras: dict = {}
+        if summary["total_runs"] > 0:
+            done_extras["usage_summary"] = summary
+
+        # v0.3 task 8 (Plan §D4.6): success-path explicit teardown.
+        # `reset_crash_count` runs for services that held running
+        # through the entire task; the explicit
+        # `_service_teardown_after_task` call short-circuits the
+        # `finally` (idempotent on already-stopped services).
+        if service_manager is not None:
+            for name in required_services:
+                if service_manager.is_running(name):
+                    service_manager.reset_crash_count(name)
+        _service_teardown_after_task(service_manager)
+
+        state.set_status(tid, "done", **done_extras)
+        print(green(f"\n  Task {tid} complete."))
+        return
+    finally:
+        # v0.3 task 8 (Plan §D4.6): defensive teardown for every
+        # non-success exit path (rate-limit returns, implementer
+        # timeouts, gate failures, dry-run early-returns,
+        # plan-missing return, uncaught exceptions). Idempotent on
+        # stopped services, so a re-call after the success-path
+        # explicit teardown is a no-op.
+        _service_teardown_after_task(service_manager)
 
 
 def save_error_output(task_dir: Path, code: int, output: str):
@@ -654,6 +809,46 @@ def _capture_implement_diff(
     if proc.returncode != 0:
         return ""
     return _tail_cap(proc.stdout, cap=_DIFF_CAP_BYTES)
+
+
+def _resolve_services_required(
+    *, task: dict, file_defaults: dict, phase_dict: dict,
+) -> list[str]:
+    """Compute the union of services_required for one task.
+
+    Layers (additive, like gates):
+      1. defaults.services_required
+      2. phase.defaults.services_required_extra (loose dict)
+      3. task.services_required_extra
+
+    Order: project, then phase, then task (matches gate
+    composition). Duplicates within or across layers are dropped;
+    first-seen order is preserved for determinism.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for src in (
+        file_defaults.get("services_required") or [],
+        phase_dict.get("services_required_extra") or [],
+        task.get("services_required_extra") or [],
+    ):
+        for name in src:
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _service_teardown_after_task(
+    service_manager: "ServiceManager | None",
+) -> None:
+    """Tear down gate- and task-scope services. No-op when manager
+    is None. Idempotent on stopped services."""
+    if service_manager is None:
+        return
+    service_manager.tear_down_for_scope("gate")
+    service_manager.tear_down_for_scope("task")
 
 
 def handle_sigint(signum, frame):

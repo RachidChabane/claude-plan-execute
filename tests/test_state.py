@@ -521,6 +521,13 @@ def test_failure_classes_includes_v0_3_writes():
     assert "rate_limited" in FAILURE_CLASSES
 
 
+def test_failure_classes_includes_v0_3_task_8_writes():
+    """v0.3 task 8 — three service-related failure classes."""
+    assert "service_unavailable" in FAILURE_CLASSES
+    assert "service_crashed" in FAILURE_CLASSES
+    assert "service_unstable" in FAILURE_CLASSES
+
+
 def test_make_failure_record_does_not_validate_failure_class():
     """Pin §D3: unknown failure_class strings are accepted (no raise)."""
     fr = make_failure_record(

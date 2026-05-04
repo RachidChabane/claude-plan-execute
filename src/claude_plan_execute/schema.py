@@ -45,6 +45,64 @@ class TaskClassConfig(BaseModel):
     effort: str | None = None
 
 
+class ReadyCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["http", "tcp", "shell"]
+    url: str | None = None
+    port: int | None = None
+    command: str | None = None
+
+    @model_validator(mode="after")
+    def _check_kind_specific_fields(self) -> "ReadyCheck":
+        if self.kind == "http":
+            if not self.url:
+                raise ValueError(
+                    "ready_check kind=http requires 'url'"
+                )
+            if self.port is not None or self.command is not None:
+                raise ValueError(
+                    "ready_check kind=http cannot set 'port' or 'command'"
+                )
+        elif self.kind == "tcp":
+            if self.port is None:
+                raise ValueError(
+                    "ready_check kind=tcp requires 'port'"
+                )
+            if not (1 <= self.port <= 65535):
+                raise ValueError(
+                    f"ready_check port must be 1-65535 (got {self.port})"
+                )
+            if self.url is not None or self.command is not None:
+                raise ValueError(
+                    "ready_check kind=tcp cannot set 'url' or 'command'"
+                )
+        elif self.kind == "shell":
+            if not self.command:
+                raise ValueError(
+                    "ready_check kind=shell requires 'command'"
+                )
+            if self.url is not None or self.port is not None:
+                raise ValueError(
+                    "ready_check kind=shell cannot set 'url' or 'port'"
+                )
+        return self
+
+
+class ServiceSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_-]+$")
+    command: str = Field(min_length=1)
+    cwd: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    ready_check: ReadyCheck
+    ready_timeout_seconds: int = 60
+    lifetime: Literal["run", "phase", "task", "gate"] = "run"
+    log_file: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+
+
 class Defaults(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -60,6 +118,7 @@ class Defaults(BaseModel):
     invariants_file: str | None = None
     dev_server_url: str | None = None
     gates: list[str] | None = None
+    services_required: list[str] | None = None
     task_class_models: dict[str, TaskClassConfig] | None = None
     caps: Caps | None = None
     on_max_review_rounds: Literal["fail", "auto_approve"] | None = None
@@ -107,6 +166,7 @@ class Task(BaseModel):
     implement_timeout_minutes: int | None = None
     implement_max_turns: int | None = None
     max_review_rounds: int | None = None
+    services_required_extra: list[str] | None = None
 
 
 class TasksFile(BaseModel):
@@ -116,6 +176,7 @@ class TasksFile(BaseModel):
     defaults: Defaults = Field(default_factory=Defaults)
     phases: list[Phase] = Field(default_factory=list)
     tasks: list[Task] = Field(min_length=1)
+    services: list[ServiceSpec] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_cross_references(self) -> "TasksFile":
@@ -152,6 +213,83 @@ class TasksFile(BaseModel):
                         f"'{tc}'. Known classes: "
                         f"{', '.join(sorted(class_names))}"
                     )
+
+        # Service-related cross-reference checks. Declared order
+        # 4 -> 5 -> 6 -> 7 -> 8 must be preserved: check 5 (depends_on
+        # names exist) MUST run before check 6 (cycle DFS) so a
+        # cycle-with-typo yields the more informative
+        # "depends_on unknown service" message rather than degrading
+        # silently. Reordering would weaken error quality.
+        service_names_list = [s.name for s in self.services]
+        service_names = set(service_names_list)
+
+        # 4. Duplicate service names rejected.
+        if len(service_names_list) != len(service_names):
+            dupes = sorted({n for n in service_names_list
+                            if service_names_list.count(n) > 1})
+            raise ValueError(f"Duplicate service names: {dupes}")
+
+        # 5. service.depends_on names exist.
+        for s in self.services:
+            unknown = [d for d in s.depends_on if d not in service_names]
+            if unknown:
+                raise ValueError(
+                    f"Service '{s.name}' depends_on unknown service(s): "
+                    f"{unknown}. Known: {sorted(service_names)}"
+                )
+
+        # 6. No cycles in service depends_on (DFS).
+        def _has_cycle(name: str, stack: list[str]) -> list[str] | None:
+            if name in stack:
+                return stack[stack.index(name):] + [name]
+            spec = next((x for x in self.services if x.name == name), None)
+            if spec is None:
+                return None  # safe: check 5 already raised on unknowns
+            for dep in spec.depends_on:
+                cycle = _has_cycle(dep, stack + [name])
+                if cycle:
+                    return cycle
+            return None
+
+        for s in self.services:
+            cycle = _has_cycle(s.name, [])
+            if cycle:
+                raise ValueError(
+                    f"Cycle in service depends_on: {' -> '.join(cycle)}"
+                )
+
+        # 7. defaults.services_required names exist.
+        unknown = [
+            n for n in (self.defaults.services_required or [])
+            if n not in service_names
+        ]
+        if unknown:
+            raise ValueError(
+                f"defaults.services_required references unknown service(s): "
+                f"{unknown}. Known: {sorted(service_names)}"
+            )
+
+        # 8a. task.services_required_extra names exist.
+        for t in self.tasks:
+            extra = t.services_required_extra or []
+            unknown = [n for n in extra if n not in service_names]
+            if unknown:
+                raise ValueError(
+                    f"Task {t.id} services_required_extra references unknown "
+                    f"service(s): {unknown}. Known: {sorted(service_names)}"
+                )
+
+        # 8b. phase.defaults.services_required_extra names exist (loose dict).
+        for p in self.phases:
+            extra = p.defaults.get("services_required_extra") or []
+            if not isinstance(extra, list):
+                continue
+            unknown = [n for n in extra if n not in service_names]
+            if unknown:
+                raise ValueError(
+                    f"Phase '{p.id}' services_required_extra references unknown "
+                    f"service(s): {unknown}. Known: {sorted(service_names)}"
+                )
         return self
 
 
@@ -182,6 +320,12 @@ def _valid_keys_for_extra_error(loc: tuple) -> list[str]:
     if len(parent) >= 2 and parent[0] == "tasks" and isinstance(parent[1], int):
         if len(parent) == 2:
             return list(Task.model_fields.keys())
+    # ("services", N, ...) where N is an int
+    if len(parent) >= 2 and parent[0] == "services" and isinstance(parent[1], int):
+        if len(parent) == 2:
+            return list(ServiceSpec.model_fields.keys())
+        if len(parent) == 3 and parent[2] == "ready_check":
+            return list(ReadyCheck.model_fields.keys())
     return []
 
 
@@ -221,6 +365,8 @@ def format_validation_error(exc: ValidationError, path: Path) -> str:
 __all__ = [
     "Caps",
     "TaskClassConfig",
+    "ReadyCheck",
+    "ServiceSpec",
     "Defaults",
     "Phase",
     "Task",
