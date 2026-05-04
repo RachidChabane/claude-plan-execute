@@ -42,12 +42,22 @@ def test_v1_fixture_validates_clean(capsys):
 
 
 def test_repo_dogfood_tasks_yaml_validates(capsys):
-    """The repo's own tasks.yaml is the strongest end-to-end test of the schema."""
+    """The repo's own tasks.yaml is the strongest end-to-end test of the schema.
+
+    Schema-level assertions only — no structural pin to a specific task ID
+    or phase, since the dogfood file rotates with each enhancement slate.
+    """
     repo_root = Path(__file__).resolve().parents[1]
     tf = loader.load_tasks_file(repo_root / "tasks.yaml")
     assert tf.version == 2
     assert len(tf.tasks) >= 4
-    assert any(t.phase == "config" and t.id == 4 for t in tf.tasks)
+    # If phases are declared, every task that references one resolves to a
+    # known phase id. (Cross-reference checks live in the model_validator;
+    # this is a smoke check that the validator ran.)
+    if tf.phases:
+        phase_ids = {p.id for p in tf.phases}
+        for t in tf.tasks:
+            assert t.phase is None or t.phase in phase_ids
 
 
 # --- B. Deprecation warnings ------------------------------------------------
@@ -389,6 +399,93 @@ def test_effective_defaults_expands_caps_max_review_rounds(tmp_path, capsys):
     assert eff["max_attempts"] == 3
 
 
+# --- C2. Caps rate-limit fields (v0.3 task 1) ------------------------------
+
+
+def test_caps_accepts_new_rate_limit_fields():
+    c = Caps(
+        max_rate_limit_retries=5,
+        rate_limit_base_backoff_seconds=30,
+    )
+    assert c.max_rate_limit_retries == 5
+    assert c.rate_limit_base_backoff_seconds == 30
+
+
+def test_caps_new_fields_default_to_none():
+    c = Caps()
+    assert c.max_rate_limit_retries is None
+    assert c.rate_limit_base_backoff_seconds is None
+
+
+def test_v2_with_rate_limit_caps_validates_clean(tmp_path):
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  caps:\n"
+        "    max_rate_limit_retries: 5\n"
+        "    rate_limit_base_backoff_seconds: 30\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.caps.max_rate_limit_retries == 5
+    assert tf.defaults.caps.rate_limit_base_backoff_seconds == 30
+
+
+def test_extra_key_under_caps_suggests_max_rate_limit_retries(tmp_path, capsys):
+    """Typo correction surfaces the new key as a suggestion."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  caps:\n"
+        "    max_rate_limit_retri: 3\n"   # typo
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "max_rate_limit_retri" in err
+    assert "max_rate_limit_retries" in err  # suggestion text
+
+
+def test_effective_defaults_expands_rate_limit_caps(tmp_path):
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  caps:\n"
+        "    max_rate_limit_retries: 7\n"
+        "    rate_limit_base_backoff_seconds: 45\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["max_rate_limit_retries"] == 7
+    assert eff["rate_limit_base_backoff_seconds"] == 45
+
+
+def test_effective_defaults_omits_rate_limit_keys_when_caps_unset(tmp_path):
+    """When caps don't set the new fields, effective_defaults doesn't add
+    them — the resolver falls through to HARDCODED_DEFAULTS."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  caps:\n"
+        "    max_minutes_per_phase: 60\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert "max_rate_limit_retries" not in eff
+    assert "rate_limit_base_backoff_seconds" not in eff
+
+
 # --- D. Strict validation: extra keys -> typo suggestion -------------------
 
 def test_extra_key_under_defaults_suggests_correction(tmp_path, capsys):
@@ -696,3 +793,882 @@ def test_defaults_rejects_unknown_dev_server_url_typo():
     suggested-correction message."""
     with pytest.raises(ValidationError):
         Defaults(dev_servr_url="http://localhost:3000")
+
+
+# --- K. ReadyCheck shape (v0.3 task 8 §D1.1) -------------------------------
+
+from claude_plan_execute.schema import ReadyCheck, ServiceSpec
+
+
+def test_ready_check_kind_http_requires_url():
+    """Plan §D1.1: kind=http must set 'url'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="http")
+
+
+def test_ready_check_kind_http_rejects_port():
+    """Plan §D1.1: kind=http must NOT set 'port'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="http", url="http://x", port=80)
+
+
+def test_ready_check_kind_http_rejects_command():
+    """Plan §D1.1: kind=http must NOT set 'command'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="http", url="http://x", command="true")
+
+
+def test_ready_check_kind_tcp_requires_port():
+    """Plan §D1.1: kind=tcp must set 'port'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="tcp")
+
+
+def test_ready_check_kind_tcp_rejects_url():
+    """Plan §D1.1: kind=tcp must NOT set 'url'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="tcp", port=5432, url="http://x")
+
+
+def test_ready_check_port_out_of_range_rejected():
+    """Plan §D1.1: port must be 1-65535."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="tcp", port=0)
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="tcp", port=70000)
+
+
+def test_ready_check_kind_shell_requires_command():
+    """Plan §D1.1: kind=shell must set 'command'."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="shell")
+
+
+def test_ready_check_typo_url_rejected():
+    """Plan §D1.1: extra='forbid' on ReadyCheck rejects typos."""
+    with pytest.raises(ValidationError):
+        ReadyCheck(kind="http", urll="http://x")  # type: ignore[call-arg]
+
+
+# --- L. ServiceSpec shape (v0.3 task 8 §D1.2) ------------------------------
+
+def test_service_spec_minimal_validates():
+    """Plan §D1.2: a minimal ServiceSpec validates."""
+    s = ServiceSpec(
+        name="dev",
+        command="npm run dev",
+        ready_check=ReadyCheck(kind="http", url="http://x"),
+    )
+    assert s.name == "dev"
+    assert s.command == "npm run dev"
+
+
+def test_service_spec_default_lifetime_is_run():
+    """Plan §D1.2: lifetime defaults to 'run'."""
+    s = ServiceSpec(
+        name="dev",
+        command="x",
+        ready_check=ReadyCheck(kind="tcp", port=80),
+    )
+    assert s.lifetime == "run"
+
+
+def test_service_spec_default_ready_timeout_is_60():
+    """Plan §D1.2: ready_timeout_seconds defaults to 60."""
+    s = ServiceSpec(
+        name="dev",
+        command="x",
+        ready_check=ReadyCheck(kind="tcp", port=80),
+    )
+    assert s.ready_timeout_seconds == 60
+
+
+def test_service_spec_typo_lifetim_rejected_with_suggestion(tmp_path, capsys):
+    """Plan §D1.2: extra='forbid' on ServiceSpec catches typos with a
+    'Did you mean' suggestion."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    lifetim: run\n"  # typo
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lifetim" in err
+    assert "Did you mean 'lifetime'?" in err
+
+
+def test_service_spec_empty_name_rejected():
+    """Plan §D1.2: name has min_length=1."""
+    with pytest.raises(ValidationError):
+        ServiceSpec(
+            name="",
+            command="x",
+            ready_check=ReadyCheck(kind="tcp", port=80),
+        )
+
+
+def test_service_spec_invalid_name_chars_rejected():
+    """Plan §D1.2: name pattern rejects shell-meta and quote chars."""
+    with pytest.raises(ValidationError):
+        ServiceSpec(
+            name="bad name",
+            command="x",
+            ready_check=ReadyCheck(kind="tcp", port=80),
+        )
+
+
+# --- M. TasksFile.services (v0.3 task 8 §D1.4) -----------------------------
+
+def test_tasks_file_accepts_services_block(tmp_path):
+    """Plan §D1.4: top-level `services:` accepts a list of ServiceSpec."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: npm run dev\n"
+        "    ready_check: { kind: http, url: http://localhost:5173 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert len(tf.services) == 1
+    assert tf.services[0].name == "dev"
+
+
+def test_tasks_file_services_default_to_empty_list(tmp_path):
+    """Plan §D1.4: `services` defaults to []."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.services == []
+
+
+def test_top_level_typo_servicse_rejected(tmp_path, capsys):
+    """Plan §D1.5: top-level typo `servicse` is rejected with a
+    'Did you mean services?' suggestion."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "servicse: []\n"  # typo
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "servicse" in err
+    assert "Did you mean 'services'?" in err
+
+
+# --- N. Defaults / Task field additions (§D1.3) ----------------------------
+
+def test_defaults_accepts_services_required():
+    """Plan §D1.3: Defaults.services_required is a list[str] | None."""
+    d = Defaults(services_required=["dev", "postgres"])
+    assert d.services_required == ["dev", "postgres"]
+
+
+def test_defaults_services_required_defaults_to_None():
+    """Plan §D1.3: Defaults.services_required defaults to None when unset."""
+    d = Defaults()
+    assert d.services_required is None
+
+
+def test_task_accepts_services_required_extra():
+    """Plan §D1.3: Task.services_required_extra is a list[str] | None."""
+    t = Task(id=1, title="T", description="D",
+             services_required_extra=["redis"])
+    assert t.services_required_extra == ["redis"]
+
+
+# --- O. Cross-references (§D1.6) -------------------------------------------
+
+def _yaml_with_services_and_required(svc_block: str, defaults_extra: str = "") -> str:
+    return (
+        "version: 2\n"
+        f"defaults:\n  {defaults_extra}\n" if defaults_extra
+        else "version: 2\n"
+    ) + (
+        f"services:\n{svc_block}\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+
+
+def test_services_required_unknown_name_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 7: defaults.services_required name must exist."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  services_required: [missing]\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "defaults.services_required" in err
+    assert "missing" in err
+
+
+def test_task_services_required_extra_unknown_name_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 8a: task.services_required_extra name must exist."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "tasks:\n"
+        "  - id: 1\n"
+        "    title: T\n"
+        "    description: D\n"
+        "    services_required_extra: [missing]\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Task 1" in err
+    assert "missing" in err
+
+
+def test_phase_services_required_extra_unknown_name_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 8b: phase.defaults.services_required_extra name
+    must exist (loose dict)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "phases:\n"
+        "  - id: p1\n"
+        "    defaults:\n"
+        "      services_required_extra: [missing]\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D, phase: p1 }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Phase 'p1'" in err
+    assert "missing" in err
+
+
+def test_service_depends_on_unknown_name_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 5: depends_on must reference a declared service."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "    depends_on: [missing]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Service 'dev'" in err
+    assert "missing" in err
+
+
+def test_service_depends_on_cycle_two_node_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 6: a -> b -> a cycle is rejected."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: a\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "    depends_on: [b]\n"
+        "  - name: b\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 81 }\n"
+        "    depends_on: [a]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Cycle" in err
+    assert "a" in err and "b" in err
+
+
+def test_service_depends_on_cycle_three_node_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 6: a -> b -> c -> a cycle is rejected."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: a\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "    depends_on: [b]\n"
+        "  - name: b\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 81 }\n"
+        "    depends_on: [c]\n"
+        "  - name: c\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 82 }\n"
+        "    depends_on: [a]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Cycle" in err
+
+
+def test_service_depends_on_self_cycle_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 6: self-cycle a -> a is rejected."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: a\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "    depends_on: [a]\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Cycle" in err
+
+
+def test_duplicate_service_names_rejected(tmp_path, capsys):
+    """Plan §D1.6 check 4: two services with the same name are rejected."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: x\n"
+        "    ready_check: { kind: tcp, port: 80 }\n"
+        "  - name: dev\n"
+        "    command: y\n"
+        "    ready_check: { kind: tcp, port: 81 }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "Duplicate service names" in err
+
+
+# --- P. Task.gates_extra (v0.3 task 4 §2.21) ------------------------------
+
+
+def test_task_accepts_gates_extra():
+    """Task §2.21: Task.gates_extra is a list[str] | None."""
+    t = Task(id=1, title="T", description="D",
+             gates_extra=["lint", "design-fidelity"])
+    assert t.gates_extra == ["lint", "design-fidelity"]
+
+
+def test_task_gates_extra_defaults_to_None():
+    """Task §2.21: gates_extra defaults to None when unset."""
+    t = Task(id=1, title="T", description="D")
+    assert t.gates_extra is None
+
+
+def test_task_typo_gate_extra_singular_rejected_with_suggestion(
+    tmp_path, capsys,
+):
+    """Task §2.21: extra='forbid' on Task catches the singular typo
+    `gate_extra` (no trailing s) and difflib suggests `gates_extra`.
+    Mirrors test_typo_lint_cmd_suggests_lint_command at line 701."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - id: 1\n"
+        "    title: T\n"
+        "    description: D\n"
+        "    gate_extra: [lint]\n"   # typo (no trailing s)
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "gate_extra" in err
+    assert "Did you mean 'gates_extra'?" in err
+
+
+# --- T9: branch_per_task / auto_pr Defaults (v0.3 §2.12) ------------------
+
+
+def test_defaults_accepts_branch_per_task_fields():
+    """All 6 T9 fields settable on Defaults(...) with documented types."""
+    d = Defaults(
+        branch_per_task=True,
+        base_branch="develop",
+        task_branch_template="task/{id}-{slug}",
+        auto_pr=True,
+        auto_merge=False,
+        pr_body_template="docs/pr-template.md",
+    )
+    assert d.branch_per_task is True
+    assert d.base_branch == "develop"
+    assert d.task_branch_template == "task/{id}-{slug}"
+    assert d.auto_pr is True
+    assert d.auto_merge is False
+    assert d.pr_body_template == "docs/pr-template.md"
+
+
+def test_defaults_branch_per_task_rejects_non_bool():
+    """Pydantic v2 lax-mode coerces "true"/0/1, but rejects clearly-non-
+    bool strings (e.g., "xyz") and out-of-range ints (e.g., 123)."""
+    with pytest.raises(ValidationError):
+        Defaults(branch_per_task="xyz")
+    with pytest.raises(ValidationError):
+        Defaults(branch_per_task=123)
+
+
+def test_defaults_base_branch_rejects_non_string():
+    """`Defaults(base_branch=123)` raises ValidationError."""
+    with pytest.raises(ValidationError):
+        Defaults(base_branch=123)
+
+
+def test_defaults_branch_fields_default_to_none():
+    """All 6 T9 fields default to None on `Defaults()`."""
+    d = Defaults()
+    assert d.branch_per_task is None
+    assert d.base_branch is None
+    assert d.task_branch_template is None
+    assert d.auto_pr is None
+    assert d.auto_merge is None
+    assert d.pr_body_template is None
+
+
+def test_v2_with_branch_per_task_validates_clean(tmp_path):
+    """YAML round-trip with all 6 T9 fields set."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  branch_per_task: true\n"
+        "  base_branch: develop\n"
+        "  task_branch_template: 'feature/{id}-{slug}'\n"
+        "  auto_pr: true\n"
+        "  auto_merge: false\n"
+        "  pr_body_template: docs/pr-template.md\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.branch_per_task is True
+    assert tf.defaults.base_branch == "develop"
+    assert tf.defaults.task_branch_template == "feature/{id}-{slug}"
+    assert tf.defaults.auto_pr is True
+    assert tf.defaults.auto_merge is False
+    assert tf.defaults.pr_body_template == "docs/pr-template.md"
+
+
+def test_extra_key_under_defaults_suggests_branch_field(tmp_path, capsys):
+    """A typo `branch_per_taks` (missing `s`) emits a Did-you-mean hint
+    pointing at `branch_per_task`."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  branch_per_taks: true\n"   # typo (missing s)
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "branch_per_taks" in err
+    assert "Did you mean 'branch_per_task'?" in err
+
+
+def test_effective_defaults_passes_through_branch_fields(tmp_path):
+    """effective_defaults preserves all 6 T9 fields."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  branch_per_task: true\n"
+        "  base_branch: develop\n"
+        "  task_branch_template: 'task/{id}-{slug}'\n"
+        "  auto_pr: true\n"
+        "  auto_merge: true\n"
+        "  pr_body_template: docs/pr.md\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["branch_per_task"] is True
+    assert eff["base_branch"] == "develop"
+    assert eff["task_branch_template"] == "task/{id}-{slug}"
+    assert eff["auto_pr"] is True
+    assert eff["auto_merge"] is True
+    assert eff["pr_body_template"] == "docs/pr.md"
+
+
+def test_phase_loose_dict_can_override_branch_per_task():
+    """A phase with `defaults: { branch_per_task: false }` overrides a
+    project-level `true`. Resolver-level integration check."""
+    from claude_plan_execute.config import resolve
+
+    file_defaults = {"branch_per_task": True}
+    phase_defaults = {"branch_per_task": False}
+    val = resolve(
+        "branch_per_task",
+        task={"id": 1},
+        file_defaults=file_defaults,
+        cli_overrides={},
+        phase=phase_defaults,
+    )
+    assert val is False
+
+
+# --- M. memory_curation_threshold field (T16) ------------------------------
+
+def test_defaults_accepts_memory_curation_threshold_int():
+    d = Defaults(memory_curation_threshold=50)
+    assert d.memory_curation_threshold == 50
+
+
+def test_defaults_rejects_memory_curation_threshold_str():
+    with pytest.raises(ValidationError):
+        Defaults(memory_curation_threshold="thirty")
+
+
+def test_task_accepts_memory_curation_threshold_override():
+    t = Task(id=1, title="T", description="D",
+             memory_curation_threshold=25)
+    assert t.memory_curation_threshold == 25
+
+
+# --- Q. Parallelism (T13 v0.3 §2.5) ---------------------------------------
+
+def test_defaults_accepts_parallelism_field():
+    """T13 §F1.1: Defaults gains parallelism: int | None field."""
+    d = Defaults(parallelism=4)
+    assert d.parallelism == 4
+
+
+def test_defaults_parallelism_defaults_to_none():
+    """T13 §D6: parallelism unset → None; runner reads `or 1`."""
+    d = Defaults()
+    assert d.parallelism is None
+
+
+def test_defaults_parallelism_typo_paralelism_suggests_correction(
+    tmp_path, capsys,
+):
+    """T13 §F1.3: typo `paralelism` rejected with difflib hint."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  paralelism: 2\n"     # typo
+        "  branch_per_task: true\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "paralelism" in err
+    assert "Did you mean 'parallelism'?" in err
+
+
+def test_parallelism_eq_1_does_NOT_require_branch_per_task(tmp_path):
+    """T13 §F1.2: parallelism=1 is the default-equivalent and does
+    NOT trip the interlock — backward compat."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 1\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.parallelism == 1
+
+
+def test_parallelism_gt_1_without_branch_per_task_rejected(
+    tmp_path, capsys,
+):
+    """T13 §F1.2 / §D5: the headline interlock — parallelism>1 +
+    branch_per_task=false is a hard load-time error."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "parallelism" in err
+    assert "branch_per_task" in err
+    assert "race" in err
+
+
+def test_parallelism_gt_1_with_explicit_branch_per_task_false_rejected(
+    tmp_path, capsys,
+):
+    """T13 §D5: explicit `branch_per_task: false` ALSO trips the
+    interlock — the user must set true (no implicit-None acceptance)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 3\n"
+        "  branch_per_task: false\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "branch_per_task" in err
+
+
+def test_parallelism_gt_1_with_branch_per_task_true_validates(tmp_path):
+    """T13 §F1.2: the happy path — parallelism>1 + branch_per_task=true
+    loads cleanly."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 3\n"
+        "  branch_per_task: true\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.parallelism == 3
+    assert tf.defaults.branch_per_task is True
+
+
+def test_parallelism_gt_1_with_lifetime_task_service_rejected(
+    tmp_path, capsys,
+):
+    """T13 §F1.2 / §D5: second interlock — lifetime=task services
+    are unsafe under parallelism (multi-instance support is v0.4)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "  branch_per_task: true\n"
+        "services:\n"
+        "  - name: dev\n"
+        "    command: \"true\"\n"
+        "    lifetime: task\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lifetime" in err
+    assert "dev" in err
+
+
+def test_parallelism_gt_1_with_lifetime_gate_service_rejected(
+    tmp_path, capsys,
+):
+    """T13 §F1.2: lifetime=gate services trip the same interlock."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "  branch_per_task: true\n"
+        "services:\n"
+        "  - name: gatesvc\n"
+        "    command: \"true\"\n"
+        "    lifetime: gate\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lifetime" in err
+    assert "gatesvc" in err
+
+
+def test_parallelism_gt_1_with_lifetime_phase_service_rejected(
+    tmp_path, capsys,
+):
+    """T13 §F1.2: lifetime=phase services trip the same interlock —
+    phase tracking has no meaning under parallelism."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "  branch_per_task: true\n"
+        "services:\n"
+        "  - name: phsvc\n"
+        "    command: \"true\"\n"
+        "    lifetime: phase\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "lifetime" in err
+    assert "phsvc" in err
+
+
+def test_parallelism_gt_1_with_only_lifetime_run_services_validates(
+    tmp_path,
+):
+    """T13 §F1.2: lifetime=run services are SAFE under parallelism
+    (idempotent ensure, shared across workers)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 2\n"
+        "  branch_per_task: true\n"
+        "services:\n"
+        "  - name: db\n"
+        "    command: \"true\"\n"
+        "    lifetime: run\n"
+        "    ready_check: { kind: shell, command: 'true' }\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.parallelism == 2
+
+
+def test_parallelism_eq_0_treated_as_unset(tmp_path):
+    """T13 §D6: parallelism: 0 is benignly accepted; runner's
+    `parallelism or 1` collapses to 1 (single worker)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  parallelism: 0\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.parallelism == 0
+
+
+# --- R. T17 auto-split fields ----------------------------------------------
+
+def test_defaults_accepts_auto_split_on_max_rounds():
+    d = Defaults.model_validate({"auto_split_on_max_rounds": True})
+    assert d.auto_split_on_max_rounds is True
+
+
+def test_defaults_accepts_auto_split_failure_classes_list():
+    d = Defaults.model_validate({
+        "auto_split_failure_classes": ["review_rejected_after_max_rounds"],
+    })
+    assert d.auto_split_failure_classes == ["review_rejected_after_max_rounds"]
+
+
+def test_defaults_accepts_max_split_depth_int():
+    d = Defaults.model_validate({"max_split_depth": 2})
+    assert d.max_split_depth == 2
+
+
+def test_task_accepts_parent_task_str_id():
+    t = Task.model_validate({
+        "id": "1a", "title": "X", "description": "Y",
+        "parent_task": 1, "split_depth": 1,
+    })
+    assert t.parent_task == 1
+    assert t.split_depth == 1
+
+
+def test_task_accepts_per_task_auto_split_overrides():
+    t = Task.model_validate({
+        "id": 1, "title": "X", "description": "Y",
+        "auto_split_on_max_rounds": False,
+        "max_split_depth": 0,
+    })
+    assert t.auto_split_on_max_rounds is False
+    assert t.max_split_depth == 0
+
+
+def test_task_typo_in_split_field_emits_did_you_mean(tmp_path):
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D, splitDepth: 1 }\n"
+    )
+    with pytest.raises(SystemExit):
+        from claude_plan_execute import loader
+        loader.load_tasks_file(p)
+
+
+def test_duplicate_task_ids_rejected(tmp_path):
+    """Plan §5.3: TasksFile._check_cross_references rejects duplicate
+    task ids at load time.
+
+    Mirrors the existing test_duplicate_service_names_rejected. Pre-T17
+    behavior was silent coalescence: Pydantic does not auto-detect
+    duplicates inside `list[Task]`, and downstream
+    `deps.validate_dependencies` does `{t["id"] for t in tasks}` which
+    dedupes (the LAST entry wins the slot, the prior duplicate
+    vanishes from the slate without any warning). T17 adds a
+    list-uniqueness check inside the existing
+    @model_validator(mode='after') so the load fails loudly.
+
+    This is also the failure path that test_splitter.py's (d8)
+    `test_run_splitter_duplicate_within_children_lands_in_yaml_caught_by_next_load`
+    relies on for its `with pytest.raises(SystemExit)` clause to fire.
+    """
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - { id: 1, title: T1, description: D }\n"
+        "  - { id: '1a', title: A, description: D }\n"
+        "  - { id: '1a', title: A2, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        from claude_plan_execute import loader
+        loader.load_tasks_file(p)

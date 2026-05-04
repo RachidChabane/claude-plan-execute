@@ -17,6 +17,7 @@ from claude_plan_execute.gates import (
     run_gates,
     _when_matches,
 )
+from claude_plan_execute.gates.agent import _extract_findings
 from claude_plan_execute.gates.builtin import make_design_fidelity_gate
 
 
@@ -172,6 +173,27 @@ def test_factory_template_lists_three_viewports():
     assert "320" in body
     assert "768" in body
     assert "1280" in body
+
+
+def test_factory_does_NOT_substitute_diff_path_at_factory_time():
+    """Pin T7 §D2 / §D6: the design-fidelity factory substitutes
+    `{persona}` and `{dev_server_url}` at factory time but
+    deliberately leaves `{diff_path}` as a literal placeholder.
+    The substitution happens at gate-run-time in AgentGate.run().
+    Regression guard against a future refactor that "helpfully"
+    pre-renders all placeholders in the factory — that would
+    break the diff_path substitution because the diff is per-
+    task and not known at factory time."""
+    g = make_design_fidelity_gate(
+        dev_server_url="http://localhost:5173",
+        persona="## Conventions\n\nFoo.\n",
+    )
+    # Factory-rendered body still contains the literal placeholder.
+    assert "{diff_path}" in g.prompt_template
+    # Sanity: persona and dev_server_url WERE substituted (existing
+    # contract — pinned by sibling tests in this section).
+    assert "{persona}" not in g.prompt_template
+    assert "{dev_server_url}" not in g.prompt_template
 
 
 # ---------------------------------------------------------------------------
@@ -390,3 +412,111 @@ def test_run_gates_design_fidelity_uses_sonnet_medium(monkeypatch, tmp_path):
     )
     assert captured[0][1]["model"] == "sonnet"
     assert captured[0][1]["effort"] == "medium"
+
+
+# ---------------------------------------------------------------------------
+# F. Findings appendix subsection in the rendered template (T11, v0.3)
+# ---------------------------------------------------------------------------
+#
+# Pin: the design-fidelity template gains a "### Structured findings
+# appendix (recommended)" subsection. Rendered template (factory output)
+# must contain the heading, schema keys, A–F cross-reference, omit
+# disclaimer, and the literal HTML-comment markers. The example block
+# parses cleanly via the same _extract_findings helper the build tool
+# uses.
+# ---------------------------------------------------------------------------
+
+def test_design_fidelity_template_has_findings_appendix_section():
+    """Pin §D / §6.5: literal `### Structured findings appendix
+    (recommended)` heading present in the factory-rendered body."""
+    g = make_design_fidelity_gate(dev_server_url="http://localhost:5173")
+    assert "### Structured findings appendix (recommended)" in g.prompt_template
+
+
+def test_design_fidelity_template_documents_per_finding_schema_keys():
+    """Pin §D10: per-finding schema for design-fidelity documents
+    `finding_letter`, `viewport`, `selectors`, `risk` as backticked
+    field names."""
+    g = make_design_fidelity_gate(dev_server_url="http://localhost:5173")
+    body = g.prompt_template
+    for key in ("finding_letter", "viewport", "selectors", "risk"):
+        assert f"`{key}`" in body, f"missing backticked key: {key}"
+
+
+def test_design_fidelity_template_finding_letter_documented_as_A_through_F():
+    """Pin §D10: `finding_letter` schema cross-references the existing
+    A–F category letters from the template body so aggregations bucket
+    consistently. The appendix subsection must mention the letters AND
+    tie at least one to its category text (e.g., "A: horizontal
+    scroll")."""
+    g = make_design_fidelity_gate(dev_server_url="http://localhost:5173")
+    body = g.prompt_template
+    # Locate the appendix subsection slice.
+    section_start = body.index("### Structured findings appendix (recommended)")
+    section = body[section_start:]
+    # Each letter A–F is named in the cross-reference.
+    for letter in ("A", "B", "C", "D", "E", "F"):
+        assert f"`{letter}`" in section or letter in section, (
+            f"finding letter {letter!r} missing from appendix subsection"
+        )
+    # At least one canonical letter→category cross-reference is present.
+    assert "horizontal scroll" in section
+
+
+def test_design_fidelity_template_has_html_comment_markers():
+    """Pin §D2: the rendered body contains the literal HTML-comment
+    markers."""
+    g = make_design_fidelity_gate(dev_server_url="http://localhost:5173")
+    body = g.prompt_template
+    assert "<!-- BEGIN_FINDINGS_JSON -->" in body
+    assert "<!-- END_FINDINGS_JSON -->" in body
+
+
+def test_design_fidelity_template_has_omit_disclaimer():
+    """Pin §D10: the optional-appendix disclaimer is present so the
+    agent knows the appendix is additive (verdict text still
+    blocks)."""
+    g = make_design_fidelity_gate(dev_server_url="http://localhost:5173")
+    assert (
+        "emit an empty `[]` or omit the appendix entirely"
+        in g.prompt_template
+    )
+
+
+def test_design_fidelity_template_example_is_valid_findings_appendix():
+    """Pin (belt-and-suspenders): the JSON example in the template
+    parses cleanly via the same _extract_findings helper the build
+    tool uses. Catches typos at CI time before agents see them."""
+    g = make_design_fidelity_gate(dev_server_url="http://localhost:5173")
+    findings, sidecar = _extract_findings(g.prompt_template, "design-fidelity")
+    assert findings is not None, "template example failed extraction"
+    assert isinstance(findings, list)
+    assert all(isinstance(el, dict) for el in findings)
+    assert sidecar is not None
+    assert "_raw" not in sidecar
+
+
+def test_design_fidelity_template_does_NOT_substitute_diff_path_or_persona_in_appendix_section():
+    """Pin: the appendix subsection is static across factory
+    invocations. Even with a non-empty persona and a custom URL, the
+    appendix block contains no `{persona}`, `{dev_server_url}`, or
+    `{diff_path}` placeholders. Belt-and-suspenders against a future
+    refactor that "helpfully" interpolates inside the example block."""
+    g = make_design_fidelity_gate(
+        dev_server_url="http://example.test:8080",
+        persona="## Conventions\n\nUse 8-pt vertical rhythm.\n",
+    )
+    body = g.prompt_template
+    section_start = body.index(
+        "### Structured findings appendix (recommended)"
+    )
+    section = body[section_start:]
+    # Persona / dev_server_url were substituted at factory time
+    # OUTSIDE the appendix; the appendix itself names neither.
+    assert "{persona}" not in section
+    assert "{dev_server_url}" not in section
+    assert "Use 8-pt vertical rhythm" not in section
+    assert "http://example.test:8080" not in section
+    # diff_path is left as a literal placeholder elsewhere; the
+    # appendix subsection must not reference it.
+    assert "{diff_path}" not in section

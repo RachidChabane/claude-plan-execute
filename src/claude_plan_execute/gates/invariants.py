@@ -54,7 +54,7 @@ class InvariantEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    kind: Literal["shell", "agent"] = "shell"
+    kind: Literal["shell", "agent", "human"] = "shell"
 
     command: str | None = None
     regex_must_match: str | None = None
@@ -65,11 +65,20 @@ class InvariantEntry(BaseModel):
 
     model: str | None = None
     effort: str | None = None
-    timeout_minutes: int = 10
+    # T10 (v0.3 §2.4) — flipped to `int | None = None` so
+    # `compile_entry` can distinguish "user left it unset" (then
+    # pick kind-specific default: 1440 for human, 10 for
+    # shell/agent) from "user explicitly set N". See
+    # plans/task-10/plan.md §D2.
+    timeout_minutes: int | None = None
     parallel_safe: bool = True
     on_failure: Literal["block", "warn"] = "block"
     when: list[str] | None = None
     comment: str | None = None
+    # T10 — optional override for the convention sentinel path.
+    # Honored only by HumanGate; CLI / server use the convention
+    # path verbatim (see plan §D8).
+    sentinel_path: str | None = None
 
     @model_validator(mode="after")
     def _check_shell_specifiers(self) -> "InvariantEntry":
@@ -101,8 +110,30 @@ def compile_entry(entry: InvariantEntry) -> Gate:
     `bash -c` grep one-liner over the configured starting paths
     (default ['.']). `files` entries are PATHS passed verbatim to
     `grep -R`, NOT bash globs (single-quoted tokens never glob).
+
+    T10 (v0.3 §2.4) — resolves `timeout_minutes` kind-specific
+    when the entry left it unset: 1440 for kind=human (24 h),
+    10 for kind=shell / kind=agent. Explicit values pass through
+    unchanged. See plans/task-10/plan.md §D2.
     """
     when = tuple(entry.when) if entry.when else ("always",)
+
+    # Kind-specific timeout default: human waits 24 h by default,
+    # shell/agent stay at 10 min. Resolved here (not at the Gate
+    # dataclass layer) so the explicit `timeout_minutes: 30` YAML
+    # form survives kind-agnostic.
+    if entry.kind == "human":
+        timeout = (
+            entry.timeout_minutes
+            if entry.timeout_minutes is not None
+            else 1440
+        )
+    else:
+        timeout = (
+            entry.timeout_minutes
+            if entry.timeout_minutes is not None
+            else 10
+        )
 
     if entry.kind == "shell":
         if entry.command is not None:
@@ -141,12 +172,32 @@ def compile_entry(entry: InvariantEntry) -> Gate:
         return Gate(
             kind="shell",
             command=("bash", "-c", cmd),
-            timeout_minutes=entry.timeout_minutes,
+            timeout_minutes=timeout,
             parallel_safe=entry.parallel_safe,
             on_failure=entry.on_failure,
             when=when,
         )
 
+    if entry.kind == "human":
+        if entry.prompt_template is None:
+            raise ValueError(
+                f"invariant {entry.name!r} kind=human requires prompt_template"
+            )
+        # parallel_safe is HARDCODED to False for human gates — see
+        # plan §C / §D2. A YAML-supplied `parallel_safe: true` is
+        # silently ignored (a kind=human gate that ran in parallel
+        # would parallelise human attention; that's a bug).
+        return Gate(
+            kind="human",
+            prompt_template=entry.prompt_template,
+            sentinel_path=entry.sentinel_path,
+            timeout_minutes=timeout,
+            parallel_safe=False,
+            on_failure=entry.on_failure,
+            when=when,
+        )
+
+    # kind == "agent" (existing branch)
     if entry.prompt_template is None:
         raise ValueError(
             f"invariant {entry.name!r} kind=agent requires prompt_template"
@@ -156,7 +207,7 @@ def compile_entry(entry: InvariantEntry) -> Gate:
         prompt_template=entry.prompt_template,
         model=entry.model,
         effort=entry.effort,
-        timeout_minutes=entry.timeout_minutes,
+        timeout_minutes=timeout,
         parallel_safe=entry.parallel_safe,
         on_failure=entry.on_failure,
         when=when,

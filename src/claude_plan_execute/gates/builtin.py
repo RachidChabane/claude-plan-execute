@@ -11,19 +11,21 @@ Exports two kinds of built-ins:
     resulting Gates are NOT pre-registered on `default_registry()`.
 
   - Module-import-time registrations for built-ins WITHOUT
-    per-task config: `test-critique` (task 15) and
-    `security-auditor` (task 16). The Gate is constructed once
-    and registered on the default singleton when this module is
-    imported (transitively via `runner.py` or directly in tests).
+    per-task config: `test-critique`, `security-auditor`, and
+    `memory-curate`. Each Gate is constructed once and
+    registered on the default singleton when this module is
+    imported (transitively via `runner.py` or directly in
+    tests).
 
 The factory pattern and the import-time pattern coexist:
-test-critique (task 15) and security-auditor (task 16) are
-import-time registrations on `default_registry()`. Task 20's
+test-critique, security-auditor, and memory-curate are import-
+time registrations on `default_registry()`. Task 20's
 `design-fidelity` ships as a FACTORY (per-project knobs:
 `dev_server_url`, persona) — same shape as `make_tests_gate` etc.
-The import-time count stays at two; the
-`_register_all_builtin_agents(registry)` refactor threshold
-("three or more import-time agent gates") has not been reached.
+The `_register_all_builtin_agents(registry)` refactor threshold
+("three or more import-time agent gates") is now reached;
+landing the refactor is intentionally deferred to a follow-up
+task to keep T16's diff focused.
 Likewise the shell-factory if/elif chain in the runner's Phase-4
 dispatch reaches four entries (tests, lint, untranslated-strings,
 design-fidelity); this is the natural threshold for a name-keyed
@@ -254,6 +256,51 @@ def _build_security_auditor_gate() -> Gate:
     )
 
 
+def _build_memory_curate_gate() -> Gate:
+    """Construct the `memory-curate` agent Gate.
+
+    Sonnet/medium agent gate that reads MEMORY.md and per-memory
+    files, verifies each against the current codebase, and emits
+    a structured-findings appendix with one verdict per memory
+    (keep / drop / merge_into:<other>). The runner post-processes
+    the findings: keep is a no-op, drop unlinks the file and
+    removes its MEMORY.md line, merge_into is logged to the
+    suggestions store for human review.
+
+    `parallel_safe=False` — the runner's post-process step
+    (§E.4) mutates `memory_dir` AFTER the gate returns, applying
+    `drop` verdicts via `_drop_memory_file`. The agent itself
+    only emits JSON; mutation is runner-side. `parallel_safe=
+    False` sequences `memory-curate` before any future gate
+    that reads MEMORY.md, preventing a stale read against a
+    half-pruned directory.
+
+    `on_failure="warn"` — fail-soft. A curation failure (the
+    agent times out, returns malformed JSON, or emits VERDICT:
+    FAIL) MUST NOT block the implementing task. Per task spec:
+    "a curation failure shouldn't block the implementing task;
+    it just leaves MEMORY.md as-is and surfaces a warning."
+
+    The Gate's `prompt_template` is the absolute path to the
+    shipped template at `gates/templates/memory-curate.md`,
+    computed via the module-level `_TEMPLATES_DIR` constant
+    (task 15 §D2 / task 16 §C.1).
+
+    Tests using the `_clean_default_registry` fixture call this
+    helper to register `memory-curate` on their fresh registry.
+    """
+    return Gate(
+        kind="agent",
+        prompt_template=str(_TEMPLATES_DIR / "memory-curate.md"),
+        model="sonnet",
+        effort="medium",
+        timeout_minutes=10,
+        parallel_safe=False,
+        on_failure="warn",
+        when=("always",),
+    )
+
+
 # Side-effecting registration. Runs once when this module is first
 # imported (via `runner.py:13` in production, via test files
 # directly in tests). See §D1 for the design choice.
@@ -262,6 +309,9 @@ default_registry().register(
 )
 default_registry().register(
     "security-auditor", _build_security_auditor_gate(),
+)
+default_registry().register(
+    "memory-curate", _build_memory_curate_gate(),
 )
 
 

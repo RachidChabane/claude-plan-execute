@@ -1,6 +1,7 @@
 """Tests for claude_plan_execute.gates — Gate Registry foundation."""
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -15,6 +16,11 @@ from claude_plan_execute.gates import (
     _when_matches,
     default_registry,
     run_gates,
+)
+from claude_plan_execute.gates.agent import (
+    _FINDINGS_RE,
+    _RAW_CAP_BYTES,
+    _extract_findings,
 )
 from claude_plan_execute.gates.shell import _OUTPUT_CAP_BYTES, _tail_cap
 
@@ -36,6 +42,18 @@ def test_gates_package_imports_cleanly():
     assert hasattr(g, "AgentGate")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gates_memory_dir(monkeypatch, tmp_path):
+    """T16 §J.1: keep gates tests from touching the operator's
+    real ~/.claude/projects/... memory directory when an
+    agent gate substitutes {memory_dir}."""
+    isolated = tmp_path / "_iso_memdir"
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.memory_dir_for_cwd",
+        lambda _cwd=None: isolated,
+    )
+
+
 # ---------------------------------------------------------------------------
 # A. Gate / GateResult dataclasses
 # ---------------------------------------------------------------------------
@@ -44,12 +62,31 @@ def test_gate_field_order_matches_task_description():
     """Task 11 description names fields in this exact order:
     kind, command, prompt_template, model, effort, timeout_minutes,
     parallel_safe, on_failure, when. Pin field order as a regression
-    guard against accidental reordering."""
+    guard against accidental reordering. T10 (v0.3 §2.4) appends
+    `sentinel_path` at the end — see plans/task-10/plan.md §D1.
+    """
     fields = [f.name for f in Gate.__dataclass_fields__.values()]
     assert fields == [
         "kind", "command", "prompt_template", "model", "effort",
         "timeout_minutes", "parallel_safe", "on_failure", "when",
+        "sentinel_path",
     ]
+
+
+def test_gate_default_sentinel_path_is_None():
+    """T10 §D4 — sentinel_path default is None; HumanGate computes
+    the convention path at run() time when None.
+    """
+    g = Gate(kind="shell", command=("echo", "hi"))
+    assert g.sentinel_path is None
+
+
+def test_gate_kind_literal_accepts_human():
+    """T10 — Gate.kind extends to ['shell', 'agent', 'human'].
+    Constructing a Gate(kind='human', ...) does not raise.
+    """
+    g = Gate(kind="human", prompt_template="please review")
+    assert g.kind == "human"
 
 
 def test_gate_is_frozen():
@@ -225,12 +262,145 @@ def test_when_matches_always_wins_over_task_class():
     assert ok is True
 
 
-def test_when_matches_touches_glob_does_not_match_in_task_11():
-    """Task 11 defers `touches:<glob>` matchers; task 20 does NOT add
-    them. Verifies non-task_class non-always tokens still fall through
-    to the 'not implemented' branch."""
-    ok, _ = _when_matches(("touches:src/auth/**",), {"id": 1})
+def test_when_matches_touches_with_no_key_files_attribute():
+    """Task 3 case (c): a task with no `key_files` key on the dict
+    yields an empty key-files list; touches patterns can't match
+    anything; result is False with a touches=... not in key_files=[]
+    reason."""
+    ok, reason = _when_matches(("touches:src/auth/**",), {"id": 1})
     assert ok is False
+    assert "touches=" in reason
+    assert "key_files=[]" in reason
+
+
+# --- task 3: touches:<glob> matcher (gitignore-style globs) ---
+
+def test_when_matches_touches_recursive_double_star_matches_at_any_depth():
+    """Task 3 case (a) — the design-critical bug-lock test.
+
+    `touches:**/auth/**` MUST match `frontend/src/auth/Login.tsx`
+    via gitignore semantics. stdlib fnmatch handles this case
+    accidentally correctly (see plan §"Documented deviations"),
+    but fails on `auth/foo.py` and over-matches `src/api/*.py`
+    against `src/api/v1/users.py`. Pathspec's GitWildMatchPattern
+    is the contract; this test pins that the contract is what
+    we ship."""
+    ok, reason = _when_matches(
+        ("touches:**/auth/**",),
+        {"id": 1, "key_files": ["frontend/src/auth/Login.tsx"]},
+    )
+    assert ok is True
+    assert "frontend/src/auth/Login.tsx" in reason
+
+
+def test_when_matches_touches_recursive_double_star_matches_at_root_depth():
+    """Task 3 case (a) extended: gitignore's leading `**/` matches
+    zero or more path components. `touches:**/auth/**` must match
+    `auth/foo.py` (no prefix). This is the under-match case stdlib
+    fnmatch gets wrong."""
+    ok, _ = _when_matches(
+        ("touches:**/auth/**",),
+        {"id": 1, "key_files": ["auth/foo.py"]},
+    )
+    assert ok is True
+
+
+def test_when_matches_touches_single_component_glob_does_not_cross_directories():
+    """Task 3 case (b): `src/api/*.py` matches `src/api/users.py`
+    but NOT `src/api/v1/users.py`. This is the over-match case
+    stdlib fnmatch gets wrong; pathspec's path-component awareness
+    is the fix."""
+    ok, reason = _when_matches(
+        ("touches:src/api/*.py",),
+        {"id": 1, "key_files": ["src/api/users.py"]},
+    )
+    assert ok is True
+    assert "src/api/users.py" in reason
+
+    # Pin the negative half — a deeper path does NOT match.
+    ok2, _ = _when_matches(
+        ("touches:src/api/*.py",),
+        {"id": 1, "key_files": ["src/api/v1/users.py"]},
+    )
+    assert ok2 is False
+
+
+def test_when_matches_touches_with_empty_key_files_list():
+    """Task 3 case (d): `key_files: []` (explicit empty list)
+    yields no matches. Distinct from case (c) which has no
+    key_files key at all; both produce False but exercise
+    different code paths in `task.get('key_files') or []`."""
+    ok, reason = _when_matches(
+        ("touches:src/auth/**",),
+        {"id": 1, "key_files": []},
+    )
+    assert ok is False
+    assert "key_files=[]" in reason
+
+
+def test_when_matches_mixed_task_class_and_touches_passes_when_task_class_matches():
+    """Task 3 case (e): `when=[task_class:ui, touches:**/auth/**]`
+    on a task with `task_class=ui` (and key_files that DON'T match
+    the glob) PASSES via the task_class branch. Verifies task_class
+    short-circuits success without reaching touches."""
+    ok, reason = _when_matches(
+        ("task_class:ui", "touches:**/auth/**"),
+        {"id": 1, "task_class": "ui", "key_files": ["src/random.go"]},
+    )
+    assert ok is True
+    assert "task_class='ui'" in reason
+
+
+def test_when_matches_touches_negative_match_with_unrelated_key_files():
+    """Task 3 case (f): a touches glob with no matching key_file
+    returns False. Reason names the patterns and the (non-matching)
+    key_files for diagnosis."""
+    ok, reason = _when_matches(
+        ("touches:**/auth/**",),
+        {"id": 1, "key_files": ["src/random.go", "tests/test_x.py"]},
+    )
+    assert ok is False
+    assert "touches=['**/auth/**']" in reason
+    assert "src/random.go" in reason
+
+
+def test_when_matches_multiple_touches_or_semantics():
+    """Pin OR-of-touches: `[touches:A, touches:B]` matches if
+    EITHER pattern matches any key_file. The matched-files list
+    in the reason includes only files matched by the spec
+    (regardless of which pattern matched them)."""
+    ok, reason = _when_matches(
+        ("touches:**/auth/**", "touches:**/api/**"),
+        {"id": 1, "key_files": ["src/api/users.py"]},
+    )
+    assert ok is True
+    assert "src/api/users.py" in reason
+
+
+def test_when_matches_falls_through_from_task_class_miss_to_touches_match():
+    """Pin §D3: the load-bearing control-flow change. A `when` with
+    BOTH `task_class:ui` and `touches:**/auth/**` on a task whose
+    task_class is NOT ui but whose key_files ARE under auth/ MUST
+    pass via touches. Pre-task-3, the eager `False` return in the
+    task_class branch blocked this. Locks the new fall-through."""
+    ok, reason = _when_matches(
+        ("task_class:ui", "touches:**/auth/**"),
+        {"id": 1, "task_class": "schema", "key_files": ["src/auth/api.py"]},
+    )
+    assert ok is True
+    assert "src/auth/api.py" in reason
+
+
+def test_when_matches_always_wins_over_touches():
+    """Pin §D4 rule 1 extended to touches: `('touches:**/x/**', 'always')`
+    on a task with no matching key_files still PASSES because
+    `always` short-circuits all predicate checks."""
+    ok, reason = _when_matches(
+        ("touches:**/x/**", "always"),
+        {"id": 1, "key_files": ["src/random.go"]},
+    )
+    assert ok is True
+    assert reason == "always"
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +676,135 @@ def test_agent_gate_skip_permissions_defaults_to_False(monkeypatch):
     assert captured["kwargs"]["verbose"] is False
 
 
+def test_agent_gate_substitutes_diff_path_in_inline_template(monkeypatch):
+    """Pin T7 §D3 / §D7: AgentGate.diff_path is substituted into
+    `{diff_path}` placeholders via .replace() on the loaded body.
+    Inline-body case — the substitution happens after _load_template
+    falls through (path-too-long → OSError → verbatim return)."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent",
+             prompt_template="The diff is at: {diff_path}\nDone.")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={}, diff_path="/tmp/foo/diff.patch",
+    ).run()
+    assert "The diff is at: /tmp/foo/diff.patch" in captured["prompt"]
+    assert "{diff_path}" not in captured["prompt"]
+
+
+def test_agent_gate_substitutes_diff_path_in_file_template(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D3: file-loaded body case — _load_template reads the
+    file, AgentGate.run() substitutes {diff_path} on the returned
+    body. Identical user-facing behavior to inline-body case."""
+    captured = _stub_run_claude(monkeypatch)
+    template_path = tmp_path / "tmpl.md"
+    template_path.write_text("Diff at: {diff_path}")
+    g = Gate(kind="agent", prompt_template=str(template_path))
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={}, diff_path="/path/to/diff.patch",
+    ).run()
+    assert "Diff at: /path/to/diff.patch" in captured["prompt"]
+    assert "{diff_path}" not in captured["prompt"]
+
+
+def test_agent_gate_diff_path_None_substitutes_with_empty_string(monkeypatch):
+    """Pin T7 §D3: `diff_path=None` (the default) replaces
+    `{diff_path}` with the empty string, NOT the literal token.
+    Avoids leaking template internals to the agent when callers
+    don't supply a diff_path (existing tests, future direct
+    callers without runner context)."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent", prompt_template="path={diff_path}|end")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},  # diff_path defaults to None
+    ).run()
+    assert "path=|end" in captured["prompt"]
+    assert "{diff_path}" not in captured["prompt"]
+
+
+def test_agent_gate_diff_path_default_is_None():
+    """Pin T7 §D7: the new `diff_path` field defaults to None so
+    every existing test call site (16 of them in this module)
+    keeps working without modification."""
+    g = Gate(kind="agent", prompt_template="x")
+    ag = AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},
+    )
+    assert ag.diff_path is None
+
+
+def test_agent_gate_substitutes_memory_dir_placeholder(monkeypatch):
+    """Pin T16 §D.2: `{memory_dir}` placeholder is replaced with
+    the AgentGate.memory_dir value at run() time."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent",
+             prompt_template="memory dir: {memory_dir}\nend")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={}, memory_dir="/some/path",
+    ).run()
+    assert "memory dir: /some/path" in captured["prompt"]
+    assert "{memory_dir}" not in captured["prompt"]
+
+
+def test_agent_gate_memory_dir_None_substitutes_empty(monkeypatch):
+    """Pin T16 §D.2: `memory_dir=None` (default) replaces the
+    placeholder with the empty string."""
+    captured = _stub_run_claude(monkeypatch)
+    g = Gate(kind="agent", prompt_template="dir={memory_dir}|end")
+    AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},  # memory_dir defaults to None
+    ).run()
+    assert "dir=|end" in captured["prompt"]
+    assert "{memory_dir}" not in captured["prompt"]
+
+
+def test_agent_gate_memory_dir_default_is_None():
+    g = Gate(kind="agent", prompt_template="x")
+    ag = AgentGate(
+        name="x", gate=g,
+        task={"id": 1, "title": "T", "description": "D"},
+        cli={},
+    )
+    assert ag.memory_dir is None
+
+
+def test_gates_module_exposes_memory_dir_for_cwd_attribute():
+    """Pin T16 §D.3 Step 1: the `memory_dir_for_cwd` import lives at
+    MODULE SCOPE in gates/__init__.py, NOT inside `run_gates`. This
+    is what makes `claude_plan_execute.gates.memory_dir_for_cwd` a
+    monkeypatch target. A future "tidy up imports" refactor that
+    re-localizes the import would silently break test isolation;
+    this assertion fails loudly. (Pin §N.17.)"""
+    import claude_plan_execute.gates as g
+    assert hasattr(g, "memory_dir_for_cwd")
+
+
+def test_extract_findings_memory_curate_shape_is_a_bare_list_of_dicts():
+    """Pin T16 §I.2: the memory-curate appendix is a bare list of
+    dicts (T11 case 3). The runner reads `r.findings` directly."""
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"memory":"x","verdict":"keep","reason":"y"}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    findings, sidecar = _extract_findings(text, "memory-curate", warn=False)
+    assert findings == [{"memory": "x", "verdict": "keep", "reason": "y"}]
+    assert sidecar == {"findings": findings}
+
+
 # ---------------------------------------------------------------------------
 # F. _tail_cap helper
 # ---------------------------------------------------------------------------
@@ -539,6 +838,24 @@ def test_tail_cap_keeps_tail_not_head():
     assert "TAILMARKER_AT_END" in out
     # The head portion should be truncated.
     assert out.count("HEAD") < text.count("HEAD")
+
+
+def test_tail_cap_respects_explicit_cap_kwarg():
+    """Pin T7 §D5: `_tail_cap` accepts a `cap=` kwarg that
+    overrides the default `_OUTPUT_CAP_BYTES`. The runner uses
+    this with `cap=_DIFF_CAP_BYTES` (256 KB) for the
+    precomputed-diff artifact; gate output keeps the 100 KB
+    default. Regression guard for the refactor: the kwarg path
+    must produce a body bounded by the new cap, not the old
+    constant."""
+    cap = 1024  # 1 KB — small for a fast assertion
+    text = "Z" * 5000  # 5 KB — well over the 1 KB cap
+    out = _tail_cap(text, cap=cap)
+    encoded = out.encode("utf-8")
+    # Cap + marker overhead (~50 bytes for "[truncated: <N>
+    # bytes omitted at head]\n") is the budget.
+    assert len(encoded) <= cap + 50
+    assert "[truncated:" in out
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +1071,50 @@ def test_run_gates_exception_in_gate_yields_failed_result(monkeypatch, tmp_path)
     assert "disk full" in (results[0].error or "")
 
 
+def test_run_gates_passes_diff_path_into_agent_gate(monkeypatch, tmp_path):
+    """Pin T7 §D7: run_gates computes
+    `str(task_dir / 'diff.patch')` and threads it to AgentGate
+    via _run_one. The agent's prompt body has the substituted
+    path."""
+    captured: list[tuple[str, dict]] = []
+
+    def fake_run_claude(prompt, **kwargs):
+        captured.append((prompt, kwargs))
+        return 0, "VERDICT: PASS\n"
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", fake_run_claude,
+    )
+    g = Gate(kind="agent",
+             prompt_template="diff_path is {diff_path}")
+    run_gates(
+        [("agent-gate", g)],
+        task={"id": 7, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert len(captured) == 1
+    expected = str(tmp_path / "diff.patch")
+    assert f"diff_path is {expected}" in captured[0][0]
+
+
+def test_run_gates_diff_path_threading_does_NOT_affect_shell_gates(
+    monkeypatch, tmp_path,
+):
+    """Pin T7 §D8: ShellGate has no template substitution surface.
+    Threading diff_path through _run_one is a no-op for shell-kind
+    gates. The shell gate runs unchanged; no error from the
+    diff_path kwarg presence."""
+    _stub_subprocess_run_global(monkeypatch, stdout="ok\n")
+    g = Gate(kind="shell", command=("true",))
+    results = run_gates(
+        [("shell-only", g)],
+        task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert len(results) == 1
+    assert results[0].passed is True
+
+
 # ---------------------------------------------------------------------------
 # H. Misc
 # ---------------------------------------------------------------------------
@@ -761,3 +1122,1653 @@ def test_run_gates_exception_in_gate_yields_failed_result(monkeypatch, tmp_path)
 def test_output_cap_constant_is_100_kb():
     """Pin §D8: 100 KB cap matches enhancement plan §2.1."""
     assert _OUTPUT_CAP_BYTES == 100 * 1024
+
+
+# ---------------------------------------------------------------------------
+# I. Findings extraction & AgentGate findings-population (T11, v0.3)
+# ---------------------------------------------------------------------------
+#
+# Pure-helper tests for `_extract_findings`: the seven cases (a)-(g)
+# enumerated in the task description, plus corner cases pinning the
+# regex semantics, the case-5 `_raw` cap, and the warn-suppression
+# kwarg. AgentGate findings-population tests follow the helper unit
+# tests (same Section I).
+#
+# Markers are HTML comments; see plan §D2 / gates/agent.py:_FINDINGS_RE.
+# ---------------------------------------------------------------------------
+
+def _wrap_findings(body: str) -> str:
+    """Helper: wrap a JSON body in the appendix marker pair."""
+    return (
+        "VERDICT: PASS\nSome prose.\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        f"{body}\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+
+
+# --- (a) well-formed array populates findings -------------------------------
+
+def test_extract_findings_well_formed_array_populates_findings(capsys):
+    """Task description test (a): markers + a well-formed JSON list of
+    dicts → findings is the parsed list; sidecar wraps it under
+    `findings:` key. No warning printed."""
+    text = _wrap_findings('[{"k": "v"}, {"k": "w"}]')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == [{"k": "v"}, {"k": "w"}]
+    assert sidecar == {"findings": [{"k": "v"}, {"k": "w"}]}
+    out = capsys.readouterr().out
+    assert "malformed" not in out
+    assert "not a list[dict]" not in out
+
+
+# --- (b) bare array normalizes to {findings: [...]} -------------------------
+
+def test_extract_findings_bare_array_normalizes_to_findings_object(capsys):
+    """Task description test (b): bare JSON list inside markers
+    normalizes to `{"findings": [...]}` in the sidecar — NOT the raw
+    list. The dataclass `findings` is the bare list; the sidecar
+    wraps."""
+    text = _wrap_findings('[{"k": "v"}, {"k": "w"}]')
+    findings, sidecar = _extract_findings(text, "g")
+    assert isinstance(findings, list)
+    assert isinstance(sidecar, dict)
+    assert sidecar.get("findings") == findings
+    assert "findings" in sidecar
+
+
+# --- (c) malformed JSON warns, returns None, no sidecar ---------------------
+
+def test_extract_findings_malformed_json_warns_returns_None_no_sidecar(capsys):
+    """Task description test (c): markers present but body fails
+    json.loads → findings is None, sidecar is None, yellow warning
+    printed. Gate verdict is unaffected (caller's `passed` decision
+    derives only from `VERDICT: PASS` substring search)."""
+    text = _wrap_findings("{this is not valid json}")
+    findings, sidecar = _extract_findings(text, "secaudit")
+    assert findings is None
+    assert sidecar is None
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" in out
+    assert "secaudit" in out
+    assert "verdict unchanged" in out
+
+
+# --- (d) no markers → None, None, no warning --------------------------------
+
+def test_extract_findings_no_markers_returns_None_no_warning(capsys):
+    """Task description test (d): plain text without marker pair →
+    findings is None, sidecar is None, no warning."""
+    findings, sidecar = _extract_findings("VERDICT: PASS\nNothing here.", "g")
+    assert findings is None
+    assert sidecar is None
+    out = capsys.readouterr().out
+    assert "malformed" not in out
+    assert "not a list[dict]" not in out
+
+
+# --- (g) list with non-dict elements → empty + raw + warning ----------------
+
+def test_extract_findings_list_with_non_dict_elements_returns_empty_with_raw(capsys):
+    """Task description test (g): a list whose elements are not all
+    dicts → strict reject. findings == [] (NOT a partial list);
+    sidecar has `_raw` for debugging. Warning printed."""
+    text = _wrap_findings('[{"a": 1}, "bad", {"b": 2}]')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    assert sidecar["findings"] == []
+    assert "_raw" in sidecar
+    assert "bad" in sidecar["_raw"]
+    out = capsys.readouterr().out
+    assert "not a list[dict]" in out
+    assert "treating as empty" in out
+
+
+# --- additional helper-level tests -----------------------------------------
+
+def test_extract_findings_object_with_findings_list_returns_inner_list(capsys):
+    """Object form: `{"findings": [...]}` → findings is the inner list,
+    sidecar is the full object (with the `findings` key preserved)."""
+    text = _wrap_findings('{"findings": [{"a": 1}, {"b": 2}]}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == [{"a": 1}, {"b": 2}]
+    assert sidecar == {"findings": [{"a": 1}, {"b": 2}]}
+    out = capsys.readouterr().out
+    assert "malformed" not in out
+    assert "not a list[dict]" not in out
+
+
+def test_extract_findings_object_with_findings_list_preserves_extra_keys_in_sidecar(capsys):
+    """Pin §D1 case 4: an object with `findings: [...]` AND extra keys
+    (e.g., `summary`) preserves the extra keys verbatim in the sidecar.
+    Templates own their inner shape; the build tool is gate-agnostic."""
+    text = _wrap_findings('{"findings": [{"a": 1}], "summary": "1 critical"}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == [{"a": 1}]
+    assert sidecar == {"findings": [{"a": 1}], "summary": "1 critical"}
+
+
+def test_extract_findings_scalar_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (scalar): an integer between markers → findings is
+    [], sidecar has `_raw` with the raw body. Warning printed."""
+    text = _wrap_findings("42")
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar == {"findings": [], "_raw": "42"}
+    out = capsys.readouterr().out
+    assert "not a list[dict]" in out
+
+
+def test_extract_findings_null_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (null): JSON `null` → findings is [], sidecar has
+    `_raw == "null"`. Warning printed."""
+    text = _wrap_findings("null")
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar == {"findings": [], "_raw": "null"}
+
+
+def test_extract_findings_object_without_findings_key_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (object lacking `findings` key): `{"summary":
+    "ok"}` → findings is [], sidecar has `_raw` with the raw body
+    JSON. Warning printed. Templates that omit the `findings` key
+    are surfaced as malformed via the warning."""
+    text = _wrap_findings('{"summary": "ok"}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    assert sidecar["findings"] == []
+    assert sidecar["_raw"] == '{"summary": "ok"}'
+
+
+def test_extract_findings_object_with_non_list_findings_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (object with non-list `findings`): `{"findings":
+    "not a list"}` → findings is [], sidecar has `_raw`. Warning."""
+    text = _wrap_findings('{"findings": "not a list"}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    assert sidecar["findings"] == []
+    assert "not a list" in sidecar["_raw"]
+
+
+def test_extract_findings_object_with_findings_list_with_non_dict_returns_empty_with_raw(capsys):
+    """Pin §D1 case 5 (object.findings list with a non-dict element):
+    strict reject at the inner-list layer too. Mirrors test (g) but
+    nested under the object form."""
+    text = _wrap_findings('{"findings": [{"a": 1}, "bad"]}')
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    assert sidecar["findings"] == []
+    assert "bad" in sidecar["_raw"]
+
+
+def test_extract_findings_first_appendix_wins(capsys):
+    """Pin §D2: `re.search` returns the FIRST match. With two
+    well-formed appendices in the text, the first body wins."""
+    text = (
+        "header\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"order": "first"}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+        "filler\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"order": "second"}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    findings, _ = _extract_findings(text, "g")
+    assert findings == [{"order": "first"}]
+
+
+def test_extract_findings_non_greedy_does_not_swallow_intermediate_markers(capsys):
+    """Pin §A: non-greedy `.*?` ensures BEGIN binds to the NEAREST END,
+    not the LAST END. With two marker pairs, the first BEGIN must
+    bind to the first END (not swallow the second BEGIN)."""
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"first": 1}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+        "interleaved text\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        '[{"second": 2}]\n'
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    match = _FINDINGS_RE.search(text)
+    assert match is not None
+    body = match.group(1)
+    # Body is the FIRST appendix's JSON, not the swallowed-everything
+    # case where body would include the literal END marker.
+    assert "first" in body
+    assert "BEGIN_FINDINGS_JSON" not in body
+    assert "END_FINDINGS_JSON" not in body
+
+
+def test_extract_findings_regex_dotall_matches_across_newlines(capsys):
+    """Pin §A: `re.DOTALL` makes `.` match newlines so a multi-line
+    JSON body is captured intact."""
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        "[\n"
+        '  {"k": 1},\n'
+        '  {"k": 2}\n'
+        "]\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    findings, _ = _extract_findings(text, "g")
+    assert findings == [{"k": 1}, {"k": 2}]
+
+
+def test_extract_findings_strips_whitespace_around_body(capsys):
+    """Pin §D2: the regex's `\\s*` flanks strip surrounding whitespace
+    (newlines, spaces) so `json.loads` sees the raw JSON. An empty
+    list with extra whitespace inside the markers parses cleanly."""
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->  \n  []  \n  <!-- END_FINDINGS_JSON -->"
+    )
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar == {"findings": []}
+
+
+def test_extract_findings_empty_array_is_valid(capsys):
+    """Pin: an explicit empty list is case 3 (clean parse), NOT case 5
+    (malformed). Distinguishes intentional zero findings from absent
+    appendix or malformed body. NO warning."""
+    text = _wrap_findings("[]")
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar == {"findings": []}
+    out = capsys.readouterr().out
+    assert "malformed" not in out
+    assert "not a list[dict]" not in out
+
+
+def test_extract_findings_warn_false_silences_warnings(capsys):
+    """Pin §D5 / §6.2: `warn=False` suppresses the case-2 / case-5
+    warnings. `run_gates` uses `warn=False` on its second extraction
+    to avoid double-printing what AgentGate already printed."""
+    text = _wrap_findings("{not valid json}")
+    findings, sidecar = _extract_findings(text, "g", warn=False)
+    assert findings is None
+    assert sidecar is None
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" not in out
+
+
+def test_extract_findings_raw_text_is_capped_at_raw_cap_bytes(capsys):
+    """Pin §D8: `_RAW_CAP_BYTES = 16 KB` defensive cap on the case-5
+    `_raw` text. A 50KB JSON string scalar produces an oversized body
+    that gets tail-capped before stuffing into `_raw`. Read the
+    constant rather than hard-coding 16 KB so the test stays in sync
+    if the cap is ever tuned."""
+    big_string = "X" * 50000
+    body = json.dumps(big_string)  # JSON-encoded string scalar
+    text = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n"
+        f"{body}\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    findings, sidecar = _extract_findings(text, "g")
+    assert findings == []
+    assert sidecar is not None
+    raw_bytes = sidecar["_raw"].encode("utf-8")
+    # Cap + ~50-byte truncation marker overhead.
+    assert len(raw_bytes) <= _RAW_CAP_BYTES + 50
+    assert "[truncated:" in sidecar["_raw"]
+
+
+def test_raw_cap_constant_is_16_kb():
+    """Pin §D8: the cap is 16 KB."""
+    assert _RAW_CAP_BYTES == 16 * 1024
+
+
+# --- AgentGate findings-population (Section I sub-block) -------------------
+
+def test_agent_gate_populates_findings_when_appendix_present(monkeypatch):
+    """Pin §D5 site 1: AgentGate.run() threads the extracted findings
+    onto the returned GateResult."""
+    text = _wrap_findings('[{"category": "ACL", "severity": "high"}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="secaudit", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.findings == [{"category": "ACL", "severity": "high"}]
+
+
+def test_agent_gate_findings_is_None_when_no_appendix(monkeypatch):
+    """Pin §D1 case 1 + AgentGate wiring: text without markers →
+    findings is None on the result."""
+    _stub_run_claude(monkeypatch, text="VERDICT: PASS\nNo appendix here.\n")
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.findings is None
+
+
+def test_agent_gate_findings_is_None_on_malformed_appendix(monkeypatch, capsys):
+    """Pin §D1 case 2 + AgentGate wiring: malformed JSON → findings is
+    None; warning printed."""
+    _stub_run_claude(
+        monkeypatch,
+        text=_wrap_findings("{this is not json}"),
+    )
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.findings is None
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" in out
+
+
+def test_agent_gate_findings_default_value_in_dataclass_is_None(monkeypatch):
+    """Pin §D4: empty agent text yields `findings is None` (the
+    helper's case-1 return value flows onto the dataclass)."""
+    _stub_run_claude(monkeypatch, text="")
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.findings is None
+
+
+def test_agent_gate_passed_is_independent_of_findings_extraction_failure(
+    monkeypatch, capsys,
+):
+    """Pin §D7: a malformed appendix on a PASS verdict does NOT block
+    the gate. `passed` derives only from `verdict: pass` substring;
+    `findings` extraction failure surfaces via warning + None on the
+    dataclass field."""
+    _stub_run_claude(
+        monkeypatch,
+        text=(
+            "VERDICT: PASS\n"
+            "<!-- BEGIN_FINDINGS_JSON -->\ngarbage\n<!-- END_FINDINGS_JSON -->"
+        ),
+    )
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    assert r.passed is True
+    assert r.findings is None
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" in out
+
+
+def test_agent_gate_uses_capped_output_for_extraction(monkeypatch):
+    """Pin §6.1: AgentGate passes `output_capped` (post-tail-cap)
+    to `_extract_findings`, NOT the raw text. If the appendix lands
+    in the omitted-head portion of an oversized text, both AgentGate's
+    extraction AND run_gates' re-extraction return (None, None) —
+    they agree because they share the same input."""
+    # Layout: appendix appears at the head; ~200 KB of filler tail
+    # pushes the head past the 100 KB tail-cap window.
+    appendix = (
+        "<!-- BEGIN_FINDINGS_JSON -->\n[{\"k\": 1}]\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    filler = "Z" * (_OUTPUT_CAP_BYTES + 50_000)
+    text = appendix + filler
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    r = AgentGate(name="g", gate=g,
+                  task={"id": 1, "title": "T", "description": "D"},
+                  cli={}).run()
+    # Markers were truncated out of `r.output` (the post-cap text);
+    # extraction sees no markers → findings is None.
+    assert "<!-- BEGIN_FINDINGS_JSON -->" not in r.output
+    assert r.findings is None
+
+
+# ---------------------------------------------------------------------------
+# J. run_gates sidecar `.json` write (T11, v0.3)
+# ---------------------------------------------------------------------------
+#
+# Integration tests at the run_gates layer. The .json file is written
+# next to <name>.txt under task_dir/gates/ when the agent populated
+# `findings`. Shell gates and skip-path results never trigger a write.
+# ---------------------------------------------------------------------------
+
+def test_run_gates_writes_json_sidecar_when_findings_present(
+    monkeypatch, tmp_path,
+):
+    """Pin task description test (a) at integration: a passing agent
+    gate with a well-formed appendix produces both <name>.txt and
+    <name>.json. The .json content parses cleanly and contains the
+    expected findings list."""
+    text = _wrap_findings('[{"category": "ACL", "severity": "high"}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("secaudit", g)],
+        task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    json_path = tmp_path / "gates" / "secaudit.json"
+    assert json_path.is_file()
+    sidecar = json.loads(json_path.read_text(encoding="utf-8"))
+    assert sidecar["findings"] == [{"category": "ACL", "severity": "high"}]
+
+
+def test_run_gates_json_sidecar_for_object_with_findings_keeps_extra_keys(
+    monkeypatch, tmp_path,
+):
+    """Pin §D1 case 4: object form with extra keys (e.g., `summary`)
+    keeps every key in the written sidecar. Belt-and-suspenders for
+    aggregator forward-compat."""
+    text = _wrap_findings('{"findings": [{"a": 1}], "summary": "S"}')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    sidecar = json.loads((tmp_path / "gates" / "g.json").read_text())
+    assert sidecar["findings"] == [{"a": 1}]
+    assert sidecar["summary"] == "S"
+
+
+def test_run_gates_json_sidecar_for_malformed_with_raw(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D1 case 5 at integration: a list with a non-dict element
+    produces a sidecar with `findings: []` and `_raw`."""
+    text = _wrap_findings('[{"a": 1}, "bad"]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    sidecar = json.loads((tmp_path / "gates" / "g.json").read_text())
+    assert sidecar["findings"] == []
+    assert "bad" in sidecar["_raw"]
+    out = capsys.readouterr().out
+    assert "not a list[dict]" in out
+
+
+def test_run_gates_does_NOT_write_json_when_no_markers(monkeypatch, tmp_path):
+    """Pin task description test (d): no markers → no .json file. The
+    .txt file IS written (gate output is always captured)."""
+    _stub_run_claude(monkeypatch, text="VERDICT: PASS\nNo findings here.")
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert (tmp_path / "gates" / "g.txt").is_file()
+    assert not (tmp_path / "gates" / "g.json").exists()
+
+
+def test_run_gates_does_NOT_write_json_on_malformed_parse(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin task description test (c) at integration: malformed JSON
+    inside markers → no .json file (case 2 is asymmetric vs. case 5).
+    Gate verdict (PASS) is unchanged. Warning printed."""
+    _stub_run_claude(
+        monkeypatch,
+        text=_wrap_findings("garbage"),
+    )
+    g = Gate(kind="agent", prompt_template="x")
+    results = run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert results[0].passed is True
+    assert not (tmp_path / "gates" / "g.json").exists()
+    out = capsys.readouterr().out
+    assert "malformed findings JSON" in out
+
+
+def test_run_gates_does_NOT_write_json_for_shell_gate(monkeypatch, tmp_path):
+    """Pin task description test (e): shell gates NEVER produce a .json
+    sidecar even if the captured stdout literally contains valid
+    findings markers. The contract is "shell gates don't extract"
+    (predicate: `r.findings is not None`), NOT "shell stdout was
+    empty". A future regression that switched the predicate to scan
+    `r.output` for markers would pass with empty stdout but FAIL
+    here."""
+    stdout_with_markers = (
+        "shell ran\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n[{\"k\": \"v\"}]\n"
+        "<!-- END_FINDINGS_JSON -->\n"
+    )
+    _stub_subprocess_run_global(monkeypatch, stdout=stdout_with_markers)
+    g = Gate(kind="shell", command=("true",))
+    run_gates(
+        [("shellgate", g)],
+        task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    txt_body = (tmp_path / "gates" / "shellgate.txt").read_text()
+    assert "BEGIN_FINDINGS_JSON" in txt_body  # markers in stdout
+    assert not (tmp_path / "gates" / "shellgate.json").exists()
+
+
+def test_run_gates_findings_survive_reconstruction(monkeypatch, tmp_path):
+    """Pin task description test (f): the GateResult re-construction
+    in run_gates' write loop MUST thread `findings=r.findings`
+    explicitly. Without that line, the returned result silently drops
+    findings (default-None applies). This is the load-bearing
+    regression guard for the `findings=r.findings` line in §6.2 step
+    4. Production would be quietly broken; only this test catches
+    it."""
+    text = _wrap_findings('[{"a": 1}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    results = run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert results[0].findings == [{"a": 1}]
+
+
+def test_run_gates_json_pretty_printed_with_indent_2(monkeypatch, tmp_path):
+    """Pin §D6: sidecar JSON uses `json.dumps(..., indent=2)` so the
+    file is human-readable. Verify by checking for indented braces /
+    keys in the raw text."""
+    text = _wrap_findings('[{"k": "v"}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    raw = (tmp_path / "gates" / "g.json").read_text(encoding="utf-8")
+    # Indent=2 produces lines beginning with two spaces inside
+    # objects; key/value pairs land on their own lines.
+    assert "  \"findings\"" in raw
+    assert "\n" in raw  # multi-line
+
+
+def test_run_gates_json_sidecar_has_trailing_newline(monkeypatch, tmp_path):
+    """Pin §6.2 step 4: the .json file ends with a single trailing
+    newline (matches the .txt convention). `json.dumps` does NOT emit
+    a trailing newline; the implementation appends `+ "\\n"`."""
+    text = _wrap_findings('[{"k": "v"}]')
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    raw_bytes = (tmp_path / "gates" / "g.json").read_bytes()
+    assert raw_bytes.endswith(b"\n")
+
+
+def test_run_gates_does_not_double_warn_on_malformed(
+    monkeypatch, tmp_path, capsys,
+):
+    """Pin §D5 / §6.2: the second extraction in run_gates uses
+    `warn=False` so the malformed-JSON warning is printed exactly
+    ONCE (from AgentGate.run's first call, not duplicated by
+    run_gates' second call). Counts canonical fragment occurrences."""
+    _stub_run_claude(monkeypatch, text=_wrap_findings("{bad json}"))
+    g = Gate(kind="agent", prompt_template="x")
+    run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    out = capsys.readouterr().out
+    # Exactly ONE occurrence — AgentGate's call site.
+    assert out.count("malformed findings JSON") == 1
+
+
+def test_run_gates_findings_None_when_skip_path_taken(monkeypatch, tmp_path):
+    """Pin §D4: a gate whose `when` filter rejects the task is skipped
+    via the passive-result path; the produced GateResult uses the
+    dataclass default → `findings is None`. No .json written."""
+    g = Gate(
+        kind="agent", prompt_template="x", when=("task_class:ui",),
+    )
+    results = run_gates(
+        [("ui-only", g)],
+        task={"id": 1, "title": "T", "description": "D",
+              "task_class": "schema"},
+        task_dir=tmp_path, cli={},
+    )
+    assert len(results) == 1
+    assert results[0].findings is None
+    assert not (tmp_path / "gates" / "ui-only.json").exists()
+
+
+def test_run_gates_findings_survive_exception_path(monkeypatch, tmp_path):
+    """Pin §D4: an exception inside the gate runner produces a fallback
+    GateResult; `findings` defaults to None. The reconstruction in
+    run_gates' write loop preserves the None (no .json written)."""
+    def boom(prompt, **kwargs):
+        raise RuntimeError("agent crashed")
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", boom,
+    )
+    g = Gate(kind="agent", prompt_template="x")
+    results = run_gates(
+        [("crashy", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert results[0].findings is None
+    assert results[0].error is not None
+    assert "agent crashed" in (results[0].error or "")
+    assert not (tmp_path / "gates" / "crashy.json").exists()
+
+
+def test_run_gates_passes_when_findings_is_empty_list(monkeypatch, tmp_path):
+    """Pin §D3: an INTENTIONAL empty list (case 3 with `[]`) writes a
+    sidecar with `{"findings": []}` and is distinct from the
+    no-appendix path (case 1, no .json written). The predicate
+    `r.findings is not None` accepts `[]`."""
+    text = (
+        "VERDICT: PASS\n"
+        "<!-- BEGIN_FINDINGS_JSON -->\n[]\n<!-- END_FINDINGS_JSON -->\n"
+    )
+    _stub_run_claude(monkeypatch, text=text)
+    g = Gate(kind="agent", prompt_template="x")
+    results = run_gates(
+        [("g", g)], task={"id": 1, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert results[0].passed is True
+    assert results[0].findings == []
+    sidecar = json.loads((tmp_path / "gates" / "g.json").read_text())
+    assert sidecar == {"findings": []}
+
+
+# ---------------------------------------------------------------------------
+# K. GateResult `findings` field (T11, v0.3)
+# ---------------------------------------------------------------------------
+
+def test_gate_result_findings_default_is_None():
+    """Pin §D4: `findings` defaults to None so existing call sites
+    that omit the kwarg keep working. Backward-compat invariant."""
+    r = GateResult(
+        name="x", passed=True, output="", output_path=None,
+        duration_seconds=0.0, on_failure="block",
+    )
+    assert r.findings is None
+
+
+def test_gate_result_findings_field_present():
+    """Pin §D4: the field accepts a list[dict] and surfaces it via
+    attribute access."""
+    r = GateResult(
+        name="x", passed=True, output="", output_path=None,
+        duration_seconds=0.0, on_failure="block",
+        findings=[{"a": 1}],
+    )
+    assert r.findings == [{"a": 1}]
+
+
+def test_gate_result_field_order_includes_findings_last():
+    """Pin §D4: field order ends with `..., error, findings`. Frozen
+    dataclass field order is part of the public contract for
+    positional construction; tests pin it as a regression guard
+    against accidental reordering."""
+    fields = [f.name for f in GateResult.__dataclass_fields__.values()]
+    assert fields == [
+        "name", "passed", "output", "output_path",
+        "duration_seconds", "on_failure", "error", "findings",
+    ]
+
+
+def test_gate_result_is_still_frozen_after_findings_added():
+    """Pin §D4: frozen-dataclass invariant preserved post-T11.
+    Mutation raises."""
+    r = GateResult(
+        name="x", passed=True, output="", output_path=None,
+        duration_seconds=0.0, on_failure="block",
+    )
+    with pytest.raises(Exception):
+        r.findings = [{"k": "v"}]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# L. Built-in template content for security-auditor + test-critique (T11)
+# ---------------------------------------------------------------------------
+#
+# Pin: each template ships a "### Structured findings appendix
+# (recommended)" subsection with a concrete example, the per-finding
+# schema keys (backticked), the omit disclaimer, and the literal
+# HTML-comment markers. The example body is parseable JSON so a
+# template typo cannot ship invalid examples.
+#
+# (Design-fidelity template tests live in test_gates_design_fidelity.py
+# per the existing repo convention.)
+# ---------------------------------------------------------------------------
+
+_TEMPLATES_DIR = (
+    Path(__file__).parent.parent
+    / "src" / "claude_plan_execute" / "gates" / "templates"
+)
+
+
+def _read_template(name: str) -> str:
+    return (_TEMPLATES_DIR / name).read_text(encoding="utf-8")
+
+
+def _extract_template_example_block(body: str) -> str:
+    """Return the JSON body between the FIRST marker pair in `body`."""
+    match = _FINDINGS_RE.search(body)
+    assert match is not None, "template lacks findings marker pair"
+    return match.group(1)
+
+
+# --- security-auditor.md --------------------------------------------------
+
+def test_security_auditor_template_has_findings_appendix_section():
+    """Pin §D / §6.3: literal `### Structured findings appendix
+    (recommended)` heading present."""
+    body = _read_template("security-auditor.md")
+    assert "### Structured findings appendix (recommended)" in body
+
+
+def test_security_auditor_template_documents_per_finding_schema_keys():
+    """Pin §D10: the per-finding schema documents `category`,
+    `severity`, `file`, `line`, `evidence`, `suggested_fix` as
+    backticked field names."""
+    body = _read_template("security-auditor.md")
+    for key in (
+        "category", "severity", "file", "line", "evidence", "suggested_fix",
+    ):
+        assert f"`{key}`" in body, f"missing backticked key: {key}"
+
+
+def test_security_auditor_template_lists_common_severity_values_without_enforcing():
+    """Pin §D10 / §D11: severity is documented with common values but
+    explicitly NOT enforced. Pins the no-enum-constraints rule."""
+    body = _read_template("security-auditor.md")
+    for sev in ("critical", "high", "medium", "low"):
+        assert f"`{sev}`" in body
+    assert "NOT enforced" in body
+
+
+def test_security_auditor_template_has_html_comment_markers():
+    """Pin §D2: literal HTML-comment markers appear in the template
+    so the agent has the exact text to copy."""
+    body = _read_template("security-auditor.md")
+    assert "<!-- BEGIN_FINDINGS_JSON -->" in body
+    assert "<!-- END_FINDINGS_JSON -->" in body
+
+
+def test_security_auditor_template_has_omit_disclaimer():
+    """Pin §D10: each template instructs the agent that the appendix
+    is optional ("emit an empty `[]` or omit the appendix
+    entirely")."""
+    body = _read_template("security-auditor.md")
+    assert "emit an empty `[]` or omit the appendix entirely" in body
+
+
+# --- test-critique.md -----------------------------------------------------
+
+def test_test_critique_template_has_findings_appendix_section():
+    body = _read_template("test-critique.md")
+    assert "### Structured findings appendix (recommended)" in body
+
+
+def test_test_critique_template_documents_per_finding_schema_keys():
+    """Pin §D10: schema keys for test-critique."""
+    body = _read_template("test-critique.md")
+    for key in ("missing_test_for", "contract", "suggested_test_name"):
+        assert f"`{key}`" in body, f"missing backticked key: {key}"
+
+
+def test_test_critique_template_has_html_comment_markers():
+    body = _read_template("test-critique.md")
+    assert "<!-- BEGIN_FINDINGS_JSON -->" in body
+    assert "<!-- END_FINDINGS_JSON -->" in body
+
+
+def test_test_critique_template_has_omit_disclaimer():
+    body = _read_template("test-critique.md")
+    assert "emit an empty `[]` or omit the appendix entirely" in body
+
+
+# --- belt-and-suspenders: examples are valid extractable appendices -------
+
+def test_security_auditor_template_example_is_valid_findings_appendix():
+    """Pin: the JSON example in the template parses cleanly via the
+    same _extract_findings helper the build tool uses. Catches typos
+    at CI time before agents ever see them."""
+    body = _read_template("security-auditor.md")
+    findings, sidecar = _extract_findings(body, "security-auditor")
+    assert findings is not None, "template example failed extraction"
+    assert isinstance(findings, list)
+    assert all(isinstance(el, dict) for el in findings)
+    # Sidecar must be writable JSON (no _raw).
+    assert sidecar is not None
+    assert "_raw" not in sidecar
+
+
+def test_test_critique_template_example_is_valid_findings_appendix():
+    """Pin: ditto for test-critique."""
+    body = _read_template("test-critique.md")
+    findings, sidecar = _extract_findings(body, "test-critique")
+    assert findings is not None
+    assert all(isinstance(el, dict) for el in findings)
+
+
+# ---------------------------------------------------------------------------
+# K. Gate.kind=human surface (T10, v0.3 §2.4)
+# ---------------------------------------------------------------------------
+#
+# Pin §D12 — `_run_one` signature must keep `task_dir` and `state`
+# as POSITIONAL_OR_KEYWORD parameters APPENDED at the end. The
+# parallel pool's positional `submit(...)` call binds the first
+# six params positionally and ignores the new two; if a future
+# refactor inserts the new params before `diff_path` /
+# `usage_jsonl_path`, the parallel pool would silently mis-bind.
+# This pin catches that.
+
+def test_run_one_signature_field_order_after_t10():
+    """T10 §D12 — `_run_one` signature includes memory_dir at the
+    end (T16 §D.4). All optional params are POSITIONAL_OR_KEYWORD."""
+    import inspect
+
+    from claude_plan_execute.gates import _run_one
+
+    sig = inspect.signature(_run_one)
+    params = list(sig.parameters.values())
+    names = [p.name for p in params]
+    assert names == [
+        "name", "gate", "task", "cli",
+        "diff_path", "usage_jsonl_path",
+        "task_dir", "state",
+        "memory_dir",
+    ]
+    for p in params:
+        assert p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD, (
+            f"{p.name} is {p.kind!r}, expected POSITIONAL_OR_KEYWORD"
+        )
+
+
+def test_run_gates_parallel_pool_unchanged_for_shell_agent_gates(
+    monkeypatch, tmp_path,
+):
+    """T10 §D12 regression — parallel-safe shell + agent gates run
+    through the parallel pool unchanged after the _run_one signature
+    extension. The positional submit(...) tuple binds (n, g, task,
+    cli, diff_path_str, usage_jsonl_path_str) verbatim; new task_dir
+    / state kwargs default to None for the parallel branch.
+    """
+    _stub_subprocess_run_global(monkeypatch, stdout="ok\n")
+    g_shell = Gate(kind="shell", command=("true",), parallel_safe=True)
+    results = run_gates(
+        [("p1", g_shell), ("p2", g_shell)],
+        task={"id": 7, "title": "T", "description": "D"},
+        task_dir=tmp_path, cli={},
+    )
+    assert len(results) == 2
+    assert all(r.passed for r in results)
+
+
+# ---------------------------------------------------------------------------
+# L. HumanGate runner (T10, v0.3 §2.4)
+# ---------------------------------------------------------------------------
+#
+# HumanGate pauses the runner pending an operator decision via
+# filesystem sentinels. Tests use `poll_interval_seconds=0.01`
+# and seed sentinels from a `threading.Thread` that sleeps ~50 ms
+# before writing — total wall time per test < 200 ms. See plan
+# §D9 testability seam.
+
+import threading
+import time  # module-level for the tests below
+
+
+def _drop_sentinel_after(
+    path: Path, content: str, delay_seconds: float = 0.05,
+) -> threading.Thread:
+    """Spawn a daemon thread that writes `content` to `path` after a
+    short delay. Returns the thread handle (caller can `.join()` for
+    cleanliness, but daemon=True means tests will exit even if the
+    thread is forgotten).
+    """
+    def writer():
+        time.sleep(delay_seconds)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    return t
+
+
+def _make_task(tid: int = 10, **extra) -> dict:
+    return {
+        "id": tid,
+        "title": "T",
+        "description": "D",
+        **extra,
+    }
+
+
+# --- (a) approval before timeout ---------------------------------------------
+
+def test_human_gate_approval_before_timeout_passes_with_note(tmp_path):
+    """Test (a) — approval drops a `<name>.approval` sentinel; the
+    gate returns passed=True with the operator's note as output.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review", parallel_safe=False)
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    approval_path = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(approval_path, "lgtm — design ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    assert "lgtm" in result.output
+    assert result.error is None
+
+
+# --- (b) rejection -----------------------------------------------------------
+
+def test_human_gate_rejection_fails_with_note(tmp_path):
+    """Test (b) — rejection drops a `<name>.rejection` sentinel; the
+    gate returns passed=False with the operator's note as output.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    rejection_path = task_dir / "gates" / "review.rejection"
+    _drop_sentinel_after(rejection_path, "needs work — see comment\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is False
+    assert "needs work" in result.output
+    # Verdict-based failures use the existing gate_failed pathway, not
+    # human_gate_timeout.
+    assert result.error is None
+
+
+# --- (c) timeout -------------------------------------------------------------
+
+def test_human_gate_timeout_fails_with_human_gate_timeout_error(tmp_path):
+    """Test (c) — no decision before timeout deadline; result has
+    error='human_gate_timeout', passed=False.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    # 1 minute timeout but we'll fake elapsed time via a low poll
+    # interval and a deadline-reached check on each tick.
+    g = Gate(
+        kind="human", prompt_template="please review",
+        timeout_minutes=1,
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    # We monkey-patch time.time inside the human module to advance
+    # the clock past the deadline after one poll tick. Cleaner than
+    # actually waiting 60 seconds.
+    import claude_plan_execute.gates.human as human_mod
+
+    real_time = human_mod.time.time
+    base = real_time()
+    state = {"calls": 0}
+
+    def fake_time():
+        state["calls"] += 1
+        # First few calls (start, deadline, deadline-check) return real;
+        # subsequent calls (during poll) jump ahead by 999 seconds so
+        # `time.time() >= deadline` fires.
+        if state["calls"] >= 4:
+            return base + 9999
+        return base + state["calls"] * 0.01
+
+    import unittest.mock as mock
+    with mock.patch.object(human_mod.time, "time", fake_time):
+        hg = HumanGate(
+            name="review", gate=g, task=_make_task(), task_dir=task_dir,
+            poll_interval_seconds=0.01,
+        )
+        result = hg.run()
+
+    assert result.passed is False
+    assert result.error == "human_gate_timeout"
+
+
+# --- pre-clear stale sentinels (§D3) -----------------------------------------
+
+def test_human_gate_clears_stale_approval_sentinel_on_entry(tmp_path):
+    """§D3 — a stale `.approval` from a prior attempt must NOT cause
+    instant PASS on re-run. HumanGate.run() pre-clears both sentinels
+    before writing the request file.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    (task_dir / "gates").mkdir(parents=True)
+
+    stale = task_dir / "gates" / "review.approval"
+    stale.write_text("stale — should be cleared\n", encoding="utf-8")
+
+    # Drop a FRESH rejection mid-poll. The fresh sentinel must win;
+    # the stale approval must NOT.
+    fresh_reject = task_dir / "gates" / "review.rejection"
+    _drop_sentinel_after(fresh_reject, "fresh reject\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is False
+    assert "fresh reject" in result.output
+
+
+def test_human_gate_clears_stale_rejection_sentinel_on_entry(tmp_path):
+    """§D3 — a stale `.rejection` from a prior attempt must NOT cause
+    instant FAIL on re-run.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    (task_dir / "gates").mkdir(parents=True)
+
+    stale = task_dir / "gates" / "review.rejection"
+    stale.write_text("stale\n", encoding="utf-8")
+
+    fresh_approve = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh_approve, "fresh approve\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    assert "fresh approve" in result.output
+
+
+# --- request file write & header (§D6) ---------------------------------------
+
+def test_human_gate_writes_request_file_to_gates_dir(tmp_path):
+    """§D6 — HumanGate writes `<name>.request.md` into task_dir/gates/.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="REVIEW BODY")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    request_file = task_dir / "gates" / "review.request.md"
+    assert request_file.exists()
+    body = request_file.read_text()
+    assert "REVIEW BODY" in body
+
+
+def test_human_gate_request_file_contains_task_header_and_response_instructions(
+    tmp_path,
+):
+    """§D6 — request body has a task header (TASK <id>: <title> +
+    DESCRIPTION:) and a footer with response instructions (Approve /
+    Reject paths + CLI examples).
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review carefully")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g,
+        task=_make_task(tid=42, title="Add OAuth"),
+        task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    body = (task_dir / "gates" / "review.request.md").read_text()
+    assert "TASK 42: Add OAuth" in body
+    assert "DESCRIPTION:" in body
+    assert "How to respond" in body
+    assert "approve 42 review" in body
+    assert "reject 42 review" in body
+
+
+# --- placeholder substitution (§D5) ------------------------------------------
+
+def test_human_gate_substitutes_all_five_placeholders_in_body(tmp_path):
+    """§D5 — five placeholders {plan_path}, {gates_dir}, {diff_path},
+    {approval_path}, {rejection_path} substituted via str.replace.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    template = (
+        "Plan: {plan_path}\nGates: {gates_dir}\nDiff: {diff_path}\n"
+        "Approve: {approval_path}\nReject: {rejection_path}\n"
+    )
+    g = Gate(kind="human", prompt_template=template)
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    body = (task_dir / "gates" / "review.request.md").read_text()
+    assert str(task_dir / "plan.md") in body
+    assert str(task_dir / "gates") in body
+    assert str(task_dir / "diff.patch") in body
+    assert str(task_dir / "gates" / "review.approval") in body
+    assert str(task_dir / "gates" / "review.rejection") in body
+
+
+def test_human_gate_substitutes_diff_path_placeholder(tmp_path):
+    """§D5 — `{diff_path}` resolves to task_dir/diff.patch."""
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="see {diff_path}")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    body = (task_dir / "gates" / "review.request.md").read_text()
+    assert "{diff_path}" not in body
+    assert str(task_dir / "diff.patch") in body
+
+
+# --- custom sentinel_path (§D4) ---------------------------------------------
+
+def test_human_gate_custom_sentinel_path_is_respected(tmp_path):
+    """§D4 — a custom `Gate.sentinel_path` overrides the convention
+    path; the rejection path is derived by suffix swap.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    custom = tmp_path / "custom-dir" / "x.approval"
+    custom.parent.mkdir(parents=True)
+    g = Gate(
+        kind="human", prompt_template="please review",
+        sentinel_path=str(custom),
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    _drop_sentinel_after(custom, "lgtm\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    assert "lgtm" in result.output
+
+
+def test_human_gate_rejection_path_swaps_approval_for_rejection_suffix(tmp_path):
+    """§D4 — when sentinel_path ends in `.approval`, the rejection
+    path is the same with `.rejection` instead.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    custom_approve = tmp_path / "custom-dir" / "x.approval"
+    custom_approve.parent.mkdir(parents=True)
+    custom_reject = tmp_path / "custom-dir" / "x.rejection"
+
+    g = Gate(
+        kind="human", prompt_template="please review",
+        sentinel_path=str(custom_approve),
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    _drop_sentinel_after(custom_reject, "no go\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is False
+    assert "no go" in result.output
+
+
+def test_human_gate_sentinel_default_uses_convention_path(tmp_path):
+    """§D4 — when sentinel_path is None, HumanGate computes
+    `task_dir/gates/<name>.approval`.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    convention = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(convention, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+
+
+# --- approval-wins tiebreak (§D7) -------------------------------------------
+
+def test_human_gate_approval_wins_over_simultaneous_rejection(tmp_path):
+    """§D7 — if both .approval and .rejection exist at poll time,
+    PASS wins. Pre-seed both before the poll loop runs.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    (task_dir / "gates").mkdir(parents=True)
+
+    # Both must be dropped AFTER the pre-clear (which fires on
+    # run() entry). Use a tiny delay; the poll sees both at once.
+    approval = task_dir / "gates" / "review.approval"
+    rejection = task_dir / "gates" / "review.rejection"
+
+    def writer():
+        time.sleep(0.05)
+        approval.write_text("approve note\n", encoding="utf-8")
+        rejection.write_text("reject note\n", encoding="utf-8")
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    assert "approve note" in result.output
+
+
+# --- output tail-cap (§D18) --------------------------------------------------
+
+def test_human_gate_output_is_capped_note_content(tmp_path):
+    """§D18 — GateResult.output is the (tail-capped) sentinel
+    content. The 100 KB cap from gates.shell._tail_cap applies.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    huge_note = "x" * (200 * 1024)  # 200 KB, twice the 100 KB cap
+    approval = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(approval, huge_note, 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+    # Truncation marker prepended; total length ≈ 100 KB (cap) +
+    # marker.
+    assert "[truncated:" in result.output
+    assert len(result.output.encode("utf-8")) < 200 * 1024
+
+
+# --- on_failure carry-through ------------------------------------------------
+
+def test_human_gate_carries_on_failure_warn_through_to_result(tmp_path):
+    """§: `on_failure="warn"` survives to the GateResult."""
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(
+        kind="human", prompt_template="please review", on_failure="warn",
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    rej = task_dir / "gates" / "review.rejection"
+    _drop_sentinel_after(rej, "no\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is False
+    assert result.on_failure == "warn"
+
+
+# --- missing prompt_template -------------------------------------------------
+
+def test_human_gate_missing_prompt_template_raises(tmp_path):
+    """HumanGate.run() raises ValueError when prompt_template is
+    missing. (compile_entry already enforces this; this is the
+    runtime defense for direct callers.)
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate.__new__(Gate)
+    object.__setattr__(g, "kind", "human")
+    object.__setattr__(g, "command", None)
+    object.__setattr__(g, "prompt_template", None)
+    object.__setattr__(g, "model", None)
+    object.__setattr__(g, "effort", None)
+    object.__setattr__(g, "timeout_minutes", 10)
+    object.__setattr__(g, "parallel_safe", False)
+    object.__setattr__(g, "on_failure", "block")
+    object.__setattr__(g, "when", ("always",))
+    object.__setattr__(g, "sentinel_path", None)
+
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    with pytest.raises(ValueError, match="prompt_template"):
+        hg.run()
+
+
+# --- state threading + awaiting_human lifecycle (§D10, §D12) -----------------
+
+def test_human_gate_sets_awaiting_human_status_during_poll(tmp_path):
+    """§D10 / §D12 — when state is threaded, HumanGate sets
+    status='awaiting_human' + awaiting_gate_name before polling and
+    restores 'implementing' (with awaiting_gate_name popped) when
+    the poll exits.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+    from claude_plan_execute.state import State
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    state = State(tmp_path / "state.json")
+    # Seed task.
+    state.set_status(10, "implementing")
+
+    captured = {}
+
+    def writer():
+        # Capture the status the gate set during poll.
+        time.sleep(0.05)
+        captured["mid_status"] = state.get(10).get("status")
+        captured["awaiting_gate_name"] = state.get(10).get(
+            "awaiting_gate_name",
+        )
+        approval = task_dir / "gates" / "review.approval"
+        approval.write_text("ok\n", encoding="utf-8")
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        state=state, poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+    t.join()
+
+    assert result.passed is True
+    assert captured["mid_status"] == "awaiting_human"
+    assert captured["awaiting_gate_name"] == "review"
+    # After run() returns, status restored + awaiting_gate_name popped.
+    final = state.get(10)
+    assert final["status"] == "implementing"
+    assert "awaiting_gate_name" not in final
+
+
+def test_human_gate_clears_awaiting_gate_name_on_pass(tmp_path):
+    """§D10 — awaiting_gate_name is popped on PASS exit."""
+    from claude_plan_execute.gates.human import HumanGate
+    from claude_plan_execute.state import State
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    state = State(tmp_path / "state.json")
+    state.set_status(10, "implementing")
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        state=state, poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    assert "awaiting_gate_name" not in state.get(10)
+
+
+def test_human_gate_clears_awaiting_gate_name_on_fail(tmp_path):
+    """§D10 — awaiting_gate_name is popped on rejection-FAIL exit."""
+    from claude_plan_execute.gates.human import HumanGate
+    from claude_plan_execute.state import State
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    state = State(tmp_path / "state.json")
+    state.set_status(10, "implementing")
+
+    fresh = task_dir / "gates" / "review.rejection"
+    _drop_sentinel_after(fresh, "no\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        state=state, poll_interval_seconds=0.01,
+    )
+    hg.run()
+
+    assert "awaiting_gate_name" not in state.get(10)
+
+
+def test_human_gate_clears_awaiting_gate_name_on_timeout(tmp_path):
+    """§D10 — awaiting_gate_name popped on timeout exit (finally block)."""
+    from claude_plan_execute.gates.human import HumanGate
+    from claude_plan_execute.state import State
+    import claude_plan_execute.gates.human as human_mod
+
+    g = Gate(
+        kind="human", prompt_template="please review", timeout_minutes=1,
+    )
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+    state = State(tmp_path / "state.json")
+    state.set_status(10, "implementing")
+
+    base = human_mod.time.time()
+    state_d = {"calls": 0}
+
+    def fake_time():
+        state_d["calls"] += 1
+        if state_d["calls"] >= 4:
+            return base + 9999
+        return base + state_d["calls"] * 0.01
+
+    import unittest.mock as mock
+    with mock.patch.object(human_mod.time, "time", fake_time):
+        hg = HumanGate(
+            name="review", gate=g, task=_make_task(), task_dir=task_dir,
+            state=state, poll_interval_seconds=0.01,
+        )
+        result = hg.run()
+
+    assert result.error == "human_gate_timeout"
+    assert "awaiting_gate_name" not in state.get(10)
+
+
+def test_human_gate_skips_state_updates_when_state_is_None(tmp_path):
+    """When state is None (unit-test path), HumanGate does NOT
+    attempt status updates; the rest of the contract still applies.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    fresh = task_dir / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        state=None, poll_interval_seconds=0.01,
+    )
+    result = hg.run()
+
+    assert result.passed is True
+
+
+# --- state threading via run_gates (§D12) -----------------------------------
+
+def test_run_gates_threads_state_into_human_gate_run(tmp_path, monkeypatch):
+    """§D12 — `run_gates(..., state=state)` forwards state through
+    `_run_one` into HumanGate.run(); the awaiting_human status fires.
+    """
+    from claude_plan_execute.state import State
+    import claude_plan_execute.gates.human as human_mod
+
+    # Speed-up: short-circuit the 10 s production sleep.
+    real_sleep = human_mod.time.sleep
+    monkeypatch.setattr(
+        human_mod.time, "sleep", lambda _s: real_sleep(0.01),
+    )
+
+    g = Gate(
+        kind="human", prompt_template="please review", parallel_safe=False,
+    )
+    state = State(tmp_path / "state.json")
+    state.set_status(10, "implementing")
+
+    captured = {}
+
+    def writer():
+        time.sleep(0.05)
+        captured["mid_status"] = state.get(10).get("status")
+        approval = tmp_path / "gates" / "review.approval"
+        approval.write_text("ok\n", encoding="utf-8")
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+
+    results = run_gates(
+        [("review", g)],
+        task=_make_task(),
+        task_dir=tmp_path,
+        cli={},
+        state=state,
+    )
+    t.join()
+
+    assert len(results) == 1
+    assert results[0].passed is True
+    assert captured["mid_status"] == "awaiting_human"
+
+
+def test_run_gates_threads_task_dir_into_human_gate_run(tmp_path, monkeypatch):
+    """§D12 — `task_dir` flows through to HumanGate; the request
+    file lands in the right place.
+    """
+    import claude_plan_execute.gates.human as human_mod
+
+    real_sleep = human_mod.time.sleep
+    monkeypatch.setattr(
+        human_mod.time, "sleep", lambda _s: real_sleep(0.01),
+    )
+
+    g = Gate(
+        kind="human", prompt_template="please review", parallel_safe=False,
+    )
+
+    fresh = tmp_path / "gates" / "review.approval"
+    _drop_sentinel_after(fresh, "ok\n", 0.05)
+
+    results = run_gates(
+        [("review", g)],
+        task=_make_task(),
+        task_dir=tmp_path,
+        cli={},
+    )
+
+    request_file = tmp_path / "gates" / "review.request.md"
+    assert request_file.exists()
+    assert results[0].passed is True
+
+
+# --- SIGINT propagation (§D11) ----------------------------------------------
+
+def test_human_gate_propagates_keyboard_interrupt(tmp_path, monkeypatch):
+    """§D11 — KeyboardInterrupt during the poll bubbles out
+    unchanged. HumanGate does NOT add an `except KeyboardInterrupt`
+    branch.
+    """
+    from claude_plan_execute.gates.human import HumanGate
+    import claude_plan_execute.gates.human as human_mod
+
+    g = Gate(kind="human", prompt_template="please review")
+    task_dir = tmp_path / "task-10"
+    task_dir.mkdir()
+
+    def fake_sleep(_seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(human_mod.time, "sleep", fake_sleep)
+
+    hg = HumanGate(
+        name="review", gate=g, task=_make_task(), task_dir=task_dir,
+        poll_interval_seconds=0.01,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        hg.run()

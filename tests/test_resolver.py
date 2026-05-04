@@ -399,8 +399,43 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "invariants_file",
         "untranslated_strings_command",
         "dev_server_url",
+        "max_rate_limit_retries",
+        "rate_limit_base_backoff_seconds",
+        # T9 (v0.3 §2.12) — per-task branches + auto-PR.
+        "branch_per_task",
+        "base_branch",
+        "task_branch_template",
+        "auto_pr",
+        "auto_merge",
+        "pr_body_template",
+        # T16 (v0.3) — memory-curate threshold.
+        "memory_curation_threshold",
+        # T17 (v0.3) — auto-split.
+        "auto_split_on_max_rounds",
+        "auto_split_failure_classes",
+        "max_split_depth",
     )
     assert KEYS_TO_AUDIT == expected
+
+
+def test_memory_curation_threshold_is_a_hardcoded_default():
+    assert HARDCODED_DEFAULTS["memory_curation_threshold"] == 30
+    assert resolve("memory_curation_threshold", {}, {}, {}) == 30
+
+
+def test_max_rate_limit_retries_is_a_hardcoded_default():
+    assert HARDCODED_DEFAULTS["max_rate_limit_retries"] == 3
+    assert resolve("max_rate_limit_retries", {}, {}, {}) == 3
+
+
+def test_rate_limit_base_backoff_seconds_is_a_hardcoded_default():
+    assert HARDCODED_DEFAULTS["rate_limit_base_backoff_seconds"] == 60
+    assert resolve("rate_limit_base_backoff_seconds", {}, {}, {}) == 60
+
+
+def test_keys_to_audit_includes_rate_limit_fields():
+    assert "max_rate_limit_retries" in KEYS_TO_AUDIT
+    assert "rate_limit_base_backoff_seconds" in KEYS_TO_AUDIT
 
 
 # ---------------------------------------------------------------------------
@@ -652,3 +687,32 @@ def test_resolve_untranslated_strings_command_explicit_empty_string_preserved():
     assert out["untranslated_strings_command"] == {
         "value": "", "from": "project_defaults",
     }
+
+
+# ---------------------------------------------------------------------------
+# M. T17 auto-split resolver
+# ---------------------------------------------------------------------------
+
+
+def test_keys_to_audit_includes_t17_auto_split_keys():
+    for k in ("auto_split_on_max_rounds",
+              "auto_split_failure_classes",
+              "max_split_depth"):
+        assert k in KEYS_TO_AUDIT
+
+
+def test_auto_split_on_max_rounds_hardcoded_default_is_false():
+    assert HARDCODED_DEFAULTS["auto_split_on_max_rounds"] is False
+    assert resolve("auto_split_on_max_rounds", {}, {}, {}) is False
+
+
+def test_auto_split_failure_classes_hardcoded_default():
+    assert HARDCODED_DEFAULTS["auto_split_failure_classes"] == [
+        "review_rejected_after_max_rounds",
+        "implementer_max_turns",
+    ]
+
+
+def test_max_split_depth_hardcoded_default_is_1():
+    assert HARDCODED_DEFAULTS["max_split_depth"] == 1
+    assert resolve("max_split_depth", {}, {}, {}) == 1

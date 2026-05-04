@@ -335,6 +335,17 @@ def test_make_test_critique_gate_template_body_starts_with_test_critique_header(
     assert "test-critique" in body.lower() or "test critic" in body.lower()
 
 
+def test_test_critique_template_references_diff_path_placeholder():
+    """Pin T7 §D9: the test-critique template body contains the
+    literal `{diff_path}` placeholder so AgentGate.run() can
+    substitute it. File-content assertion (before any rendering
+    by AgentGate). Regression guard against a future template
+    rewrite that drops the placeholder."""
+    g = default_registry().get("test-critique")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "{diff_path}" in body
+
+
 # ---------------------------------------------------------------------------
 # H. security-auditor built-in agent gate (task 16)
 # ---------------------------------------------------------------------------
@@ -474,6 +485,17 @@ def test_security_auditor_template_body_starts_with_recognizable_header():
     )
 
 
+def test_security_auditor_template_references_diff_path_placeholder():
+    """Pin T7 §D9: the security-auditor template body contains
+    the literal `{diff_path}` placeholder so AgentGate.run() can
+    substitute it. File-content assertion (before any rendering
+    by AgentGate). Regression guard against a future template
+    rewrite that drops the placeholder."""
+    g = default_registry().get("security-auditor")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "{diff_path}" in body
+
+
 def test_test_critique_and_security_auditor_are_both_registered():
     """Pin §D1: both task-15 (test-critique) and task-16
     (security-auditor) registrations coexist on the default
@@ -579,3 +601,109 @@ def test_make_untranslated_strings_gate_does_NOT_register_on_default_registry():
     make_untranslated_strings_gate("python tools/check_i18n.py")
     after = set(default_registry().names())
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# J. memory-curate built-in agent gate (T16)
+# ---------------------------------------------------------------------------
+
+from claude_plan_execute.gates.builtin import _build_memory_curate_gate
+
+
+def test_memory_curate_is_registered_on_default_registry_after_import():
+    assert "memory-curate" in default_registry().names()
+
+
+def test_memory_curate_gate_kind_is_agent():
+    g = default_registry().get("memory-curate")
+    assert g is not None and g.kind == "agent"
+
+
+def test_memory_curate_gate_model_is_sonnet():
+    assert default_registry().get("memory-curate").model == "sonnet"
+
+
+def test_memory_curate_gate_effort_is_medium():
+    assert default_registry().get("memory-curate").effort == "medium"
+
+
+def test_memory_curate_gate_on_failure_is_warn():
+    """Pin §C.1: on_failure=warn — fail-soft. A curation failure
+    MUST NOT block the implementing task."""
+    assert default_registry().get("memory-curate").on_failure == "warn"
+
+
+def test_memory_curate_gate_parallel_safe_is_False():
+    """Pin §C.1: parallel_safe=False so the runner's post-process
+    step (E.4) mutates the memory dir sequentially after the gate
+    returns."""
+    assert default_registry().get("memory-curate").parallel_safe is False
+
+
+def test_memory_curate_gate_when_is_always():
+    assert default_registry().get("memory-curate").when == ("always",)
+
+
+def test_memory_curate_gate_timeout_is_10_minutes():
+    assert default_registry().get("memory-curate").timeout_minutes == 10
+
+
+def test_memory_curate_gate_prompt_template_is_an_existing_file():
+    g = default_registry().get("memory-curate")
+    p = Path(g.prompt_template)
+    assert p.is_absolute()
+    assert p.is_file()
+    assert p.name == "memory-curate.md"
+
+
+def test_memory_curate_template_has_VERDICT_PASS_pin():
+    g = default_registry().get("memory-curate")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "VERDICT: PASS" in body or "Verdict: PASS" in body
+
+
+def test_memory_curate_template_references_memory_dir_placeholder():
+    """Pin §C.2: the template body contains the literal
+    `{memory_dir}` placeholder so AgentGate.run() can substitute
+    it with the per-task memory dir."""
+    g = default_registry().get("memory-curate")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "{memory_dir}" in body
+
+
+def test_build_memory_curate_gate_returns_a_fresh_Gate():
+    g1 = _build_memory_curate_gate()
+    g2 = _build_memory_curate_gate()
+    assert g1.kind == g2.kind == "agent"
+    assert g1.model == g2.model == "sonnet"
+    assert g1 == g2
+
+
+def test_build_memory_curate_gate_does_NOT_register_on_call():
+    before = set(default_registry().names())
+    _build_memory_curate_gate()
+    _build_memory_curate_gate()
+    after = set(default_registry().names())
+    assert before == after
+
+
+def test_memory_curate_gate_template_path_is_under_gates_templates_dir():
+    g = default_registry().get("memory-curate")
+    p = Path(g.prompt_template)
+    assert p.parent.name == "templates"
+    assert p.parent.parent.name == "gates"
+
+
+def test_memory_curate_template_body_starts_with_recognizable_header():
+    g = default_registry().get("memory-curate")
+    body = Path(g.prompt_template).read_text(encoding="utf-8")
+    assert "memory-curate" in body.lower() or "memory curat" in body.lower()
+
+
+def test_three_built_in_agent_gates_coexist_on_default_registry():
+    """Pin §C.1: T15's test-critique, T16's security-auditor, AND
+    T16's memory-curate all coexist on the singleton after import."""
+    names = default_registry().names()
+    assert "test-critique" in names
+    assert "security-auditor" in names
+    assert "memory-curate" in names

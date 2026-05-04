@@ -27,6 +27,21 @@ You have access to these MCP tools:
 If any of these tools is unavailable, emit `VERDICT: FAIL` with
 "Playwright MCP not available" as the reason.
 
+## Implementation diff
+
+The runner has written the implementation diff to `{diff_path}`.
+While this gate primarily exercises the LIVE app (not the diff —
+see the "No production-relevant changes in the diff" special case
+below), reading the diff helps you SCOPE the audit:
+
+- New routes mentioned in the diff → exercise those specifically
+  in addition to the project's persona-named routes.
+- New components / changed selectors → focus contrast / structure
+  / focus-visible checks on them.
+- An empty `diff.patch` (no-op task) means use the standard route
+  discovery — `/` and any in-page navigation links. Still run all
+  three viewports.
+
 ## Steps
 
 1. Identify the key flows to verify. The project's persona
@@ -221,3 +236,49 @@ app; don't speculate about CSS the agent didn't actually check.
 False positives waste implementer budget; false negatives ship
 design regressions. When in doubt about severity, surface it as
 Medium and let the implementer judge.
+
+### Structured findings appendix (recommended)
+
+After the markdown verdict and findings sections above, optionally
+emit a machine-readable findings appendix between these exact
+HTML-comment markers:
+
+<!-- BEGIN_FINDINGS_JSON -->
+[
+  {
+    "finding_letter": "A",
+    "viewport": "320x800",
+    "selectors": ["html"],
+    "risk": "horizontal scroll on mobile causes content cut-off"
+  },
+  {
+    "finding_letter": "C",
+    "viewport": "320x800",
+    "selectors": ["button.submit", "a.nav-link"],
+    "risk": "touch targets below 44 CSS-px on mobile cause mis-taps"
+  }
+]
+<!-- END_FINDINGS_JSON -->
+
+Per-finding schema (each element is a JSON object):
+
+- `finding_letter`: one of `A`–`F`, matching the category letters
+  above (A: horizontal scroll, B: semantic structure, C: touch
+  targets, D: focus rings, E: contrast, F: overflow).
+- `viewport`: viewport size in `<W>x<H>` format. Common values:
+  `320x800`, `768x1024`, `1280x800`. List the worst-case viewport
+  if the finding manifests on multiple.
+- `selectors`: list of CSS selectors or DOM identifiers naming the
+  affected elements. May be a single selector or several when one
+  finding hits multiple elements.
+- `risk`: one-line user-facing impact summary.
+
+Keep the markdown verdict sections — the appendix is additive.
+
+If you cannot produce structured findings — e.g., the failure is a
+single-line cause — emit an empty `[]` or omit the appendix entirely.
+The text verdict is what blocks; the appendix is for aggregation.
+
+The markers must appear EXACTLY as shown (HTML comments). They are
+invisible when the response is rendered as Markdown but extractable
+by the build tool.

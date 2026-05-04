@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-plan-execute"
-version = "0.2.0"
+version = "0.3.0"
 description = "Automated plan-review-implement workflow for Claude Code."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,8 @@ authors = [{ name = "Rachid Chabane" }]
 dependencies = [
     "pyyaml>=6.0",
     "pydantic>=2.0,<3.0",
+    "pathspec>=0.10,<2",
+    "ruamel.yaml>=0.17,<0.19",
 ]
 
 [project.optional-dependencies]

@@ -12,12 +12,25 @@ in the codebase.
    yourself. The implement step has just landed a single
    commit; HEAD should be that commit.
 
-2. Run `git diff HEAD~1 HEAD` to see the full implement diff.
-   If `HEAD~1` does not exist (first commit) or the diff is
-   empty, run `git diff` to see uncommitted changes and proceed
-   with what's there. If there is no git history at all, emit
-   `VERDICT: FAIL` with an explanation that the gate cannot
-   evaluate without a diff.
+2. Read the precomputed implementation diff at `{diff_path}`.
+   The runner wrote it immediately after the implement phase
+   (against `HEAD~1..HEAD`), so it captures the exact work this
+   gate is evaluating. Read it first — the diff is the contract
+   surface for this gate. Then read the surrounding context for
+   each changed file (not just the hunks) so you can judge
+   whether changed lines introduce a vulnerability in the broader
+   file context.
+
+   - If the file is empty, the diff is empty (no-op task —
+     docs-only change, comment-only edit, fixture-only). In
+     that case the "No production changes in the diff" special
+     case below applies; emit `VERDICT: PASS` with a one-
+     sentence Reason.
+   - If the file is missing entirely (not the runner's normal
+     behavior), run `git diff HEAD~1 HEAD` as a fallback.
+   - If neither approach yields a diff and there is no git
+     history at all, emit `VERDICT: FAIL` with an explanation
+     that the gate cannot evaluate without a diff.
 
 3. From the diff, identify which production files were added
    or modified (anything outside test directories, fixtures,
@@ -155,3 +168,55 @@ Be precise. Block only on real, diff-introduced
 vulnerabilities. False positives waste implementer budget;
 false negatives ship security regressions. When in doubt about
 severity, surface it as Medium and let the implementer judge.
+
+### Structured findings appendix (recommended)
+
+After the markdown verdict and findings sections above, optionally
+emit a machine-readable findings appendix between these exact
+HTML-comment markers:
+
+<!-- BEGIN_FINDINGS_JSON -->
+[
+  {
+    "category": "ACL",
+    "severity": "critical",
+    "file": "src/api/works.py",
+    "line": 142,
+    "evidence": "db.get_doc(id) without owner check",
+    "suggested_fix": "Add `if doc.owner_id != user.id: raise Forbidden()`."
+  },
+  {
+    "category": "Secrets",
+    "severity": "high",
+    "file": "src/config.py",
+    "line": 88,
+    "evidence": "API_KEY = \"sk-...\"",
+    "suggested_fix": "Move to environment variable; remove from source."
+  }
+]
+<!-- END_FINDINGS_JSON -->
+
+Per-finding schema (each element is a JSON object):
+
+- `category`: short string. Common values: `ACL`, `Secrets`,
+  `Injection`, `PathTraversal`, `Deserialization`, `Crypto`, `CSRF`,
+  `DataExposure`, `Supply`. Free-form — use whichever category
+  letter from "## Categories to detect" your finding belongs to.
+- `severity`: free-form string. Common values: `critical`, `high`,
+  `medium`, `low`. NOT enforced — emit whichever value matches your
+  judgment.
+- `file`: project-relative path of the affected source file.
+- `line`: integer line number of the affected line in `file`.
+- `evidence`: one-line code excerpt or quoted snippet showing the
+  vulnerability.
+- `suggested_fix`: one-line remediation.
+
+Keep the markdown verdict sections — the appendix is additive.
+
+If you cannot produce structured findings — e.g., the failure is a
+single-line cause — emit an empty `[]` or omit the appendix entirely.
+The text verdict is what blocks; the appendix is for aggregation.
+
+The markers must appear EXACTLY as shown (HTML comments). They are
+invisible when the response is rendered as Markdown but extractable
+by the build tool.

@@ -36,9 +36,12 @@ def test_invariant_entry_default_on_failure_is_block():
     assert e.on_failure == "block"
 
 
-def test_invariant_entry_default_timeout_is_10_minutes():
+def test_invariant_entry_default_timeout_is_None_after_t10():
+    """T10 (v0.3 §2.4) flipped `timeout_minutes` from `int = 10` to
+    `int | None = None`. The 10-minute default for shell/agent now
+    lives in `compile_entry` — see plans/task-10/plan.md §D2."""
     e = InvariantEntry(name="x", command="true")
-    assert e.timeout_minutes == 10
+    assert e.timeout_minutes is None
 
 
 def test_invariant_entry_default_parallel_safe_is_true():
@@ -502,3 +505,158 @@ def test_loaded_invariant_names_returns_a_copy():
     snapshot = loaded_invariant_names()
     snapshot.append("INJECTED")
     assert "INJECTED" not in _loaded_invariant_names
+
+
+# ---------------------------------------------------------------------------
+# F. InvariantEntry kind=human (T10, v0.3 §2.4)
+# ---------------------------------------------------------------------------
+#
+# Six tests pin the kind=human branch of InvariantEntry +
+# compile_entry. See plans/task-10/plan.md §6 D2 / §3 A-D.
+
+def test_invariant_entry_kind_literal_accepts_human():
+    """Pin: the kind Literal extends to ['shell', 'agent', 'human'].
+    Constructing an InvariantEntry(kind='human', ...) does not raise.
+    """
+    e = InvariantEntry(
+        name="design-review", kind="human",
+        prompt_template="Please review {diff_path}",
+    )
+    assert e.kind == "human"
+    assert e.prompt_template == "Please review {diff_path}"
+
+
+def test_invariant_entry_human_kind_passes_shell_specifier_validator():
+    """Pin §3.A: `_check_shell_specifiers` is gated on kind='shell',
+    so a kind=human entry never reaches the body. No 'split or
+    relax' refactor is needed; the kind=human enforcement lives in
+    `compile_entry`, not in the validator.
+    """
+    # No raise even with command + regex set — they are silently
+    # ignored by the kind=human compiler branch.
+    e = InvariantEntry(
+        name="x", kind="human",
+        prompt_template="please review",
+        command="echo this is ignored",
+    )
+    assert e.kind == "human"
+
+
+def test_compile_human_default_timeout_is_1440():
+    """Pin §D2: kind=human entry without `timeout_minutes` resolves
+    to 1440 (24 h) at compile time."""
+    e = InvariantEntry(
+        name="x", kind="human", prompt_template="please review",
+    )
+    g = compile_entry(e)
+    assert g.kind == "human"
+    assert g.timeout_minutes == 1440
+
+
+def test_compile_human_explicit_timeout_is_preserved():
+    """Pin §D2: kind=human entry with explicit `timeout_minutes: 30`
+    keeps 30."""
+    e = InvariantEntry(
+        name="x", kind="human", prompt_template="please review",
+        timeout_minutes=30,
+    )
+    g = compile_entry(e)
+    assert g.timeout_minutes == 30
+
+
+def test_compile_shell_default_timeout_is_10_when_unset():
+    """Pin §D2 regression: kind=shell entry without `timeout_minutes`
+    still resolves to 10 (the v0.2 default behavior, now via the
+    `is not None else 10` branch in compile_entry)."""
+    e = InvariantEntry(name="x", command="true")
+    g = compile_entry(e)
+    assert g.kind == "shell"
+    assert g.timeout_minutes == 10
+
+
+def test_compile_agent_default_timeout_is_10_when_unset():
+    """Pin §D2 regression: kind=agent entry without `timeout_minutes`
+    still resolves to 10."""
+    e = InvariantEntry(
+        name="x", kind="agent", prompt_template="please review",
+    )
+    g = compile_entry(e)
+    assert g.kind == "agent"
+    assert g.timeout_minutes == 10
+
+
+def test_compile_human_requires_prompt_template():
+    """Test (e) — `compile_entry` rejects kind=human WITHOUT
+    prompt_template with a ValueError. The error fires from
+    compile_entry, NOT from `model_validate` (per §3.A pin).
+    """
+    e = InvariantEntry(name="x", kind="human")
+    with pytest.raises(ValueError, match="kind=human requires prompt_template"):
+        compile_entry(e)
+
+
+def test_compile_human_passes_through_sentinel_path():
+    """Pin §D4: `sentinel_path` on the entry passes through to the
+    compiled Gate verbatim. Default is None.
+    """
+    e = InvariantEntry(
+        name="x", kind="human", prompt_template="please review",
+        sentinel_path="/custom/path/x.approval",
+    )
+    g = compile_entry(e)
+    assert g.sentinel_path == "/custom/path/x.approval"
+
+
+def test_compile_human_default_sentinel_path_is_None():
+    """Pin §D4: default sentinel_path is None (HumanGate computes
+    convention path at run() time)."""
+    e = InvariantEntry(
+        name="x", kind="human", prompt_template="please review",
+    )
+    g = compile_entry(e)
+    assert g.sentinel_path is None
+
+
+def test_compile_human_forces_parallel_safe_false_even_when_yaml_sets_true():
+    """Pin §C / §D2: `compile_entry` HARDCODES `parallel_safe=False`
+    for kind=human, ignoring `entry.parallel_safe`. A YAML-supplied
+    `parallel_safe: true` is silently overridden — running a human
+    gate in parallel would parallelise human attention.
+    """
+    e = InvariantEntry(
+        name="x", kind="human", prompt_template="please review",
+        parallel_safe=True,  # YAML lie — should be ignored
+    )
+    g = compile_entry(e)
+    assert g.kind == "human"
+    assert g.parallel_safe is False
+
+
+def test_compile_human_propagates_on_failure_warn():
+    """Pin: `on_failure="warn"` flows through to the compiled Gate.
+    """
+    e = InvariantEntry(
+        name="x", kind="human", prompt_template="please review",
+        on_failure="warn",
+    )
+    g = compile_entry(e)
+    assert g.on_failure == "warn"
+
+
+def test_compile_human_propagates_when_filter():
+    """Pin: `when` flows through (default = ('always',))."""
+    e = InvariantEntry(
+        name="x", kind="human", prompt_template="please review",
+        when=["task_class:ui"],
+    )
+    g = compile_entry(e)
+    assert g.when == ("task_class:ui",)
+
+
+def test_compile_human_default_when_is_always():
+    """Pin: default `when` is ('always',)."""
+    e = InvariantEntry(
+        name="x", kind="human", prompt_template="please review",
+    )
+    g = compile_entry(e)
+    assert g.when == ("always",)

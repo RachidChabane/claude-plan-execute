@@ -7,13 +7,90 @@ the `VERDICT: PASS` sentinel in the agent's response.
 """
 from __future__ import annotations
 
+import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_plan_execute.claude import run_claude
+from claude_plan_execute.colors import yellow
 from claude_plan_execute.gates import Gate, GateResult
 from claude_plan_execute.gates.shell import _tail_cap
+
+_RAW_CAP_BYTES = 16 * 1024  # 16 KB; defensive cap on _raw text in malformed-but-parsed appendix.
+
+# Findings appendix: HTML-comment-delimited JSON. Markers chosen to be
+# invisible in rendered Markdown (the dashboard renders gate output as
+# Markdown). Regex semantics:
+#   - re.DOTALL: `.` matches newlines.
+#   - non-greedy `.*?`: nearest END binds (first appendix wins).
+#   - re.search (used in _extract_findings): first match in text.
+# The `\s*` flanks strip surrounding whitespace from the captured body
+# so json.loads sees the raw JSON.
+_FINDINGS_RE = re.compile(
+    r"<!-- BEGIN_FINDINGS_JSON -->\s*(.*?)\s*<!-- END_FINDINGS_JSON -->",
+    re.DOTALL,
+)
+
+
+def _extract_findings(
+    text: str, gate_name: str, *, warn: bool = True,
+) -> tuple[list[dict] | None, dict | None]:
+    """Extract a structured findings appendix from agent text output.
+
+    Returns (findings, sidecar) where:
+
+      - findings: what to put on GateResult.findings.
+        - None when markers are absent or json.loads raised.
+        - list[dict] (possibly empty) otherwise.
+      - sidecar: what run_gates writes as the .json body.
+        - None means "do not write".
+        - {"findings": [...]} for a clean bare list.
+        - <full parsed object> for an object with findings: list[dict],
+          including any extra keys.
+        - {"findings": [], "_raw": <body, capped>} for malformed-but-
+          parsed values.
+
+    `warn=True` (default) prints yellow warnings on cases 2 and 5
+    (see plan §D1). `run_gates` calls this helper a second time with
+    `warn=False` to avoid double-warning.
+    """
+    match = _FINDINGS_RE.search(text)
+    if not match:
+        return (None, None)  # case 1: no markers
+
+    body = match.group(1)
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        if warn:
+            print(yellow(
+                f"  malformed findings JSON in {gate_name!r}; "
+                f"gate verdict unchanged"
+            ))
+        return (None, None)  # case 2: parse failed
+
+    # Case 3: bare list of dicts.
+    if isinstance(parsed, list) and all(isinstance(el, dict) for el in parsed):
+        return (parsed, {"findings": parsed})
+
+    # Case 4: object with `findings: list[dict]` — preserve full object
+    # (including extra keys like `summary`) in the sidecar.
+    if isinstance(parsed, dict):
+        inner = parsed.get("findings")
+        if isinstance(inner, list) and all(isinstance(el, dict) for el in inner):
+            return (inner, parsed)
+
+    # Case 5: anything else.
+    if warn:
+        print(yellow(
+            f"  findings appendix in {gate_name!r} not a list[dict] or "
+            f"object with findings list; treating as empty. "
+            f"gate verdict unchanged"
+        ))
+    raw_capped = _tail_cap(body, cap=_RAW_CAP_BYTES)
+    return ([], {"findings": [], "_raw": raw_capped})
 
 
 def _load_template(path_or_inline: str) -> str:
@@ -41,12 +118,32 @@ def _load_template(path_or_inline: str) -> str:
 
 @dataclass
 class AgentGate:
-    """Runner for `kind: agent` Gates."""
+    """Runner for `kind: agent` Gates.
+
+    `diff_path` (T7, v0.3) is the path to the precomputed
+    implementation diff written by the runner immediately before
+    Phase 4. The substitution `body.replace("{diff_path}",
+    self.diff_path or "")` runs after the template body is loaded
+    so agent-gate templates can reference the diff via
+    `{diff_path}` placeholder. Persona substitution still happens
+    at factory time (per gate); diff_path substitution happens
+    here at gate-run time because the diff is per-task and not
+    known until implement finishes. (Plan §D2 / §D3.)
+
+    `usage_jsonl_path` (T2, v0.3) is the path to the per-task
+    `usage.jsonl` that `run_claude` appends a row to whenever it
+    parses a `usage` event from the CLI's result. Threaded by
+    `run_gates` from `task_dir / 'usage.jsonl'`. None disables the
+    append (used by tests that don't care about telemetry).
+    """
 
     name: str
     gate: Gate
     task: dict
     cli: dict
+    diff_path: str | None = None
+    usage_jsonl_path: str | None = None
+    memory_dir: str | None = None
 
     def run(self) -> GateResult:
         if self.gate.kind != "agent":
@@ -59,6 +156,8 @@ class AgentGate:
             )
 
         body = _load_template(self.gate.prompt_template)
+        body = body.replace("{diff_path}", self.diff_path or "")
+        body = body.replace("{memory_dir}", self.memory_dir or "")
         prompt = (
             f"You are running a post-implement gate for the "
             f"following task.\n\n"
@@ -75,13 +174,23 @@ class AgentGate:
             timeout_minutes=self.gate.timeout_minutes,
             skip_permissions=self.cli.get("skip_permissions", False),
             verbose=self.cli.get("verbose", False),
+            phase=f"gate:{self.name}",
+            usage_jsonl_path=self.usage_jsonl_path,
         )
         passed = "verdict: pass" in (text or "").lower()
+        output_capped = _tail_cap(text or "")
+        # T11: extract structured findings appendix (if present) from
+        # the SAME post-tail-cap text that run_gates writes to disk and
+        # re-extracts from. Both call sites must see the same input;
+        # see plan §6.1 "AgentGate passes output_capped to
+        # _extract_findings" pin.
+        findings, _ = _extract_findings(output_capped, self.name)
         return GateResult(
             name=self.name,
             passed=passed,
-            output=_tail_cap(text or ""),
+            output=output_capped,
             output_path=None,
             duration_seconds=time.time() - start,
             on_failure=self.gate.on_failure,
+            findings=findings,
         )

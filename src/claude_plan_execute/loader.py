@@ -109,7 +109,8 @@ def effective_defaults(tasks_file: TasksFile) -> dict:
       `implement_timeout_minutes`). Caps wins over a directly-set legacy
       value (S2). Deprecation warning was already emitted at load.
     - Expands `caps.max_review_rounds`, `caps.max_implement_turns`,
-      `caps.max_attempts` into resolver-friendly keys.
+      `caps.max_attempts`, `caps.max_rate_limit_retries`, and
+      `caps.rate_limit_base_backoff_seconds` into resolver-friendly keys.
     - Injects `on_max_review_rounds: "auto_approve"` for v1 / no-version
       files when the user hasn't set it explicitly (task 6 §D1).
     - Injects `gates: ["tests"]` for v1 / no-version files when the
@@ -131,6 +132,12 @@ def effective_defaults(tasks_file: TasksFile) -> dict:
             out["implement_max_turns"] = caps.max_implement_turns
         if caps.max_attempts is not None:
             out["max_attempts"] = caps.max_attempts
+        if caps.max_rate_limit_retries is not None:
+            out["max_rate_limit_retries"] = caps.max_rate_limit_retries
+        if caps.rate_limit_base_backoff_seconds is not None:
+            out["rate_limit_base_backoff_seconds"] = (
+                caps.rate_limit_base_backoff_seconds
+            )
 
     if "on_max_review_rounds" not in out:
         if tasks_file.version is None or tasks_file.version == 1:

@@ -5,6 +5,8 @@ string sent to the `claude` CLI as the `-p` argument.
 """
 from __future__ import annotations
 
+import re
+
 
 # Per-attempt verbatim is already capped at 4 KB by `make_failure_record`
 # at write time. Block-level cap applies to the whole rendered failure-
@@ -21,6 +23,100 @@ _VERBATIM_LABEL_HINTS: dict[str, str] = {
     "implementer_timeout":              "stderr",
     "implementer_max_turns":            "CLI output",
 }
+
+
+# T15 (v0.3 §"cross-task-memory"). Each per-phase block is injected
+# inside the body string of its respective builder. Keep wording
+# tight — every byte ships in every prompt.
+
+_MEMORY_SECTION_PLAN = """## Memory
+
+You have a project memory directory auto-loaded by Claude Code at
+session start (`~/.claude/projects/<encoded-cwd>/memory/MEMORY.md`).
+Before planning:
+1. Read the loaded MEMORY.md, especially entries with type `feedback`
+   or `project` — these capture pitfalls and constraints discovered
+   in earlier tasks.
+2. Apply any learnings that bear on this task's design choices.
+3. When a memory drives a step in your plan, ANNOTATE that step with
+   `[MEM: <memory_name>]` (using the exact memory file's `name`
+   slug). The runner counts these citations to decide which memories
+   stay relevant.
+
+"""
+
+_MEMORY_SECTION_REVIEW = """## Memory
+
+The project memory directory (`~/.claude/projects/<encoded-cwd>/
+memory/`) is auto-loaded for this session. Before reviewing:
+1. Cross-check the plan against MEMORY.md, especially entries with
+   type `feedback` or `project`. Flag plans that contradict an
+   accepted learning (e.g., "the plan does X, but memory entry
+   `feedback_pydantic_v2` says Y").
+2. Verify every `[MEM: <name>]` citation in the plan resolves to a
+   real, currently-live memory file in the directory. Hallucinated
+   names are a NEEDS_REVISION issue.
+
+"""
+
+_MEMORY_SECTION_IMPLEMENT = """## Memory
+
+You have four prompt-overlay layers feeding this session. Pick the
+right one when persisting knowledge:
+
+  1. `docs/persona.md` (hand-curated): stable conventions.
+  2. `docs/decisions/` (hand-curated): ADR-style architectural
+     choices.
+  3. `~/.claude/projects/<encoded-cwd>/memory/MEMORY.md` + per-memory
+     files (agent-curated, auto-loaded): tactical pitfalls discovered
+     in flight. THIS is the layer you write to.
+  4. failure_context (runner-injected, transient): per-attempt prior
+     failure verbatim.
+
+If during this implementation you discover a non-obvious pitfall,
+gotcha, or trick worth saving for future tasks, save it as a memory
+using the standard Claude Code pattern.
+
+FRONTMATTER REQUIRED on every new memory:
+
+```
+---
+name: <slug>
+description: <one-line — used to decide relevance in future tasks>
+type: user|feedback|project|reference
+lifecycle: evergreen | slate:<slate-id> | task:<id>
+citation_count: 0
+---
+```
+
+DEFAULT LIFECYCLE BY TYPE (override only when you know better):
+  - type=project   -> lifecycle: slate:$CLAUDE_PLAN_EXECUTE_SLATE_ID
+  - type=feedback  -> lifecycle: evergreen
+  - type=reference -> lifecycle: evergreen
+  - type=user      -> lifecycle: evergreen
+
+The current slate id is exposed via the env var
+`CLAUDE_PLAN_EXECUTE_SLATE_ID`. Read it with `echo
+$CLAUDE_PLAN_EXECUTE_SLATE_ID` (or via Bash). Override default ->
+explicit (e.g., `lifecycle: task:8`) when the lesson applies only
+until a specific task lands.
+
+WARNING — `lifecycle: task:<N>` footgun: N must be STRICTLY GREATER
+than the current task id. Memories scoped to the CURRENT task
+(`task:<self>`) are pruned at this task's success boundary and will
+NEVER reach the next planner. If your lesson is meant to die at the
+end of this task, just don't write it; if it should survive into the
+next planning round, choose `evergreen` or `task:<future_id>`.
+
+TERSENESS BUDGET: title <= 60 chars, body <= 5 lines.
+
+DO NOT SAVE:
+  - trivia or one-off task state;
+  - restated `docs/persona.md` content;
+  - project-state recap of what just changed in code (that belongs
+    in commit messages, not memory).
+
+"""
 
 
 def build_persona_section(persona: str, persona_extra: str = "") -> str:
@@ -192,6 +288,7 @@ def build_plan_prompt(
         )
 
     return failure_context + persona + decisions + (
+        _MEMORY_SECTION_PLAN +
         f"You are planning the implementation of a task in this codebase.\n"
         f"Read all relevant files before producing your plan.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"
@@ -222,6 +319,7 @@ def build_review_prompt(task: dict, plan_path: str, review_path: str,
         )
 
     return persona + (
+        _MEMORY_SECTION_REVIEW +
         f"You are reviewing an implementation plan.\n"
         f"Your job is to find problems, gaps, and risks BEFORE implementation.\n\n"
         f"TASK {task['id']}: {task['title']}\n\n"
@@ -261,15 +359,126 @@ def build_revise_prompt(task: dict, plan_path: str, review_path: str,
 def build_implement_prompt(task: dict, plan_path: str,
                            commit_message: str, *, persona: str = "",
                            failure_context: str = "") -> str:
+    tid = task["id"]
+    progress_path = f"plans/task-{tid}/progress.md"
     return failure_context + persona + (
+        _MEMORY_SECTION_IMPLEMENT +
         f"You are implementing a validated plan.\n"
         f"The plan has been reviewed and approved. Follow it precisely.\n\n"
-        f"TASK {task['id']}: {task['title']}\n\n"
+        f"TASK {tid}: {task['title']}\n\n"
         f"Read the validated plan at: {plan_path}\n\n"
         f"INSTRUCTIONS:\n"
         f"1. Read the plan completely before starting.\n"
         f"2. Implement every item in the plan, in order.\n"
-        f"3. Commit with message:\n"
+        f"3. Work in commit-sized chunks. After each logically-complete\n"
+        f"   chunk, run:\n"
+        f"     git add -A && git commit -m \"task-{tid} WIP: <chunk-description>\"\n"
+        f"   Continue with the next chunk.\n"
+        f"4. Maintain a checklist at {progress_path} with one item per\n"
+        f"   plan step. Mark items as you go:\n"
+        f"     [ ] not started\n"
+        f"     [~] in progress\n"
+        f"     [x] done\n"
+        f"   Update the file BEFORE each commit so the on-disk state matches\n"
+        f"   what's committed.\n"
+        f"5. If you sense the turn budget is running low, commit the current\n"
+        f"   chunk, update {progress_path}, and finish the session cleanly\n"
+        f"   (do NOT start a new chunk you can't finish). The runner detects\n"
+        f"   the partial progress and resumes on the next invocation.\n"
+        f"6. After every chunk is committed and the checklist reads all\n"
+        f"   [x], create the final commit with message:\n"
         f"   {commit_message}\n\n"
         f"Do not skip any part of the plan. Do not add unplanned features.\n"
     )
+
+
+def build_resume_prompt(
+    task: dict,
+    plan_path: str,
+    progress_path: str,
+    progress_md_text: str,
+    dirty_tree_porcelain: str,
+    commit_message: str,
+    *,
+    persona: str = "",
+    failure_context: str = "",
+) -> str:
+    """Build the Implement-phase prompt for a resume run.
+
+    Pure: no I/O. The runner pre-reads `progress.md` and runs
+    `git status --porcelain`, passing both as strings. Composition order
+    matches `build_implement_prompt`: `failure_context + persona + body`.
+    `dirty_tree_porcelain` may be the empty string when the working
+    tree is clean — the builder renders a clean-tree section in that
+    case.
+    """
+    tid = task["id"]
+    if dirty_tree_porcelain.strip():
+        dirty_section = (
+            f"## Uncommitted hunks detected\n\n"
+            f"`git status --porcelain` reports the following uncommitted\n"
+            f"changes from the prior session:\n\n"
+            f"```\n{dirty_tree_porcelain.rstrip()}\n```\n\n"
+            f"Before continuing the next chunk, choose ONE:\n"
+            f"  (a) Commit them as the next chunk:\n"
+            f"      git add -A && git commit -m \"task-{tid} WIP: <chunk-description>\"\n"
+            f"  (b) Revert them with a brief explanation in your reply\n"
+            f"      (`git restore -SW .` for tracked changes; `git clean\n"
+            f"      -fd` for untracked).\n"
+            f"Do NOT begin new work while uncommitted hunks remain — they\n"
+            f"will be lost or conflated with the next chunk's diff.\n\n"
+        )
+    else:
+        dirty_section = (
+            f"## Working tree is clean\n\n"
+            f"`git status --porcelain` reports no uncommitted changes.\n"
+            f"Continue with the next [~] or [ ] item below.\n\n"
+        )
+    return failure_context + persona + (
+        f"You are RESUMING an in-progress implementation.\n"
+        f"A prior session was interrupted (turn budget, timeout, or\n"
+        f"manual stop). The plan has already been reviewed and approved;\n"
+        f"earlier chunks have been committed as `task-{tid} WIP: ...`.\n\n"
+        f"TASK {tid}: {task['title']}\n\n"
+        f"Read the validated plan at: {plan_path}\n"
+        f"Read the existing checklist at: {progress_path}\n\n"
+        f"## Current checklist (from {progress_path})\n\n"
+        f"```\n{progress_md_text.rstrip()}\n```\n\n"
+        f"{dirty_section}"
+        f"INSTRUCTIONS:\n"
+        f"1. Re-read the plan and the checklist to orient.\n"
+        f"2. Continue with the FIRST item marked [~] (in progress) or\n"
+        f"   [ ] (not started). Do not redo items already marked [x].\n"
+        f"3. Work in commit-sized chunks. After each logically-complete\n"
+        f"   chunk, run:\n"
+        f"     git add -A && git commit -m \"task-{tid} WIP: <chunk-description>\"\n"
+        f"4. Update {progress_path} BEFORE each commit so the on-disk\n"
+        f"   state matches what's committed.\n"
+        f"5. If you sense the turn budget is running low, commit the\n"
+        f"   current chunk, update {progress_path}, and finish cleanly.\n"
+        f"6. After every checklist item reads [x], create the final\n"
+        f"   commit with message:\n"
+        f"   {commit_message}\n\n"
+        f"Do not re-plan. Do not add unplanned features. Treat the\n"
+        f"existing plan as authoritative; flag any discovered gaps in\n"
+        f"a follow-up but do not expand scope here.\n"
+    )
+
+
+_PROGRESS_ITEM_RE = re.compile(r"^\s*[-*+]\s*\[([ x~])\]", re.MULTILINE)
+
+
+def parse_progress_status(text: str) -> tuple[int, int, int]:
+    """Count [x] / [~] / [ ] markers in a progress.md body.
+
+    Returns (n_done, n_in_progress, n_pending). Markers must appear at
+    the start of a list item (-, *, or +) optionally preceded by
+    whitespace. Other markdown (headings, paragraphs, fenced blocks)
+    is ignored. Capital `X` is NOT recognized — the prompt mandates
+    lowercase. Pure: no I/O.
+    """
+    matches = _PROGRESS_ITEM_RE.findall(text)
+    n_done = sum(1 for m in matches if m == "x")
+    n_in_progress = sum(1 for m in matches if m == "~")
+    n_pending = sum(1 for m in matches if m == " ")
+    return n_done, n_in_progress, n_pending

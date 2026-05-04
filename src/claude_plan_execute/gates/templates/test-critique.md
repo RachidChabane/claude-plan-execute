@@ -10,12 +10,23 @@ actual contract being delivered.
    yourself. The implement step has just landed a single
    commit; HEAD should be that commit.
 
-2. Run `git diff HEAD~1 HEAD` to see the full implement diff.
-   If `HEAD~1` does not exist (first commit) or the diff is
-   empty, run `git diff` to see uncommitted changes and proceed
-   with what's there. If there is no git history at all, emit
-   `VERDICT: FAIL` with an explanation that the gate cannot
-   evaluate without a diff.
+2. Read the precomputed implementation diff at `{diff_path}`.
+   The runner wrote it immediately after the implement phase
+   (against `HEAD~1..HEAD`), so it captures the exact work this
+   gate is evaluating. Read it before reading source files —
+   the diff is the contract surface for this gate.
+
+   - If the file is empty, the diff is empty (no-op task —
+     docs-only change, refactor with full coverage, trivial
+     fix). In that case fall back to reading source files
+     directly to evaluate the change. (Note: on a true no-op,
+     the "Special cases / Zero new tests in the diff" guidance
+     below still applies.)
+   - If the file is missing entirely (not the runner's normal
+     behavior), run `git diff HEAD~1 HEAD` as a fallback.
+   - If neither approach yields a diff and there is no git
+     history at all, emit `VERDICT: FAIL` with an explanation
+     that the gate cannot evaluate without a diff.
 
 3. From the diff, identify which test files were added or
    modified. Test files typically live under `tests/`,
@@ -93,3 +104,45 @@ Be precise. Block only when the tests would let real
 regressions through. False positives waste implementer budget;
 false negatives waste reviewer attention. Aim for the right
 verdict, not the safe one.
+
+### Structured findings appendix (recommended)
+
+After the markdown verdict and suggested-cases sections above,
+optionally emit a machine-readable findings appendix between these
+exact HTML-comment markers:
+
+<!-- BEGIN_FINDINGS_JSON -->
+[
+  {
+    "missing_test_for": "User cannot read another user's document",
+    "contract": "GET /docs/<id> returns 403 when user.id != doc.owner_id",
+    "suggested_test_name": "test_get_doc_returns_403_for_non_owner"
+  },
+  {
+    "missing_test_for": "Pagination boundary at end of list",
+    "contract": "page=N+1 returns empty list, not 404",
+    "suggested_test_name": "test_list_docs_page_past_end_returns_empty"
+  }
+]
+<!-- END_FINDINGS_JSON -->
+
+Per-finding schema (each element is a JSON object):
+
+- `missing_test_for`: one-line description of the contract or
+  behavior the existing tests do not exercise.
+- `contract`: one-line restatement of what the new behavior
+  promises (e.g., the input → output relationship that should be
+  pinned).
+- `suggested_test_name`: snake_case test name following the
+  project's existing convention (typically
+  `test_<unit>_<scenario>_<expected_outcome>`).
+
+Keep the markdown verdict sections — the appendix is additive.
+
+If you cannot produce structured findings — e.g., the failure is a
+single-line cause — emit an empty `[]` or omit the appendix entirely.
+The text verdict is what blocks; the appendix is for aggregation.
+
+The markers must appear EXACTLY as shown (HTML comments). They are
+invisible when the response is rendered as Markdown but extractable
+by the build tool.
