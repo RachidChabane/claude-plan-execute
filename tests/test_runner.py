@@ -32,6 +32,7 @@ def _reset_module_globals():
     claude._active_child = None
     claude._last_run_timed_out = False
     claude._last_run_subtype = None
+    claude._last_run_rate_limited = False
     runner._current_state = None
     runner._current_task_id = 0
     runner._current_phase = "plan"
@@ -39,6 +40,7 @@ def _reset_module_globals():
     claude._active_child = None
     claude._last_run_timed_out = False
     claude._last_run_subtype = None
+    claude._last_run_rate_limited = False
     runner._current_state = None
     runner._current_task_id = 0
     runner._current_phase = "plan"
@@ -670,6 +672,226 @@ def test_run_claude_resets_timed_out_flag_at_call_entry(monkeypatch):
         skip_permissions=False, verbose=False,
     )
     assert claude._last_run_timed_out is False
+
+
+# ---------------------------------------------------------------------------
+# D2. run_claude rate-limit retry (v0.3 task 1)
+# ---------------------------------------------------------------------------
+
+
+def _patch_run_claude_once(monkeypatch, responses):
+    """Drive run_claude with a deterministic sequence of (code, text, stderr)
+    tuples. Returns (helper_calls, sleep_calls)."""
+    helper_calls = []
+    sleep_calls = []
+
+    def fake_once(prompt, **kwargs):
+        i = len(helper_calls)
+        helper_calls.append(kwargs)
+        if i >= len(responses):
+            raise AssertionError(
+                f"_run_claude_once called more times than expected "
+                f"(got {i + 1}, expected {len(responses)})"
+            )
+        code, text, stderr = responses[i]
+        # Simulate side-channel flags exactly like the real helper would:
+        # reset at entry, set timed_out only on the explicit timeout sentinel.
+        claude._last_run_timed_out = (code == 1 and text == "" and stderr == "TIMEOUT")
+        claude._last_run_subtype = None
+        return code, text, "" if stderr == "TIMEOUT" else stderr
+
+    monkeypatch.setattr("claude_plan_execute.claude._run_claude_once", fake_once)
+    monkeypatch.setattr(
+        "claude_plan_execute.claude.time.sleep",
+        lambda s: sleep_calls.append(s),
+    )
+    return helper_calls, sleep_calls
+
+
+def test_run_claude_success_first_attempt_no_retry(monkeypatch):
+    helper_calls, sleeps = _patch_run_claude_once(monkeypatch, [
+        (0, "ok", ""),
+    ])
+    code, text = run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert (code, text) == (0, "ok")
+    assert len(helper_calls) == 1
+    assert sleeps == []
+    assert claude._last_run_rate_limited is False
+
+
+def test_run_claude_one_rate_limit_then_success(monkeypatch):
+    helper_calls, sleeps = _patch_run_claude_once(monkeypatch, [
+        (1, "", "rate_limit_error: too many requests"),
+        (0, "ok", ""),
+    ])
+    code, text = run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert (code, text) == (0, "ok")
+    assert len(helper_calls) == 2
+    assert sleeps == [60]
+    assert claude._last_run_rate_limited is False
+
+
+def test_run_claude_all_retries_exhausted_sets_flag(monkeypatch):
+    helper_calls, sleeps = _patch_run_claude_once(monkeypatch, [
+        (1, "", "Anthropic API rate limit reached"),
+        (1, "", "rate_limit_error"),
+        (1, "", "429 Too Many Requests"),
+        (1, "", "Retry-After: 60"),
+    ])
+    code, text = run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert (code, text) == (1, "")
+    assert len(helper_calls) == 4
+    assert sleeps == [60, 120, 240]
+    assert claude._last_run_rate_limited is True
+
+
+def test_run_claude_non_rate_limit_failure_not_retried(monkeypatch):
+    helper_calls, sleeps = _patch_run_claude_once(monkeypatch, [
+        (1, "", "compile error: undefined symbol"),
+    ])
+    code, text = run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert (code, text) == (1, "")
+    assert len(helper_calls) == 1
+    assert sleeps == []
+    assert claude._last_run_rate_limited is False
+
+
+def test_run_claude_timeout_does_not_consume_rate_limit_budget(monkeypatch):
+    """A timeout must short-circuit the retry loop: 1 attempt, 0 sleeps,
+    `_last_run_timed_out=True`, `_last_run_rate_limited=False`. Otherwise
+    a 60-minute timeout would block on three more 60s sleeps."""
+    helper_calls, sleeps = _patch_run_claude_once(monkeypatch, [
+        (1, "", "TIMEOUT"),
+    ])
+    code, text = run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert (code, text) == (1, "")
+    assert len(helper_calls) == 1
+    assert sleeps == []
+    assert claude._last_run_timed_out is True
+    assert claude._last_run_rate_limited is False
+
+
+def test_run_claude_max_retries_zero_disables_rate_limit_awareness(monkeypatch):
+    """Pin §D5.3 opt-out branch: 0 retries → rate-limit detection
+    skipped entirely; pre-task behavior preserved."""
+    helper_calls, sleeps = _patch_run_claude_once(monkeypatch, [
+        (1, "", "rate_limit_error"),
+    ])
+    code, text = run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+        max_rate_limit_retries=0,
+    )
+    assert (code, text) == (1, "")
+    assert len(helper_calls) == 1
+    assert sleeps == []
+    assert claude._last_run_rate_limited is False
+
+
+@pytest.mark.parametrize("stderr_text", [
+    "RATE_LIMIT_ERROR: blah",
+    "ratE_limiT_error",
+    "HTTP 429 returned",
+    "Anthropic API rate limit hit",
+    "anthropic api rate limit",
+    "Retry-After: 30",
+    "retry-after: 30",
+])
+def test_run_claude_rate_limit_pattern_match_is_case_insensitive(
+    monkeypatch, stderr_text,
+):
+    helper_calls, sleeps = _patch_run_claude_once(monkeypatch, [
+        (1, "", stderr_text),
+        (0, "ok", ""),
+    ])
+    code, _ = run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert code == 0
+    assert sleeps == [60]
+
+
+def test_run_claude_exponential_backoff_doubles_per_attempt(monkeypatch):
+    helper_calls, sleeps = _patch_run_claude_once(monkeypatch, [
+        (1, "", "rate_limit_error")
+    ] * 5 + [(0, "ok", "")])
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+        max_rate_limit_retries=5, rate_limit_base_backoff_seconds=10,
+    )
+    # 5 retries → 6 attempts; sequence succeeds on attempt 6.
+    assert sleeps == [10, 20, 40, 80, 160]
+
+
+def test_run_claude_retry_banner_format(monkeypatch, capsys):
+    _patch_run_claude_once(monkeypatch, [
+        (1, "", "rate_limit_error"),
+        (0, "ok", ""),
+    ])
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    out = capsys.readouterr().out
+    assert "Rate-limited; waiting 60s before retry 2/4" in out
+
+
+def test_run_claude_exhaustion_banner_format(monkeypatch, capsys):
+    _patch_run_claude_once(monkeypatch, [
+        (1, "", "rate_limit_error"),
+    ] * 4)
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    out = capsys.readouterr().out
+    assert "Rate-limit retries exhausted after 4 attempts." in out
+
+
+def test_run_claude_resets_rate_limited_flag_at_entry(monkeypatch):
+    """A clean call after a prior exhaustion must clear the flag."""
+    claude._last_run_rate_limited = True  # leftover
+    _patch_run_claude_once(monkeypatch, [
+        (0, "ok", ""),
+    ])
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1, timeout_minutes=1,
+        skip_permissions=False, verbose=False,
+    )
+    assert claude._last_run_rate_limited is False
+
+
+def test_is_rate_limited_matches_each_pattern():
+    from claude_plan_execute.claude import _is_rate_limited
+    for txt in ["rate_limit_error", "429", "anthropic api rate limit", "retry-after"]:
+        assert _is_rate_limited(txt) is True
+
+
+def test_is_rate_limited_returns_false_on_empty_stderr():
+    from claude_plan_execute.claude import _is_rate_limited
+    assert _is_rate_limited("") is False
+
+
+def test_is_rate_limited_returns_false_on_unrelated_text():
+    from claude_plan_execute.claude import _is_rate_limited
+    assert _is_rate_limited("syntax error: undefined name 'x'") is False
 
 
 # ---------------------------------------------------------------------------
@@ -1932,6 +2154,200 @@ def test_handle_sigint_still_prints_resume_command(monkeypatch, capsys, tmp_path
         handle_sigint(2, None)
     out = capsys.readouterr().out
     assert "--task 7 --skip-to implement" in out
+
+
+# --- L.6: rate-limit exhaustion records FailureRecord (v0.3 task 1) -------
+
+
+def _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch):
+    """Stub that simulates the wrapper exhausting all retries: sets
+    `_last_run_rate_limited=True`, returns (1, '')."""
+    called = []
+
+    def stub(*args, **kwargs):
+        called.append((args, kwargs))
+        claude._last_run_timed_out = False
+        claude._last_run_subtype = None
+        claude._last_run_rate_limited = True
+        return 1, ""
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    return called
+
+
+def test_implement_rate_limit_records_failure(monkeypatch, tmp_path):
+    """Pin §D6: rate_limited FailureRecord written when
+    claude._last_run_rate_limited is True after Phase 3 run_claude."""
+    _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "rate_limited"
+    assert attempts[0]["phase"] == "implement"
+
+
+def test_implement_rate_limit_sets_blocked_status(monkeypatch, tmp_path):
+    _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert entry.get("block_reason") == "rate_limited"
+
+
+def test_implement_rate_limit_does_NOT_run_gates(monkeypatch, tmp_path):
+    """Mirror the implementer_timeout test: rate-limit return short-circuits
+    the gates phase."""
+    _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["tests"]},
+        cli={}, skip_to="implement",
+    )
+    # No "gate failed" attempt was appended; only the rate-limit one.
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "rate_limited"
+
+
+def test_implement_rate_limit_takes_priority_over_timeout(monkeypatch, tmp_path):
+    """If both `_last_run_rate_limited=True` AND `_last_run_timed_out=True`
+    were set (theoretically impossible by §D5 exit guards, but defensive),
+    the rate-limit branch runs first."""
+    def stub(*args, **kwargs):
+        claude._last_run_timed_out = True       # spurious
+        claude._last_run_rate_limited = True    # authoritative
+        return 1, ""
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "rate_limited"
+
+
+def test_plan_phase_rate_limit_records_failure(monkeypatch, tmp_path):
+    """Plan-phase rate-limit exhaustion records a rate_limited
+    FailureRecord with phase='plan'. The plan file was never written, so
+    artifacts['plan'] is absent."""
+    _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={},
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "rate_limited"
+    assert attempts[0]["phase"] == "plan"
+    assert "plan" not in attempts[0]["artifacts"]
+    assert state.get(1)["status"] == "blocked"
+    assert state.get(1).get("block_reason") == "rate_limited"
+
+
+def test_review_phase_rate_limit_records_failure(monkeypatch, tmp_path):
+    """Review-phase rate-limit exhaustion records phase='review'."""
+    _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch)
+    plan_dir = tmp_path / "task-1"
+    plan_dir.mkdir()
+    (plan_dir / "plan.md").write_text("placeholder plan")
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="review",
+    )
+    attempts = state.get(1)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure_class"] == "rate_limited"
+    assert attempts[0]["phase"] == "review"
+    assert "plan" in attempts[0]["artifacts"]
+
+
+def test_rate_limit_failure_reason_includes_attempt_count(monkeypatch, tmp_path):
+    """Pin: the reason string mentions the total attempts (retries + 1).
+    With default max_rate_limit_retries=3 → '4 attempts'."""
+    _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    reason = state.get(1)["attempts"][0]["reason"]
+    assert "4 attempts" in reason
+
+
+def test_execute_task_resolved_config_includes_rate_limit_keys(monkeypatch, tmp_path):
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["max_rate_limit_retries"] == {"value": 3, "from": "hardcoded"}
+    assert cfg["rate_limit_base_backoff_seconds"] == {"value": 60, "from": "hardcoded"}
+
+
+def test_execute_task_resolved_config_rate_limit_from_caps(monkeypatch, tmp_path):
+    """After loader.effective_defaults expands caps, the resolver labels
+    them as project_defaults."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_rate_limit_retries": 5,           # post-effective_defaults
+            "rate_limit_base_backoff_seconds": 30,
+        },
+        cli={}, dry_run=True,
+    )
+    cfg = _read_resolved_config(tmp_path, 1)
+    assert cfg["max_rate_limit_retries"] == {"value": 5, "from": "project_defaults"}
+    assert cfg["rate_limit_base_backoff_seconds"] == {"value": 30, "from": "project_defaults"}
+
+
+def test_execute_task_passes_rate_limit_kwargs_to_run_claude(monkeypatch, tmp_path):
+    captured = {}
+
+    def stub(*args, **kwargs):
+        captured.update(kwargs)
+        claude._last_run_timed_out = False
+        claude._last_run_subtype = "success"
+        claude._last_run_rate_limited = False
+        return 0, ""
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_rate_limit_retries": 7,
+            "rate_limit_base_backoff_seconds": 45,
+        },
+        cli={}, skip_to="implement",
+    )
+    assert captured.get("max_rate_limit_retries") == 7
+    assert captured.get("rate_limit_base_backoff_seconds") == 45
 
 
 # ---------------------------------------------------------------------------

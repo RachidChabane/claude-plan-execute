@@ -389,6 +389,93 @@ def test_effective_defaults_expands_caps_max_review_rounds(tmp_path, capsys):
     assert eff["max_attempts"] == 3
 
 
+# --- C2. Caps rate-limit fields (v0.3 task 1) ------------------------------
+
+
+def test_caps_accepts_new_rate_limit_fields():
+    c = Caps(
+        max_rate_limit_retries=5,
+        rate_limit_base_backoff_seconds=30,
+    )
+    assert c.max_rate_limit_retries == 5
+    assert c.rate_limit_base_backoff_seconds == 30
+
+
+def test_caps_new_fields_default_to_none():
+    c = Caps()
+    assert c.max_rate_limit_retries is None
+    assert c.rate_limit_base_backoff_seconds is None
+
+
+def test_v2_with_rate_limit_caps_validates_clean(tmp_path):
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  caps:\n"
+        "    max_rate_limit_retries: 5\n"
+        "    rate_limit_base_backoff_seconds: 30\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    assert tf.defaults.caps.max_rate_limit_retries == 5
+    assert tf.defaults.caps.rate_limit_base_backoff_seconds == 30
+
+
+def test_extra_key_under_caps_suggests_max_rate_limit_retries(tmp_path, capsys):
+    """Typo correction surfaces the new key as a suggestion."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  caps:\n"
+        "    max_rate_limit_retri: 3\n"   # typo
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        loader.load_tasks_file(p)
+    err = capsys.readouterr().err
+    assert "max_rate_limit_retri" in err
+    assert "max_rate_limit_retries" in err  # suggestion text
+
+
+def test_effective_defaults_expands_rate_limit_caps(tmp_path):
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  caps:\n"
+        "    max_rate_limit_retries: 7\n"
+        "    rate_limit_base_backoff_seconds: 45\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert eff["max_rate_limit_retries"] == 7
+    assert eff["rate_limit_base_backoff_seconds"] == 45
+
+
+def test_effective_defaults_omits_rate_limit_keys_when_caps_unset(tmp_path):
+    """When caps don't set the new fields, effective_defaults doesn't add
+    them — the resolver falls through to HARDCODED_DEFAULTS."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "defaults:\n"
+        "  caps:\n"
+        "    max_minutes_per_phase: 60\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D }\n"
+    )
+    tf = loader.load_tasks_file(p)
+    eff = loader.effective_defaults(tf)
+    assert "max_rate_limit_retries" not in eff
+    assert "rate_limit_base_backoff_seconds" not in eff
+
+
 # --- D. Strict validation: extra keys -> typo suggestion -------------------
 
 def test_extra_key_under_defaults_suggests_correction(tmp_path, capsys):

@@ -34,6 +34,8 @@ class Caps(BaseModel):
     max_review_rounds: int | None = None
     max_implement_turns: int | None = None
     max_attempts: int | None = None
+    max_rate_limit_retries: int | None = None
+    rate_limit_base_backoff_seconds: int | None = None
 
 
 class TaskClassConfig(BaseModel):

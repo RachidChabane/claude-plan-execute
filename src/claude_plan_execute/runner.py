@@ -121,6 +121,10 @@ def execute_task(
     untranslated_strings_command = resolved["untranslated_strings_command"]["value"]
     dev_server_url = resolved["dev_server_url"]["value"]
     on_max_review_rounds = resolved["on_max_review_rounds"]["value"]
+    max_rate_limit_retries = int(resolved["max_rate_limit_retries"]["value"])
+    rate_limit_base_backoff_seconds = int(
+        resolved["rate_limit_base_backoff_seconds"]["value"]
+    )
     skip_perms = cli.get("skip_permissions", False)
     verbose = cli.get("verbose", False)
 
@@ -151,7 +155,12 @@ def execute_task(
     print(bold(f"TASK {tid}: {task['title']}"))
     print(bold("=" * 60))
 
-    run_kwargs = dict(model=model, effort=effort, skip_permissions=skip_perms, verbose=verbose)
+    run_kwargs = dict(
+        model=model, effort=effort,
+        skip_permissions=skip_perms, verbose=verbose,
+        max_rate_limit_retries=max_rate_limit_retries,
+        rate_limit_base_backoff_seconds=rate_limit_base_backoff_seconds,
+    )
 
     # --- PHASE 1: PLAN ---
     if skip_to not in ("review", "implement"):
@@ -171,6 +180,12 @@ def execute_task(
             return
 
         code, _ = run_claude(prompt, max_turns=100, timeout_minutes=plan_timeout, **run_kwargs)
+        if claude._last_run_rate_limited:
+            _record_rate_limited_and_block(
+                state, tid, phase="plan", plan_path=None,
+                max_rate_limit_retries=max_rate_limit_retries,
+            )
+            return
         if not plan_path.exists():
             print(red(f"  Plan file not created at {plan_path}"))
             save_error_output(task_dir, code, _)
@@ -196,6 +211,12 @@ def execute_task(
                 return
 
             run_claude(prompt, max_turns=60, timeout_minutes=review_timeout, **run_kwargs)
+            if claude._last_run_rate_limited:
+                _record_rate_limited_and_block(
+                    state, tid, phase="review", plan_path=plan_path,
+                    max_rate_limit_retries=max_rate_limit_retries,
+                )
+                return
 
             approved, feedback = check_verdict(review_path)
             if approved:
@@ -213,6 +234,12 @@ def execute_task(
                     persona=persona_section,
                 )
                 run_claude(revise_prompt, max_turns=60, timeout_minutes=review_timeout, **run_kwargs)
+                if claude._last_run_rate_limited:
+                    _record_rate_limited_and_block(
+                        state, tid, phase="review", plan_path=plan_path,
+                        max_rate_limit_retries=max_rate_limit_retries,
+                    )
+                    return
         else:
             if on_max_review_rounds == "fail":
                 print(red(
@@ -275,6 +302,13 @@ def execute_task(
         return
 
     run_claude(prompt, max_turns=impl_turns, timeout_minutes=impl_timeout, **run_kwargs)
+
+    if claude._last_run_rate_limited:
+        _record_rate_limited_and_block(
+            state, tid, phase="implement", plan_path=plan_path,
+            max_rate_limit_retries=max_rate_limit_retries,
+        )
+        return
 
     if claude._last_run_timed_out:
         state.set_status(
@@ -433,6 +467,32 @@ def save_error_output(task_dir: Path, code: int, output: str):
     err_path = task_dir / "error-output.txt"
     err_path.write_text(f"Exit code: {code}\n\n{output}")
     print(yellow(f"  Raw output saved to {err_path}"))
+
+
+def _record_rate_limited_and_block(
+    state: State, tid: int | str, phase: str, plan_path: Path | None,
+    *, max_rate_limit_retries: int,
+) -> None:
+    """Record a `rate_limited` FailureRecord and set status to blocked.
+
+    Called from each `run_claude` call site when
+    `claude._last_run_rate_limited` is True after the call. `plan_path`
+    may be `None` (plan-phase failure where the plan never materialized).
+    """
+    artifacts: dict[str, str] = {}
+    if plan_path is not None:
+        artifacts["plan"] = str(plan_path)
+    state.set_status(tid, "blocked", block_reason="rate_limited")
+    state.record_failure(tid, make_failure_record(
+        failure_class="rate_limited",
+        phase=phase,
+        reason=(
+            f"Claude API rate-limit retries exhausted after "
+            f"{max_rate_limit_retries + 1} attempts."
+        ),
+        artifacts=artifacts,
+    ))
+    print(red(f"\n  Task {tid} blocked: rate-limit retries exhausted."))
 
 
 def handle_sigint(signum, frame):

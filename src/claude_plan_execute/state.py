@@ -35,6 +35,7 @@ FAILURE_CLASSES = (
     "plan_not_written",                   # NOT written in task 9 (Non-goals)
     "test_failed",                        # subtype of gate_failed; task 12+
     "budget_exceeded",                    # NOT written in task 9 (max_attempts deferred)
+    "rate_limited",                       # v0.3 task 1 — Claude-API rate-limit retries exhausted (§2.15)
 )
 
 

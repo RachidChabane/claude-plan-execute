@@ -22,6 +22,8 @@ HARDCODED_DEFAULTS: dict = {
     "persona_file": "docs/persona.md",
     "decisions_dir": "docs/decisions",
     "dev_server_url": "http://localhost:5173",
+    "max_rate_limit_retries": 3,
+    "rate_limit_base_backoff_seconds": 60,
 }
 
 
@@ -30,8 +32,10 @@ HARDCODED_DEFAULTS: dict = {
 # on_max_review_rounds. Task 7 added persona_file. Task 8 added
 # decisions_dir. Task 13 added lint_command. Task 14 added
 # invariants_file. Task 17 added untranslated_strings_command.
-# Task 20 added dev_server_url. Future tasks extend this tuple as
-# new keys become resolver-consumable.
+# Task 20 added dev_server_url. Task 1 of v0.3 added
+# max_rate_limit_retries and rate_limit_base_backoff_seconds.
+# Future tasks extend this tuple as new keys become
+# resolver-consumable.
 KEYS_TO_AUDIT: tuple[str, ...] = (
     "model",
     "effort",
@@ -50,6 +54,8 @@ KEYS_TO_AUDIT: tuple[str, ...] = (
     "invariants_file",
     "untranslated_strings_command",
     "dev_server_url",
+    "max_rate_limit_retries",
+    "rate_limit_base_backoff_seconds",
 )
 
 

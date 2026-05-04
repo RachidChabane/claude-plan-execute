@@ -488,6 +488,11 @@ def test_failure_classes_includes_deferred_classes():
     assert "budget_exceeded" in FAILURE_CLASSES
 
 
+def test_failure_classes_includes_v0_3_writes():
+    """v0.3 task 1 — Claude-API rate-limit retries exhausted."""
+    assert "rate_limited" in FAILURE_CLASSES
+
+
 def test_make_failure_record_does_not_validate_failure_class():
     """Pin §D3: unknown failure_class strings are accepted (no raise)."""
     fr = make_failure_record(

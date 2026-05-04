@@ -2,6 +2,11 @@
 
 Owns the module-level `_active_child` reference so that the SIGINT handler
 (in runner.py) can kill the in-flight child via `_kill_child()`.
+
+Side-channel telemetry flags read by the runner immediately after each
+`run_claude` call: `_last_run_timed_out`, `_last_run_subtype`, and
+`_last_run_rate_limited` (set when retries exhaust on a rate-limit
+signal).
 """
 from __future__ import annotations
 
@@ -15,12 +20,38 @@ _active_child: subprocess.Popen | None = None
 
 # Side-channel telemetry set by `run_claude`. The runner reads these
 # IMMEDIATELY after a `run_claude` call to differentiate normal
-# completion from timeout (subprocess.TimeoutExpired) and from
-# max-turns (CLI subtype "error_max_turns"). Reset to defaults at
-# every `run_claude` entry; never read except through the runner's
-# post-call inspection.
+# completion from timeout (subprocess.TimeoutExpired), max-turns
+# (CLI subtype "error_max_turns"), and rate-limit retry exhaustion.
+# `_last_run_timed_out` and `_last_run_subtype` are reset per-attempt
+# at `_run_claude_once` entry; `_last_run_rate_limited` is reset
+# per-call at `run_claude` entry.
 _last_run_timed_out: bool = False
 _last_run_subtype: str | None = None
+_last_run_rate_limited: bool = False
+
+
+# Substring patterns matched (lower-case) against subprocess stderr to
+# detect Claude-API rate-limit signals. Any one match triggers a retry.
+# The "Retry-After" pattern is matched as a SIGNAL only — the value is
+# not parsed (deferred refinement).
+_RATE_LIMIT_PATTERNS = (
+    "rate_limit_error",
+    "429",
+    "anthropic api rate limit",
+    "retry-after",
+)
+
+
+def _is_rate_limited(stderr: str) -> bool:
+    """Case-insensitive substring match against `_RATE_LIMIT_PATTERNS`.
+
+    Empty stderr → False. The match is intentionally permissive —
+    Anthropic's CLI has emitted multiple stderr shapes over time;
+    surfacing any of the four patterns is enough to retry."""
+    if not stderr:
+        return False
+    s = stderr.lower()
+    return any(p in s for p in _RATE_LIMIT_PATTERNS)
 
 
 def _kill_child():
@@ -52,7 +83,7 @@ def _kill_child():
     _active_child = None
 
 
-def run_claude(
+def _run_claude_once(
     prompt: str,
     *,
     model: str,
@@ -61,12 +92,11 @@ def run_claude(
     timeout_minutes: int,
     skip_permissions: bool,
     verbose: bool,
-) -> tuple[int, str]:
-    """Invoke claude CLI. Returns (return_code, stdout_text).
+) -> tuple[int, str, str]:
+    """Single subprocess attempt. Returns (returncode, result_text, stderr_text).
 
-    Side-channel telemetry: sets module-level `_last_run_timed_out`
-    and `_last_run_subtype` for the runner to inspect post-call.
-    Both are reset at entry.
+    Resets `_last_run_timed_out` and `_last_run_subtype` at entry —
+    each call's side-channel flags reflect this attempt only.
     """
     global _active_child, _last_run_timed_out, _last_run_subtype
     _last_run_timed_out = False
@@ -105,7 +135,7 @@ def run_claude(
         print(red(f"  TIMEOUT after {timeout_minutes} minutes"))
         _last_run_timed_out = True
         _kill_child()
-        return 1, ""
+        return 1, "", ""
     finally:
         _active_child = None
 
@@ -143,4 +173,87 @@ def run_claude(
                 result_text = result_event["result"]
     except (json.JSONDecodeError, KeyError, TypeError):
         pass
-    return returncode, result_text
+    return returncode, result_text, stderr
+
+
+def run_claude(
+    prompt: str,
+    *,
+    model: str,
+    effort: str,
+    max_turns: int,
+    timeout_minutes: int,
+    skip_permissions: bool,
+    verbose: bool,
+    max_rate_limit_retries: int = 3,
+    rate_limit_base_backoff_seconds: int = 60,
+) -> tuple[int, str]:
+    """Invoke claude CLI with rate-limit retry. Returns (return_code, stdout_text).
+
+    Retries on Claude-API rate-limit signals in stderr (see
+    `_RATE_LIMIT_PATTERNS`). Backoff is exponential:
+    `base * 2^(attempt-1)` seconds — 60s/120s/240s for the default
+    3 retries (~7 min total). Non-rate-limit failures and timeouts
+    return immediately and DO NOT consume the retry budget.
+
+    `max_rate_limit_retries` counts retry attempts AFTER the initial
+    one — N retries → N+1 total attempts → N waits with values
+    `base, base*2, ..., base*2^(N-1)`. `max_rate_limit_retries=0`
+    disables rate-limit awareness (single attempt, detection skipped).
+
+    Sets module-level `_last_run_rate_limited = True` iff retries
+    exhaust on a rate-limit signal. The runner reads this flag
+    immediately post-call to record a `rate_limited` FailureRecord.
+
+    Per-attempt side-channel flags (`_last_run_timed_out`,
+    `_last_run_subtype`) reflect the most recent attempt.
+    """
+    global _last_run_rate_limited
+    _last_run_rate_limited = False
+
+    # Opt-out: 0 retries → skip rate-limit awareness entirely.
+    if max_rate_limit_retries == 0:
+        code, result_text, _stderr = _run_claude_once(
+            prompt,
+            model=model, effort=effort, max_turns=max_turns,
+            timeout_minutes=timeout_minutes,
+            skip_permissions=skip_permissions, verbose=verbose,
+        )
+        return code, result_text
+
+    last_code, last_text = 1, ""
+    total_attempts = max_rate_limit_retries + 1
+    for attempt in range(1, total_attempts + 1):
+        code, result_text, stderr = _run_claude_once(
+            prompt,
+            model=model, effort=effort, max_turns=max_turns,
+            timeout_minutes=timeout_minutes,
+            skip_permissions=skip_permissions, verbose=verbose,
+        )
+        last_code, last_text = code, result_text
+
+        if code == 0:
+            return code, result_text
+
+        # Timeout: do NOT retry; do NOT consume rate-limit budget.
+        if _last_run_timed_out:
+            return code, result_text
+
+        # Non-rate-limit non-zero exit: pass through unchanged.
+        if not _is_rate_limited(stderr):
+            return code, result_text
+
+        # Rate-limited; sleep before next attempt unless this was the last.
+        if attempt < total_attempts:
+            wait = rate_limit_base_backoff_seconds * (2 ** (attempt - 1))
+            print(yellow(
+                f"  Rate-limited; waiting {wait}s before retry "
+                f"{attempt + 1}/{total_attempts}"
+            ))
+            time.sleep(wait)
+
+    _last_run_rate_limited = True
+    print(red(
+        f"  Rate-limit retries exhausted after {total_attempts} attempts."
+    ))
+    return last_code, last_text

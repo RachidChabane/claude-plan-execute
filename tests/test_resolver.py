@@ -399,8 +399,25 @@ def test_resolve_task_config_audit_keys_match_doc_constant():
         "invariants_file",
         "untranslated_strings_command",
         "dev_server_url",
+        "max_rate_limit_retries",
+        "rate_limit_base_backoff_seconds",
     )
     assert KEYS_TO_AUDIT == expected
+
+
+def test_max_rate_limit_retries_is_a_hardcoded_default():
+    assert HARDCODED_DEFAULTS["max_rate_limit_retries"] == 3
+    assert resolve("max_rate_limit_retries", {}, {}, {}) == 3
+
+
+def test_rate_limit_base_backoff_seconds_is_a_hardcoded_default():
+    assert HARDCODED_DEFAULTS["rate_limit_base_backoff_seconds"] == 60
+    assert resolve("rate_limit_base_backoff_seconds", {}, {}, {}) == 60
+
+
+def test_keys_to_audit_includes_rate_limit_fields():
+    assert "max_rate_limit_retries" in KEYS_TO_AUDIT
+    assert "rate_limit_base_backoff_seconds" in KEYS_TO_AUDIT
 
 
 # ---------------------------------------------------------------------------
