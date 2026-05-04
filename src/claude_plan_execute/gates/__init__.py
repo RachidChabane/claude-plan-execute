@@ -225,12 +225,19 @@ def _when_matches(when: tuple[str, ...], task: dict) -> tuple[bool, str]:
 def _run_one(
     name: str, gate: Gate, task: dict, cli: dict,
     diff_path: str | None = None,
+    usage_jsonl_path: str | None = None,
 ) -> GateResult:
     """Execute one gate, returning a GateResult on success OR failure.
 
     `diff_path` (T7, v0.3) is the path to the precomputed
     implementation diff. Threaded only into `AgentGate`; `ShellGate`
     has no template substitution surface and ignores it.
+
+    `usage_jsonl_path` (T2, v0.3) is the path to the per-task
+    `usage.jsonl`. Threaded only into `AgentGate` (whose `run_claude`
+    call appends a row when present). ShellGate's row is written by
+    `run_gates` itself in the post-results loop, so this kwarg is
+    not threaded into `ShellGate`.
 
     Exceptions are caught and reported; the gate-run loop never raises
     out of `run_gates`.
@@ -243,6 +250,7 @@ def _run_one(
             return AgentGate(
                 name=name, gate=gate, task=task, cli=cli,
                 diff_path=diff_path,
+                usage_jsonl_path=usage_jsonl_path,
             ).run()
         return GateResult(
             name=name, passed=False, output="",
@@ -297,6 +305,11 @@ def run_gates(
     # when no agent gates are configured — cheap; the runner has
     # already written the file.
     diff_path_str = str(task_dir / "diff.patch")
+    # T2 §D6: per-task usage.jsonl path threaded to AgentGate (which
+    # forwards it to run_claude); shell-gate rows are written by this
+    # function in the post-results loop below.
+    usage_jsonl_path_str = str(task_dir / "usage.jsonl")
+    kind_by_name: dict[str, str] = {n: g.kind for (n, g) in gates}
 
     # Filter by `when` first; skipped gates produce passive results.
     runnable: list[tuple[str, Gate]] = []
@@ -325,21 +338,28 @@ def run_gates(
     # Serial first (single-runner dependence assumed; see §D5).
     for name, gate in serial:
         print(dim(f"  Running gate '{name}' (serial)..."))
-        results.append(_run_one(name, gate, task, cli,
-                                diff_path=diff_path_str))
+        results.append(_run_one(
+            name, gate, task, cli,
+            diff_path=diff_path_str,
+            usage_jsonl_path=usage_jsonl_path_str,
+        ))
 
     # Then parallel.
     if parallel:
         max_workers = min(len(parallel), 4)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
-                ex.submit(_run_one, n, g, task, cli, diff_path_str): n
+                ex.submit(
+                    _run_one, n, g, task, cli,
+                    diff_path_str, usage_jsonl_path_str,
+                ): n
                 for (n, g) in parallel
             }
             for fut in as_completed(futures):
                 results.append(fut.result())
 
     # Write output files and patch output_path on each result.
+    skipped_names = {sr.name for sr in skipped}
     final_results: list[GateResult] = []
     for r in results:
         out_path = gates_dir / f"{r.name}.txt"
@@ -358,6 +378,20 @@ def run_gates(
                     json.dumps(sidecar, indent=2) + "\n",
                     encoding="utf-8",
                 )
+        # T2 §D6: append a usage row for shell-kind gates only.
+        # AgentGate rows were written inside run_claude (see §D5).
+        # Skipped gates do not get a row (they did not actually run).
+        if (
+            r.name not in skipped_names
+            and kind_by_name.get(r.name) == "shell"
+        ):
+            from claude_plan_execute.claude import _append_usage_row
+            _append_usage_row(
+                usage_jsonl_path_str,
+                phase=f"gate:{r.name}",
+                model=None,
+                duration_seconds=r.duration_seconds,
+            )
         # GateResult is frozen → reconstruct with output_path set.
         # T11: also thread `findings` through (default-None would
         # otherwise drop it).

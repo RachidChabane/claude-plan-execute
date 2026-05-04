@@ -129,6 +129,12 @@ class AgentGate:
     at factory time (per gate); diff_path substitution happens
     here at gate-run time because the diff is per-task and not
     known until implement finishes. (Plan §D2 / §D3.)
+
+    `usage_jsonl_path` (T2, v0.3) is the path to the per-task
+    `usage.jsonl` that `run_claude` appends a row to whenever it
+    parses a `usage` event from the CLI's result. Threaded by
+    `run_gates` from `task_dir / 'usage.jsonl'`. None disables the
+    append (used by tests that don't care about telemetry).
     """
 
     name: str
@@ -136,6 +142,7 @@ class AgentGate:
     task: dict
     cli: dict
     diff_path: str | None = None
+    usage_jsonl_path: str | None = None
 
     def run(self) -> GateResult:
         if self.gate.kind != "agent":
@@ -165,6 +172,8 @@ class AgentGate:
             timeout_minutes=self.gate.timeout_minutes,
             skip_permissions=self.cli.get("skip_permissions", False),
             verbose=self.cli.get("verbose", False),
+            phase=f"gate:{self.name}",
+            usage_jsonl_path=self.usage_jsonl_path,
         )
         passed = "verdict: pass" in (text or "").lower()
         output_capped = _tail_cap(text or "")

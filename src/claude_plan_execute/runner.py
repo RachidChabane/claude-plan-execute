@@ -33,7 +33,9 @@ from claude_plan_execute.prompts import (
     build_revise_prompt,
     parse_progress_status,
 )
-from claude_plan_execute.state import State, make_failure_record
+from claude_plan_execute.state import (
+    State, make_failure_record, summarize_usage,
+)
 
 
 # T7 §D5: 256 KB cap for the precomputed implement-diff artifact.
@@ -102,6 +104,7 @@ def execute_task(
     plans_dir = Path(resolved["plans_dir"]["value"])
     task_dir = plans_dir / f"task-{tid}"
     task_dir.mkdir(parents=True, exist_ok=True)
+    usage_path = task_dir / "usage.jsonl"
 
     # Audit artifact — written before any phase. (Plan §D6.)
     resolved_config_path = task_dir / "resolved-config.json"
@@ -213,7 +216,11 @@ def execute_task(
             print(prompt[:800])
             return
 
-        code, _ = run_claude(prompt, max_turns=100, timeout_minutes=plan_timeout, **run_kwargs)
+        code, _ = run_claude(
+            prompt, max_turns=100, timeout_minutes=plan_timeout,
+            phase="plan", usage_jsonl_path=usage_path,
+            **run_kwargs,
+        )
         if claude._last_run_rate_limited:
             _record_rate_limited_and_block(
                 state, tid, phase="plan", plan_path=None,
@@ -244,7 +251,11 @@ def execute_task(
                 print(dim(f"  [DRY RUN] Review prompt: {len(prompt)} chars"))
                 return
 
-            run_claude(prompt, max_turns=60, timeout_minutes=review_timeout, **run_kwargs)
+            run_claude(
+                prompt, max_turns=60, timeout_minutes=review_timeout,
+                phase="review", usage_jsonl_path=usage_path,
+                **run_kwargs,
+            )
             if claude._last_run_rate_limited:
                 _record_rate_limited_and_block(
                     state, tid, phase="review", plan_path=plan_path,
@@ -267,7 +278,12 @@ def execute_task(
                     task, str(plan_path), str(review_path),
                     persona=persona_section,
                 )
-                run_claude(revise_prompt, max_turns=60, timeout_minutes=review_timeout, **run_kwargs)
+                run_claude(
+                    revise_prompt, max_turns=60,
+                    timeout_minutes=review_timeout,
+                    phase="revise", usage_jsonl_path=usage_path,
+                    **run_kwargs,
+                )
                 if claude._last_run_rate_limited:
                     _record_rate_limited_and_block(
                         state, tid, phase="review", plan_path=plan_path,
@@ -349,7 +365,11 @@ def execute_task(
             print(dim(f"  [DRY RUN] Implement prompt: {len(prompt)} chars"))
             return
 
-        run_claude(prompt, max_turns=impl_turns, timeout_minutes=impl_timeout, **run_kwargs)
+        run_claude(
+            prompt, max_turns=impl_turns, timeout_minutes=impl_timeout,
+            phase="implement", usage_jsonl_path=usage_path,
+            **run_kwargs,
+        )
 
         if claude._last_run_rate_limited:
             _record_rate_limited_and_block(
@@ -517,7 +537,15 @@ def execute_task(
                 ))
                 return
 
-    state.set_status(tid, "done")
+    # T2 §D8: roll up per-run usage rows into the per-task summary.
+    # Failed / blocked tasks short-circuit before this point; they
+    # do NOT get a usage_summary. Re-running a done task overwrites
+    # the summary (cumulative over the append-only JSONL).
+    summary = summarize_usage(usage_path)
+    done_extras: dict = {}
+    if summary["total_runs"] > 0:
+        done_extras["usage_summary"] = summary
+    state.set_status(tid, "done", **done_extras)
     print(green(f"\n  Task {tid} complete."))
 
 

@@ -18,7 +18,7 @@ from claude_plan_execute.state import (
 
 def test_new_state_has_empty_tasks(tmp_path: Path):
     s = State(tmp_path / "state.json")
-    assert s.data == {"schema_version": 2, "tasks": {}}
+    assert s.data == {"schema_version": 3, "tasks": {}}
 
 
 def test_get_creates_pending_entry(tmp_path: Path):
@@ -55,7 +55,7 @@ def test_save_writes_atomically(tmp_path: Path):
 
     on_disk = json.loads(path.read_text())
     assert on_disk == {
-        "schema_version": 2,
+        "schema_version": 3,
         "tasks": {
             "1": {"status": "done", "attempts": [], "current_attempt": 1},
         },
@@ -131,7 +131,7 @@ def test_reset_all_tasks(tmp_path: Path):
 def test_reset_all_on_empty_state_is_noop(tmp_path: Path):
     s = State(tmp_path / "state.json")
     s.reset()  # no tasks; should not raise
-    assert s.data == {"schema_version": 2, "tasks": {}}
+    assert s.data == {"schema_version": 3, "tasks": {}}
 
 
 def test_statuses_constant_includes_known_values():
@@ -168,14 +168,15 @@ def test_use_color_propagates_to_loader_and_deps_via_module_global(monkeypatch, 
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_constant_is_2():
-    """Pin: SCHEMA_VERSION is the load-bearing constant."""
-    assert SCHEMA_VERSION == 2
+def test_schema_version_constant_is_3():
+    """Pin: SCHEMA_VERSION is the load-bearing constant. Bumped to 3 in
+    T2 v0.3 (§3.2) when per-task `usage_summary` was added."""
+    assert SCHEMA_VERSION == 3
 
 
-def test_new_state_has_schema_version_2(tmp_path: Path):
+def test_new_state_has_schema_version_3(tmp_path: Path):
     s = State(tmp_path / "state.json")
-    assert s.data["schema_version"] == 2
+    assert s.data["schema_version"] == 3
 
 
 def test_save_writes_schema_version_to_disk(tmp_path: Path):
@@ -183,20 +184,43 @@ def test_save_writes_schema_version_to_disk(tmp_path: Path):
     s = State(path)
     s.set_status(1, "pending")
     on_disk = json.loads(path.read_text())
-    assert on_disk["schema_version"] == 2
+    assert on_disk["schema_version"] == 3
 
 
-def test_load_v1_state_self_heals_to_v2(tmp_path: Path):
-    """Schema-1 file (no schema_version key) loads with the v2
-    defaults injected and saves as schema 2 on next write."""
+def test_load_v1_state_self_heals_to_v3(tmp_path: Path):
+    """Schema-1 file (no schema_version key) loads with the v3
+    defaults injected and saves as schema 3 on next write."""
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"tasks": {"1": {"status": "done"}}}))
     s = State(path)
-    assert s.data["schema_version"] == 2
+    assert s.data["schema_version"] == 3
 
     s.save()
     on_disk = json.loads(path.read_text())
-    assert on_disk["schema_version"] == 2
+    assert on_disk["schema_version"] == 3
+
+
+def test_load_v2_state_self_heals_to_v3(tmp_path: Path):
+    """Schema-2 file with attempts loads cleanly into a schema-3
+    State; schema_version stamp is updated, attempts preserved."""
+    fr = {
+        "failure_class": "manual_stop", "phase": "implement",
+        "timestamp": "2026-05-02T22:30:00+00:00",
+        "reason": "x", "verbatim": "", "artifacts": {}, "hypothesis": None,
+    }
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "tasks": {"1": {"status": "blocked", "attempts": [fr], "current_attempt": 2}},
+    }))
+    s = State(path)
+    assert s.data["schema_version"] == 3
+    assert s.get(1)["attempts"] == [fr]
+    assert s.get(1)["current_attempt"] == 2
+
+    s.save()
+    on_disk = json.loads(path.read_text())
+    assert on_disk["schema_version"] == 3
 
 
 def test_load_v1_state_injects_attempts_default(tmp_path: Path):
@@ -220,7 +244,8 @@ def test_load_v1_state_injects_current_attempt_default(tmp_path: Path):
 
 
 def test_load_v2_state_preserves_attempts(tmp_path: Path):
-    """Schema-2 file with non-empty attempts loads unchanged."""
+    """Schema-2 file with non-empty attempts loads cleanly into v3
+    (self-heal stamps schema_version=3); attempts preserved."""
     fr = {
         "failure_class": "manual_stop", "phase": "implement",
         "timestamp": "2026-05-02T22:30:00+00:00",
@@ -232,12 +257,14 @@ def test_load_v2_state_preserves_attempts(tmp_path: Path):
         "tasks": {"1": {"status": "blocked", "attempts": [fr], "current_attempt": 1}},
     }))
     s = State(path)
+    assert s.data["schema_version"] == 3
     assert s.get(1)["attempts"] == [fr]
     assert s.get(1)["current_attempt"] == 1
 
 
 def test_load_v2_state_does_not_overwrite_current_attempt(tmp_path: Path):
-    """If a schema-2 file has current_attempt: 3, the load must not reset it to 1."""
+    """If a schema-2 file has current_attempt: 3, the load must not
+    reset it to 1 (the v2 → v3 self-heal preserves it)."""
     path = tmp_path / "state.json"
     path.write_text(json.dumps({
         "schema_version": 2,
@@ -245,6 +272,7 @@ def test_load_v2_state_does_not_overwrite_current_attempt(tmp_path: Path):
     }))
     s = State(path)
     assert s.get(1)["current_attempt"] == 3
+    assert s.data["schema_version"] == 3
 
 
 def test_get_creates_entry_with_attempts_default(tmp_path: Path):
@@ -499,3 +527,135 @@ def test_make_failure_record_does_not_validate_failure_class():
         "completely_made_up_class", "plan", reason="r",
     )
     assert fr["failure_class"] == "completely_made_up_class"
+
+
+# ---------------------------------------------------------------------------
+# summarize_usage helper (task 2 v0.3)
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from claude_plan_execute.state import summarize_usage
+
+
+def test_summarize_usage_returns_zero_rollup_for_missing_file(tmp_path):
+    p = tmp_path / "nope.jsonl"
+    s = summarize_usage(p)
+    assert s == {
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cache_read": 0,
+        "total_cache_create": 0,
+        "total_runs": 0,
+        "duration_seconds": 0.0,
+    }
+
+
+def test_summarize_usage_returns_zero_rollup_for_empty_file(tmp_path):
+    p = tmp_path / "u.jsonl"
+    p.write_text("")
+    s = summarize_usage(p)
+    assert s["total_runs"] == 0
+
+
+def test_summarize_usage_sums_single_row(tmp_path):
+    p = tmp_path / "u.jsonl"
+    p.write_text(_json.dumps({
+        "phase": "plan", "input": 100, "output": 50,
+        "cache_read": 30, "cache_create": 5,
+        "duration_seconds": 12.0,
+    }) + "\n")
+    s = summarize_usage(p)
+    assert s["total_input_tokens"] == 100
+    assert s["total_output_tokens"] == 50
+    assert s["total_cache_read"] == 30
+    assert s["total_cache_create"] == 5
+    assert s["duration_seconds"] == 12.0
+    assert s["total_runs"] == 1
+
+
+def test_summarize_usage_sums_multiple_rows(tmp_path):
+    p = tmp_path / "u.jsonl"
+    rows = [
+        {"phase": "plan", "input": 1, "output": 2,
+         "cache_read": 3, "cache_create": 4,
+         "duration_seconds": 5.0},
+        {"phase": "implement", "input": 10, "output": 20,
+         "cache_read": 30, "cache_create": 40,
+         "duration_seconds": 50.0},
+        {"phase": "gate:tests", "input": 0, "output": 0,
+         "cache_read": 0, "cache_create": 0,
+         "duration_seconds": 1.5},
+    ]
+    p.write_text("".join(_json.dumps(r) + "\n" for r in rows))
+    s = summarize_usage(p)
+    assert s["total_input_tokens"] == 11
+    assert s["total_output_tokens"] == 22
+    assert s["total_cache_read"] == 33
+    assert s["total_cache_create"] == 44
+    assert s["duration_seconds"] == 56.5
+    assert s["total_runs"] == 3
+
+
+def test_summarize_usage_skips_corrupt_lines(tmp_path):
+    p = tmp_path / "u.jsonl"
+    p.write_text(
+        _json.dumps({"input": 1, "output": 1, "cache_read": 0,
+                     "cache_create": 0, "duration_seconds": 0.0}) + "\n"
+        + "not json\n"
+        + "{incomplete\n"
+        + _json.dumps({"input": 2, "output": 2, "cache_read": 0,
+                       "cache_create": 0, "duration_seconds": 0.0}) + "\n"
+    )
+    s = summarize_usage(p)
+    assert s["total_runs"] == 2
+    assert s["total_input_tokens"] == 3
+
+
+def test_summarize_usage_handles_missing_token_fields(tmp_path):
+    """Pin §D9: rows missing token keys default to 0; row still counts."""
+    p = tmp_path / "u.jsonl"
+    p.write_text(_json.dumps({
+        "phase": "plan", "duration_seconds": 5.0,
+    }) + "\n")
+    s = summarize_usage(p)
+    assert s["total_input_tokens"] == 0
+    assert s["total_runs"] == 1
+    assert s["duration_seconds"] == 5.0
+
+
+def test_summarize_usage_skips_non_dict_rows(tmp_path):
+    p = tmp_path / "u.jsonl"
+    p.write_text("[1, 2, 3]\n42\n\"a string\"\n")
+    s = summarize_usage(p)
+    assert s["total_runs"] == 0
+
+
+def test_summarize_usage_skips_blank_lines(tmp_path):
+    p = tmp_path / "u.jsonl"
+    p.write_text(
+        _json.dumps({"input": 1, "output": 0, "cache_read": 0,
+                     "cache_create": 0, "duration_seconds": 0.0}) + "\n"
+        + "\n"
+        + "   \n"
+        + _json.dumps({"input": 2, "output": 0, "cache_read": 0,
+                       "cache_create": 0, "duration_seconds": 0.0}) + "\n"
+    )
+    s = summarize_usage(p)
+    assert s["total_runs"] == 2
+
+
+def test_summarize_usage_returns_correct_types(tmp_path):
+    """Pin §D9: token totals are int; duration_seconds is float."""
+    p = tmp_path / "u.jsonl"
+    p.write_text(_json.dumps({
+        "input": 1, "output": 2, "cache_read": 3, "cache_create": 4,
+        "duration_seconds": 5.5,
+    }) + "\n")
+    s = summarize_usage(p)
+    assert isinstance(s["total_input_tokens"], int)
+    assert isinstance(s["total_output_tokens"], int)
+    assert isinstance(s["total_cache_read"], int)
+    assert isinstance(s["total_cache_create"], int)
+    assert isinstance(s["total_runs"], int)
+    assert isinstance(s["duration_seconds"], float)

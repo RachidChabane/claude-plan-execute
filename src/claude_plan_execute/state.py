@@ -8,10 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # State file format version. Bumped to 2 in task 9 to add per-task
-# `attempts: list[FailureRecord]` and `current_attempt: int`. Schema-1
-# files (no `schema_version` key) self-heal on load: `State.__init__`
-# injects defaults; subsequent writes emit v2.
-SCHEMA_VERSION = 2
+# `attempts: list[FailureRecord]` and `current_attempt: int`. Bumped
+# to 3 in task 2 of v0.3 (§2.7) to add per-task
+# `usage_summary: dict | None`. Schema-N files self-heal on load:
+# `State.__init__` overwrites `schema_version` to current
+# `SCHEMA_VERSION`; missing optional fields stay missing (callers use
+# `.get(...)`).
+SCHEMA_VERSION = 3
 
 # Verbatim-content byte cap for FailureRecord.verbatim. The truncation
 # marker (~30-50 bytes) is appended on top; final string is bounded by
@@ -75,6 +78,50 @@ def make_failure_record(
         "artifacts": dict(artifacts) if artifacts else {},
         "hypothesis": hypothesis,
     }
+
+
+def summarize_usage(jsonl_path: Path) -> dict:
+    """Sum a `usage.jsonl` file into a per-task rollup dict.
+
+    See plan task-2 §D9. Pure: no side effects, no I/O beyond the file
+    read.
+
+    Returns a dict with six keys, even when the file is missing
+    (all-zero rollup, `total_runs == 0` — caller uses this as the
+    absence-robust signal to skip writing `usage_summary` to
+    state.json).
+    """
+    summary: dict = {
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cache_read": 0,
+        "total_cache_create": 0,
+        "total_runs": 0,
+        "duration_seconds": 0.0,
+    }
+    if not jsonl_path.exists():
+        return summary
+    try:
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                summary["total_input_tokens"] += int(row.get("input", 0))
+                summary["total_output_tokens"] += int(row.get("output", 0))
+                summary["total_cache_read"] += int(row.get("cache_read", 0))
+                summary["total_cache_create"] += int(row.get("cache_create", 0))
+                summary["duration_seconds"] += float(row.get("duration_seconds", 0))
+                summary["total_runs"] += 1
+    except OSError:
+        pass
+    return summary
 
 
 class State:

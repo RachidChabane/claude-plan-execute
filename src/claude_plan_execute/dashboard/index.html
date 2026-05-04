@@ -1256,6 +1256,35 @@ body::before {
       </div>
     </div>
 
+    <!-- T2 §D11: Cost panel placeholder. Real visuals (bar chart,
+         model breakdown, per-phase split) ship in T13. -->
+    <div class="stats-bar fade-in" id="costPanel">
+      <div class="stat">
+        <span class="stat-value dim" id="costInput">0</span>
+        <span class="stat-label">Input tokens</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value dim" id="costOutput">0</span>
+        <span class="stat-label">Output tokens</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value dim" id="costCacheRead">0</span>
+        <span class="stat-label">Cache read</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value dim" id="costCacheCreate">0</span>
+        <span class="stat-label">Cache create</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value dim" id="costRuns">0</span>
+        <span class="stat-label">Runs</span>
+      </div>
+      <div class="stat" style="margin-left:auto">
+        <span class="stat-value dim" id="costSeconds">0</span>
+        <span class="stat-label">Wall-clock s</span>
+      </div>
+    </div>
+
     <!-- Running banner -->
     <div class="running-banner" id="runningBanner">
       <div class="running-spinner"></div>
@@ -1437,6 +1466,33 @@ function isActive(status) {
   return ['planning', 'reviewing', 'revising', 'implementing'].includes(status);
 }
 
+function fmtNum(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
+  return String(n);
+}
+
+function updateCostPanel() {
+  let input = 0, output = 0, cacheR = 0, cacheC = 0;
+  let runs = 0, secs = 0;
+  for (const tid in (state.tasks || {})) {
+    const us = state.tasks[tid].usage_summary;
+    if (!us) continue;
+    input  += us.total_input_tokens   || 0;
+    output += us.total_output_tokens  || 0;
+    cacheR += us.total_cache_read     || 0;
+    cacheC += us.total_cache_create   || 0;
+    runs   += us.total_runs           || 0;
+    secs   += us.duration_seconds     || 0;
+  }
+  document.getElementById('costInput').textContent       = fmtNum(input);
+  document.getElementById('costOutput').textContent      = fmtNum(output);
+  document.getElementById('costCacheRead').textContent   = fmtNum(cacheR);
+  document.getElementById('costCacheCreate').textContent = fmtNum(cacheC);
+  document.getElementById('costRuns').textContent        = runs;
+  document.getElementById('costSeconds').textContent     = Math.round(secs);
+}
+
 function updateStats() {
   let done = 0, active = 0, pending = 0;
   tasks.forEach(t => {
@@ -1465,6 +1521,8 @@ function updateStats() {
   } else {
     stopRunTimer();
   }
+
+  updateCostPanel();
 }
 
 function updateUI() {

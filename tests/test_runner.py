@@ -33,6 +33,12 @@ def _reset_module_globals():
     claude._last_run_timed_out = False
     claude._last_run_subtype = None
     claude._last_run_rate_limited = False
+    # T2 §D1: reset the five usage flags between tests.
+    claude._last_run_input_tokens = None
+    claude._last_run_output_tokens = None
+    claude._last_run_cache_read_tokens = None
+    claude._last_run_cache_creation_tokens = None
+    claude._last_run_duration_seconds = None
     runner._current_state = None
     runner._current_task_id = 0
     runner._current_phase = "plan"
@@ -41,6 +47,11 @@ def _reset_module_globals():
     claude._last_run_timed_out = False
     claude._last_run_subtype = None
     claude._last_run_rate_limited = False
+    claude._last_run_input_tokens = None
+    claude._last_run_output_tokens = None
+    claude._last_run_cache_read_tokens = None
+    claude._last_run_cache_creation_tokens = None
+    claude._last_run_duration_seconds = None
     runner._current_state = None
     runner._current_task_id = 0
     runner._current_phase = "plan"
@@ -682,7 +693,13 @@ def test_run_claude_resets_timed_out_flag_at_call_entry(monkeypatch):
 
 def _patch_run_claude_once(monkeypatch, responses):
     """Drive run_claude with a deterministic sequence of (code, text, stderr)
-    tuples. Returns (helper_calls, sleep_calls)."""
+    tuples. Returns (helper_calls, sleep_calls).
+
+    T2 §D2: the underlying `_run_claude_once` returns a 5-tuple
+    `(code, text, stderr, usage, elapsed)`. The fake widens the
+    3-tuple `responses` entries to that shape with `usage=None,
+    elapsed=0.0` so existing callers stay backward-compatible —
+    rate-limited retries / timeout behavior is unchanged."""
     helper_calls = []
     sleep_calls = []
 
@@ -699,7 +716,13 @@ def _patch_run_claude_once(monkeypatch, responses):
         # reset at entry, set timed_out only on the explicit timeout sentinel.
         claude._last_run_timed_out = (code == 1 and text == "" and stderr == "TIMEOUT")
         claude._last_run_subtype = None
-        return code, text, "" if stderr == "TIMEOUT" else stderr
+        return (
+            code,
+            text,
+            "" if stderr == "TIMEOUT" else stderr,
+            None,
+            0.0,
+        )
 
     monkeypatch.setattr("claude_plan_execute.claude._run_claude_once", fake_once)
     monkeypatch.setattr(
@@ -5895,3 +5918,1149 @@ def test_execute_task_implementer_max_turns_does_NOT_write_diff_patch(
     diff_path = tmp_path / "task-1" / "diff.patch"
     assert not diff_path.exists()
     assert state.get(1)["status"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# X. Token usage — claude.run_claude side-channel and JSONL append
+#    (task 2 v0.3)
+# ---------------------------------------------------------------------------
+
+
+def test_run_claude_sets_input_tokens_side_channel_flag(monkeypatch):
+    """Pin §D1: the four token flags are set from the parsed CLI
+    `usage` event."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {
+            "input_tokens": 12345,
+            "output_tokens": 678,
+            "cache_read_input_tokens": 8000,
+            "cache_creation_input_tokens": 200,
+        },
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False)
+    assert claude._last_run_input_tokens == 12345
+    assert claude._last_run_output_tokens == 678
+    assert claude._last_run_cache_read_tokens == 8000
+    assert claude._last_run_cache_creation_tokens == 200
+
+
+def test_run_claude_sets_duration_seconds_side_channel_flag(monkeypatch):
+    """Pin §D1: duration is set unconditionally from the existing
+    `elapsed` measurement."""
+    _patch_run_claude_subprocess(monkeypatch)
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False)
+    assert claude._last_run_duration_seconds is not None
+    assert claude._last_run_duration_seconds >= 0
+
+
+def test_run_claude_resets_usage_flags_at_call_entry(monkeypatch):
+    """Pin §D1: stale flags from a prior run are cleared. The new
+    call's stdout has no `usage` event → flags reset to None."""
+    claude._last_run_input_tokens = 999_999  # leftover
+    stdout = json.dumps({"type": "result", "subtype": "success", "result": "ok"})
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False)
+    assert claude._last_run_input_tokens is None
+
+
+def test_run_claude_usage_flags_None_when_usage_event_absent(monkeypatch):
+    """Pin §D1: older CLI versions (no `usage` field in result event)
+    leave the four token flags as None — `summarize_usage` /
+    `_append_usage_row` skip the row."""
+    stdout = json.dumps({"type": "result", "subtype": "success", "result": "ok"})
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False)
+    assert claude._last_run_input_tokens is None
+    assert claude._last_run_output_tokens is None
+    assert claude._last_run_cache_read_tokens is None
+    assert claude._last_run_cache_creation_tokens is None
+
+
+def test_run_claude_extracts_usage_from_list_result_event(monkeypatch):
+    """Pin §D1: CLI v2.x list-of-events output. Usage on the
+    terminal `type: result` event flows into the side-channel."""
+    stdout = json.dumps([
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success", "result": "ok",
+         "usage": {"input_tokens": 100, "output_tokens": 50}},
+    ])
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False)
+    assert claude._last_run_input_tokens == 100
+    assert claude._last_run_output_tokens == 50
+
+
+def test_run_claude_extracts_usage_from_dict_legacy_shape(monkeypatch):
+    """Pin §D1: legacy single-dict CLI output. Usage at the top-
+    level dict still flows through."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False)
+    assert claude._last_run_input_tokens == 1
+
+
+def test_run_claude_appends_jsonl_row_when_path_and_phase_provided(
+    monkeypatch, tmp_path,
+):
+    """Pin §D3: the row predicate fires when usage_jsonl_path,
+    phase, and parsed usage are all present."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {"input_tokens": 100, "output_tokens": 50,
+                  "cache_read_input_tokens": 30,
+                  "cache_creation_input_tokens": 5},
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    p = tmp_path / "usage.jsonl"
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False,
+               phase="implement", usage_jsonl_path=p)
+    assert p.is_file()
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    assert len(rows) == 1
+    assert rows[0]["input"] == 100
+    assert rows[0]["output"] == 50
+    assert rows[0]["cache_read"] == 30
+    assert rows[0]["cache_create"] == 5
+
+
+def test_run_claude_jsonl_row_schema_matches_spec(monkeypatch, tmp_path):
+    """Pin §D10: row keys are exactly the eight named in tasks.yaml,
+    in this order."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {"input_tokens": 1, "output_tokens": 1,
+                  "cache_read_input_tokens": 1,
+                  "cache_creation_input_tokens": 1},
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    p = tmp_path / "u.jsonl"
+    run_claude("p", model="sonnet", effort="medium", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False,
+               phase="plan", usage_jsonl_path=p)
+    row = json.loads(p.read_text().strip())
+    assert list(row.keys()) == [
+        "timestamp", "phase", "model",
+        "input", "output", "cache_read", "cache_create",
+        "duration_seconds",
+    ]
+    assert row["phase"] == "plan"
+    assert row["model"] == "sonnet"
+
+
+def test_run_claude_jsonl_row_timestamp_parseable(monkeypatch, tmp_path):
+    """Pin §D10: timestamps are UTC ISO-8601."""
+    from datetime import datetime
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    p = tmp_path / "u.jsonl"
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False,
+               phase="plan", usage_jsonl_path=p)
+    row = json.loads(p.read_text().strip())
+    parsed = datetime.fromisoformat(row["timestamp"])
+    assert parsed.utcoffset().total_seconds() == 0
+
+
+def test_run_claude_appends_multiple_rows_to_same_file(monkeypatch, tmp_path):
+    """Pin: the file is open-append, NOT open-write. Multiple
+    run_claude calls accumulate rows."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    p = tmp_path / "u.jsonl"
+    for _ in range(3):
+        run_claude("p", model="opus", effort="max", max_turns=1,
+                   timeout_minutes=1, skip_permissions=False, verbose=False,
+                   phase="plan", usage_jsonl_path=p)
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    assert len(rows) == 3
+
+
+def test_run_claude_does_NOT_append_when_path_is_None(monkeypatch, tmp_path):
+    """Pin §D3: usage_jsonl_path=None disables the append."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    p = tmp_path / "u.jsonl"
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False,
+               phase="plan", usage_jsonl_path=None)
+    assert not p.exists()
+
+
+def test_run_claude_does_NOT_append_when_phase_is_None(monkeypatch, tmp_path):
+    """Pin §D3: phase=None disables the append even when path is
+    provided."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    p = tmp_path / "u.jsonl"
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False,
+               phase=None, usage_jsonl_path=p)
+    assert not p.exists()
+
+
+def test_run_claude_does_NOT_append_when_usage_event_absent(
+    monkeypatch, tmp_path,
+):
+    """Pin §D3 (absence-robust headline): no `usage` field in stdout
+    → no row appended. This is THE test the task description names
+    in 'robust to absence — older CLI versions, dry-run, etc.'"""
+    stdout = json.dumps({"type": "result", "subtype": "success", "result": "ok"})
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout)
+    p = tmp_path / "u.jsonl"
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False,
+               phase="plan", usage_jsonl_path=p)
+    assert not p.exists()
+
+
+def test_run_claude_appends_row_on_nonzero_exit_with_usage(monkeypatch, tmp_path):
+    """Pin §D3: an attempt with non-zero exit but a usage event in
+    its result still records the row. The operator-debug question
+    'how much did the failed attempt cost?' is answered."""
+    stdout = json.dumps({
+        "type": "result", "subtype": "error_max_turns",
+        "result": "", "is_error": True,
+        "usage": {"input_tokens": 50, "output_tokens": 0},
+    })
+    _patch_run_claude_subprocess(monkeypatch, stdout=stdout, returncode=1)
+    p = tmp_path / "u.jsonl"
+    # Disable rate-limit retry to keep the test single-attempt.
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False,
+               phase="implement", usage_jsonl_path=p,
+               max_rate_limit_retries=0)
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    assert len(rows) == 1
+    assert rows[0]["input"] == 50
+
+
+def test_run_claude_writes_no_rows_when_no_attempt_has_usage(
+    monkeypatch, tmp_path,
+):
+    """Pin §D3 (absence-robust under the per-call contract): when
+    every retry attempt's `_run_claude_once` returns usage=None,
+    the row write at the return site has nothing to write — ZERO
+    rows in the JSONL file."""
+    helper_calls, _sleeps = _patch_run_claude_once(monkeypatch, [
+        # Attempts 1-3: rate-limited, no usage.
+        (1, "", "rate_limit_error"),
+        (1, "", "rate_limit_error"),
+        (1, "", "rate_limit_error"),
+        # Attempt 4: success with no usage (helper stub returns
+        # usage=None for ALL attempts via its 5-tuple defaults).
+        (0, "ok", ""),
+    ])
+    p = tmp_path / "u.jsonl"
+    run_claude("p", model="opus", effort="max", max_turns=1,
+               timeout_minutes=1, skip_permissions=False, verbose=False,
+               phase="implement", usage_jsonl_path=p)
+    # The fake _run_claude_once returns usage=None for every
+    # attempt → no row appended. This is the correct outcome
+    # under the per-call contract.
+    assert not p.exists() or p.read_text() == ""
+
+
+def test_run_claude_one_row_when_final_retry_succeeds_with_usage(
+    monkeypatch, tmp_path,
+):
+    """Pin §D3 (per-call contract; final-attempt-wins): when a
+    rate-limited retry succeeds on the final attempt with usage
+    data, exactly one row is written using the final attempt's
+    usage."""
+    seq_iter = iter([
+        # Three rate-limited attempts (no usage)
+        (1, "", "rate_limit_error", None, 0.0),
+        (1, "", "rate_limit_error", None, 0.0),
+        (1, "", "rate_limit_error", None, 0.0),
+        # Final success with usage
+        (0, "ok", "", {"input_tokens": 99, "output_tokens": 11}, 5.0),
+    ])
+
+    def fake_once(prompt, **kwargs):
+        return next(seq_iter)
+
+    monkeypatch.setattr(
+        "claude_plan_execute.claude._run_claude_once", fake_once,
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.claude.time.sleep", lambda s: None,
+    )
+    p = tmp_path / "u.jsonl"
+    code, text = run_claude(
+        "p", model="opus", effort="max", max_turns=1,
+        timeout_minutes=1, skip_permissions=False, verbose=False,
+        phase="implement", usage_jsonl_path=p,
+    )
+    assert (code, text) == (0, "ok")
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    assert len(rows) == 1
+    assert rows[0]["input"] == 99
+    assert rows[0]["output"] == 11
+
+
+def test_run_claude_jsonl_thread_safety(tmp_path):
+    """Pin §D4: the module-level Lock serializes concurrent
+    appends. 16 threads × 10 rows each → 160 valid rows; no
+    interleaving / partial writes."""
+    import threading as _threading
+    p = tmp_path / "u.jsonl"
+
+    def writer():
+        for _i in range(10):
+            claude._append_usage_row(
+                p, phase="plan", model="opus",
+                input=1, output=1, cache_read=0, cache_create=0,
+                duration_seconds=0.5,
+            )
+
+    threads = [_threading.Thread(target=writer) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    assert len(rows) == 160
+
+
+def test_append_usage_row_swallows_OSError(monkeypatch, tmp_path, capsys):
+    """Pin §D4: I/O errors do not raise; a yellow warning prints."""
+    p = tmp_path / "missing-dir" / "u.jsonl"
+    real_open = open
+
+    def boom(path, *a, **k):
+        if str(path).endswith("u.jsonl"):
+            raise PermissionError("simulated")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", boom)
+    # Must not raise:
+    claude._append_usage_row(
+        p, phase="plan", model="opus",
+        input=1, output=1, cache_read=0, cache_create=0,
+        duration_seconds=0.5,
+    )
+    out = capsys.readouterr().out
+    assert "[usage]" in out
+
+
+def test_run_claude_5tuple_return_shape_from_run_claude_once(monkeypatch):
+    """Pin §D2: _run_claude_once returns a 5-tuple. Direct
+    invocation with a passing stub asserts the shape."""
+    _patch_run_claude_subprocess(monkeypatch, stdout=json.dumps({
+        "type": "result", "subtype": "success", "result": "ok",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }))
+    from claude_plan_execute.claude import _run_claude_once
+    out = _run_claude_once(
+        "p", model="opus", effort="max", max_turns=1,
+        timeout_minutes=1, skip_permissions=False, verbose=False,
+    )
+    assert len(out) == 5
+    code, text, stderr, usage, elapsed = out
+    assert code == 0
+    assert usage == {"input_tokens": 1, "output_tokens": 1}
+    assert elapsed >= 0
+
+
+def test_run_claude_once_5tuple_shape_on_timeout_path(monkeypatch):
+    """Pin §D2 / Rev-1 C2: the timeout path also returns a 5-tuple
+    `(1, "", "", None, 0.0)`."""
+    _patch_run_claude_subprocess(monkeypatch, raises_timeout=True)
+    from claude_plan_execute.claude import _run_claude_once
+    out = _run_claude_once(
+        "p", model="opus", effort="max", max_turns=1,
+        timeout_minutes=1, skip_permissions=False, verbose=False,
+    )
+    assert len(out) == 5
+    assert out == (1, "", "", None, 0.0)
+    # C3: side-channel duration flag is set to 0.0 on the timeout
+    # path for symmetry with the returned tuple's elapsed.
+    assert claude._last_run_duration_seconds == 0.0
+    assert claude._last_run_timed_out is True
+
+
+def test_run_claude_once_returns_None_usage_when_stdout_is_garbage(
+    monkeypatch,
+):
+    """Pin Rev-1 I1 (regression): non-JSON stdout drives the
+    `except (json.JSONDecodeError, KeyError, TypeError):` branch
+    in `_run_claude_once`. With the `usage = None` pre-bind, the
+    function returns a well-formed 5-tuple."""
+    _patch_run_claude_subprocess(monkeypatch, stdout="not json output")
+    from claude_plan_execute.claude import _run_claude_once
+    out = _run_claude_once(
+        "p", model="opus", effort="max", max_turns=1,
+        timeout_minutes=1, skip_permissions=False, verbose=False,
+    )
+    assert len(out) == 5
+    code, text, stderr, usage, elapsed = out
+    assert usage is None
+    assert elapsed >= 0
+
+
+def test_run_claude_once_returns_None_usage_when_parsed_is_empty_list(
+    monkeypatch,
+):
+    """Pin Rev-1 I1 (regression): when `parsed = []` (CLI emits no
+    events at all), the for-loop never assigns `result_event`, so
+    the `if result_event is not None:` branch never executes. The
+    pre-bind keeps `usage = None` and the 5-tuple return is
+    well-formed."""
+    _patch_run_claude_subprocess(monkeypatch, stdout="[]")
+    from claude_plan_execute.claude import _run_claude_once
+    out = _run_claude_once(
+        "p", model="opus", effort="max", max_turns=1,
+        timeout_minutes=1, skip_permissions=False, verbose=False,
+    )
+    assert len(out) == 5
+    assert out[3] is None  # usage
+
+
+def test_run_claude_once_returns_None_usage_when_parsed_is_not_list_or_dict(
+    monkeypatch,
+):
+    """Pin Rev-1 I1 (regression): when `parsed` is a string / number
+    (legacy CLI shapes, adversarial output), neither branch fires →
+    `result_event` stays None → pre-bind keeps `usage = None`."""
+    _patch_run_claude_subprocess(monkeypatch, stdout='"a string"')
+    from claude_plan_execute.claude import _run_claude_once
+    out = _run_claude_once(
+        "p", model="opus", effort="max", max_turns=1,
+        timeout_minutes=1, skip_permissions=False, verbose=False,
+    )
+    assert len(out) == 5
+    assert out[3] is None
+
+
+def test_run_claude_writes_zero_rows_when_intermediate_attempt_has_usage_but_final_does_not(
+    monkeypatch, tmp_path,
+):
+    """Pin §D3 / Rev-1 I2 (per-call contract — discriminating
+    test): attempt 1 emits a usage event but is rate-limited;
+    attempt 2 (the final attempt) is also rate-limited and emits
+    no usage event. Under the per-call contract, the row write at
+    the post-loop `return` site sees `last_usage = None` (from
+    attempt 2) and writes ZERO rows."""
+    seq_iter = iter([
+        # Attempt 1: emits usage but is "rate-limited" to force
+        # the loop to continue.
+        (1, "", "rate_limit_error",
+         {"input_tokens": 50, "output_tokens": 10}, 1.0),
+        # Attempt 2 (final): rate-limited, no usage.
+        (1, "", "rate_limit_error", None, 1.0),
+    ])
+
+    def fake_once(prompt, **kwargs):
+        return next(seq_iter)
+
+    monkeypatch.setattr(
+        "claude_plan_execute.claude._run_claude_once", fake_once,
+    )
+    monkeypatch.setattr(
+        "claude_plan_execute.claude.time.sleep", lambda s: None,
+    )
+    p = tmp_path / "u.jsonl"
+    run_claude(
+        "p", model="opus", effort="max", max_turns=1,
+        timeout_minutes=1, skip_permissions=False, verbose=False,
+        phase="implement", usage_jsonl_path=p,
+        max_rate_limit_retries=1,  # 2 attempts total
+    )
+    # Per-call contract: final attempt's usage (None) wins.
+    assert not p.exists() or p.read_text() == ""
+
+
+# ---------------------------------------------------------------------------
+# Y. Token usage — runner threads usage_jsonl_path through phases
+#    (task 2 v0.3)
+# ---------------------------------------------------------------------------
+
+
+def _capture_run_claude_kwargs(monkeypatch, *, write_plan=True, tmp_path=None):
+    """Capture every run_claude call's kwargs across phases. By
+    default the stub writes the plan file on the first call so
+    Phase 1 transitions cleanly into Phase 2."""
+    calls = []
+
+    def stub(prompt, **kwargs):
+        calls.append(kwargs)
+        claude._last_run_timed_out = False
+        claude._last_run_subtype = "success"
+        # Write the plan file the first time so Phase 1 progresses.
+        if write_plan and tmp_path is not None and len(calls) == 1:
+            plan_dir = tmp_path / "task-1"
+            plan_dir.mkdir(parents=True, exist_ok=True)
+            plan_path = plan_dir / "plan.md"
+            if not plan_path.exists():
+                plan_path.write_text("plan")
+        return 0, "ok"
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    return calls
+
+
+def test_execute_task_passes_phase_plan_to_run_claude(monkeypatch, tmp_path):
+    """Pin §D7: Phase 1 plan call carries phase='plan'."""
+    calls = _capture_run_claude_kwargs(monkeypatch, tmp_path=tmp_path)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 0,
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={},
+    )
+    # First call is Phase 1 plan.
+    assert calls[0]["phase"] == "plan"
+
+
+def test_execute_task_passes_phase_review_to_run_claude(monkeypatch, tmp_path):
+    """Pin §D7: skip_to='review' bypasses Plan; the first call is review."""
+    calls = _capture_run_claude_kwargs(monkeypatch, tmp_path=tmp_path)
+    plan_dir = tmp_path / "task-1"
+    plan_dir.mkdir()
+    (plan_dir / "plan.md").write_text("plan")
+    # Pre-write a passing review file so the loop terminates.
+    (plan_dir / "review-1.md").write_text("Verdict: APPROVED\n")
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={}, skip_to="review",
+    )
+    assert calls[0]["phase"] == "review"
+
+
+def test_execute_task_passes_phase_implement_to_run_claude(monkeypatch, tmp_path):
+    """Pin §D7: skip_to='implement' bypasses Plan + Review. The first
+    (and only) Phase-3 call carries phase='implement'."""
+    calls = _capture_run_claude_kwargs(monkeypatch, tmp_path=tmp_path)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert calls[0]["phase"] == "implement"
+
+
+def test_execute_task_passes_usage_jsonl_path_to_every_call(
+    monkeypatch, tmp_path,
+):
+    """Pin §D7: every run_claude call gets the per-task usage_path."""
+    calls = _capture_run_claude_kwargs(monkeypatch, tmp_path=tmp_path)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 0,
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={},
+    )
+    expected = tmp_path / "task-1" / "usage.jsonl"
+    assert calls, "expected at least one run_claude call"
+    for c in calls:
+        assert c["usage_jsonl_path"] == expected
+
+
+def test_execute_task_dry_run_does_NOT_create_usage_jsonl(monkeypatch, tmp_path):
+    """Pin §D7: dry-run returns before any run_claude → no rows
+    appended → no file created."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    assert not (tmp_path / "task-1" / "usage.jsonl").exists()
+
+
+def test_execute_task_revise_phase_uses_phase_revise(monkeypatch, tmp_path):
+    """Pin §D7: the revise call (after a NEEDS_REVISION verdict)
+    uses phase='revise', distinct from the prior phase='review'."""
+    calls = []
+
+    def stub(prompt, **kwargs):
+        calls.append(kwargs)
+        # On the first review call, write the review file with
+        # NEEDS_REVISION → triggers the revise call.
+        if len(calls) == 1:
+            review_path = tmp_path / "task-1" / "review-1.md"
+            review_path.write_text("## Verdict: NEEDS_REVISION\n")
+        claude._last_run_timed_out = False
+        claude._last_run_subtype = "success"
+        return 0, "ok"
+
+    monkeypatch.setattr("claude_plan_execute.runner.run_claude", stub)
+    plan_dir = tmp_path / "task-1"
+    plan_dir.mkdir()
+    (plan_dir / "plan.md").write_text("plan")
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "auto_approve",
+        },
+        cli={}, skip_to="review",
+    )
+    # Calls: [review-1, revise]. Phase strings: ["review", "revise"].
+    assert calls[0]["phase"] == "review"
+    assert calls[1]["phase"] == "revise"
+
+
+# ---------------------------------------------------------------------------
+# Z. Token usage — gate runner appends rows (task 2 v0.3)
+# ---------------------------------------------------------------------------
+
+
+def test_run_gates_appends_shell_gate_row_with_duration(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D6: a passing shell gate produces a JSONL row with
+    `phase: 'gate:<name>'` and `model: null`."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "ok", Gate(kind="shell", command=("true",)),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "ok"
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["ok"]},
+        cli={}, skip_to="implement",
+    )
+    p = tmp_path / "task-1" / "usage.jsonl"
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    gate_rows = [r for r in rows if r["phase"].startswith("gate:")]
+    assert len(gate_rows) == 1
+    assert gate_rows[0]["phase"] == "gate:ok"
+    assert gate_rows[0]["model"] is None
+    assert gate_rows[0]["input"] == 0
+    assert gate_rows[0]["output"] == 0
+    assert gate_rows[0]["duration_seconds"] >= 0
+
+
+def test_run_gates_passes_usage_jsonl_path_to_agent_gate(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D5/§D6: the AgentGate's run_claude call carries the
+    per-task usage.jsonl path."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    captured = {}
+
+    def stub_agent_run(prompt, **kwargs):
+        captured.update(kwargs)
+        return 0, "VERDICT: PASS\n"
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", stub_agent_run,
+    )
+    _clean_default_registry.register(
+        "agent-x",
+        Gate(kind="agent", prompt_template="body", on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["agent-x"]},
+        cli={}, skip_to="implement",
+    )
+    expected = str(tmp_path / "task-1" / "usage.jsonl")
+    assert captured["usage_jsonl_path"] == expected
+
+
+def test_run_gates_agent_gate_phase_has_gate_prefix(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D5: the agent gate's run_claude call uses
+    phase=f'gate:{name}'."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    captured = {}
+
+    def stub_agent_run(prompt, **kwargs):
+        captured.update(kwargs)
+        return 0, "VERDICT: PASS\n"
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", stub_agent_run,
+    )
+    _clean_default_registry.register(
+        "test-critique",
+        Gate(kind="agent", prompt_template="body", on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["test-critique"],
+        },
+        cli={}, skip_to="implement",
+    )
+    assert captured["phase"] == "gate:test-critique"
+
+
+def test_run_gates_skipped_gate_does_NOT_append_row(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D6: gates filtered by `_when_matches` (e.g.,
+    task_class:foo on a task with class=bar) get a passive
+    GateResult; no usage row is appended for the skipped gate."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "task-class-only",
+        Gate(kind="shell", command=("true",), when=("task_class:other",)),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = ""
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1, task_class="ui"), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["task-class-only"],
+        },
+        cli={}, skip_to="implement",
+    )
+    p = tmp_path / "task-1" / "usage.jsonl"
+    if p.exists():
+        rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    else:
+        rows = []
+    gate_rows = [r for r in rows if r["phase"].startswith("gate:")]
+    assert len(gate_rows) == 0
+
+
+def test_run_gates_does_NOT_double_write_agent_row(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Pin §D6: an agent gate's row is written by run_claude inside
+    AgentGate.run() (one row). run_gates does NOT also write a row
+    in its post-loop."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def stub_agent_run(prompt, **kwargs):
+        # Have the stub append a row to demonstrate that's the ONE
+        # source of agent rows.
+        if kwargs.get("usage_jsonl_path") and kwargs.get("phase"):
+            from claude_plan_execute.claude import _append_usage_row
+            _append_usage_row(
+                kwargs["usage_jsonl_path"],
+                phase=kwargs["phase"],
+                model=kwargs.get("model", "opus"),
+                input=10, output=10,
+                duration_seconds=0.5,
+            )
+        return 0, "VERDICT: PASS\n"
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", stub_agent_run,
+    )
+    _clean_default_registry.register(
+        "agent-x",
+        Gate(kind="agent", prompt_template="body", on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["agent-x"]},
+        cli={}, skip_to="implement",
+    )
+    p = tmp_path / "task-1" / "usage.jsonl"
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    agent_rows = [r for r in rows if r["phase"] == "gate:agent-x"]
+    assert len(agent_rows) == 1   # NOT 2
+
+
+def test_run_gates_shell_row_when_no_agent_gates_configured(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Cover the kind_by_name path purely for shell gates."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    _clean_default_registry.register(
+        "shell-a", Gate(kind="shell", command=("true",)),
+    )
+    _clean_default_registry.register(
+        "shell-b", Gate(kind="shell", command=("true",)),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class P:
+            pass
+        p = P()
+        p.returncode = 0
+        p.stdout = "ok"
+        p.stderr = ""
+        return p
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.shell.subprocess.run", fake_run,
+    )
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "gates": ["shell-a", "shell-b"],
+        },
+        cli={}, skip_to="implement",
+    )
+    p = tmp_path / "task-1" / "usage.jsonl"
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    gate_phases = sorted(
+        r["phase"] for r in rows if r["phase"].startswith("gate:")
+    )
+    assert gate_phases == ["gate:shell-a", "gate:shell-b"]
+
+
+def test_run_gates_agent_gate_row_has_model(
+    monkeypatch, tmp_path, _clean_default_registry,
+):
+    """Agent rows preserve the actual model name (NOT null)."""
+    _patch_run_claude_simulating_success(monkeypatch)
+
+    def stub_agent_run(prompt, **kwargs):
+        if kwargs.get("usage_jsonl_path") and kwargs.get("phase"):
+            from claude_plan_execute.claude import _append_usage_row
+            _append_usage_row(
+                kwargs["usage_jsonl_path"],
+                phase=kwargs["phase"],
+                model=kwargs.get("model", "opus"),
+                input=1, output=1, duration_seconds=0.0,
+            )
+        return 0, "VERDICT: PASS\n"
+
+    monkeypatch.setattr(
+        "claude_plan_execute.gates.agent.run_claude", stub_agent_run,
+    )
+    _clean_default_registry.register(
+        "agent-x",
+        Gate(kind="agent", prompt_template="body",
+             model="haiku", on_failure="warn"),
+    )
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path), "gates": ["agent-x"]},
+        cli={}, skip_to="implement",
+    )
+    p = tmp_path / "task-1" / "usage.jsonl"
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    agent_rows = [r for r in rows if r["phase"] == "gate:agent-x"]
+    assert agent_rows[0]["model"] == "haiku"
+
+
+# ---------------------------------------------------------------------------
+# AA. Token usage — usage_summary roll-up on done (task 2 v0.3)
+# ---------------------------------------------------------------------------
+
+
+def _seed_usage_jsonl(tmp_path, tid, rows):
+    """Pre-write a usage.jsonl file at the task's expected path."""
+    task_dir = tmp_path / f"task-{tid}"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    p = task_dir / "usage.jsonl"
+    p.write_text(
+        "".join(json.dumps(r) + "\n" for r in rows),
+        encoding="utf-8",
+    )
+    return p
+
+
+def test_execute_task_writes_usage_summary_on_done(monkeypatch, tmp_path):
+    """Pin §D8: a task that reaches done with rows in usage.jsonl
+    gets a usage_summary on its state entry."""
+    _seed_usage_jsonl(tmp_path, 1, [
+        {"phase": "plan", "model": "opus",
+         "input": 100, "output": 50,
+         "cache_read": 30, "cache_create": 5,
+         "duration_seconds": 12.0},
+    ])
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert "usage_summary" in entry
+    # The implement run_claude stub doesn't write to JSONL (it's
+    # stubbed at run_claude level, not _run_claude_once); only the
+    # seeded row is summed.
+    assert entry["usage_summary"]["total_runs"] == 1
+    assert entry["usage_summary"]["total_input_tokens"] == 100
+
+
+def test_execute_task_does_NOT_write_summary_when_jsonl_empty(
+    monkeypatch, tmp_path,
+):
+    """Pin §D8 / absence-robust: zero rows → no usage_summary key."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert "usage_summary" not in entry
+
+
+def test_execute_task_does_NOT_write_summary_on_blocked(
+    monkeypatch, tmp_path,
+):
+    """Pin §D8: blocked-by-rate-limit task does NOT reach the
+    summary write site."""
+    _seed_usage_jsonl(tmp_path, 1, [
+        {"phase": "implement", "model": "opus",
+         "input": 100, "output": 50,
+         "cache_read": 0, "cache_create": 0,
+         "duration_seconds": 10.0},
+    ])
+    _patch_run_claude_simulating_rate_limit_exhausted(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    entry = state.get(1)
+    assert entry["status"] == "blocked"
+    assert "usage_summary" not in entry
+
+
+def test_execute_task_does_NOT_write_summary_on_dry_run(
+    monkeypatch, tmp_path,
+):
+    """Dry-run path returns BEFORE any run_claude / summary write."""
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, dry_run=True,
+    )
+    entry = state.get(1)
+    assert "usage_summary" not in entry
+
+
+def test_execute_task_summary_includes_all_six_keys(monkeypatch, tmp_path):
+    """Pin §D9: summary has six keys exactly."""
+    _seed_usage_jsonl(tmp_path, 1, [
+        {"phase": "plan", "model": "opus",
+         "input": 1, "output": 2,
+         "cache_read": 3, "cache_create": 4,
+         "duration_seconds": 5.0},
+    ])
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    s = state.get(1)["usage_summary"]
+    assert set(s.keys()) == {
+        "total_input_tokens", "total_output_tokens",
+        "total_cache_read", "total_cache_create",
+        "total_runs", "duration_seconds",
+    }
+
+
+def test_usage_summary_sums_correctly_across_multiple_runs(
+    monkeypatch, tmp_path,
+):
+    """Pin (headline test from task description): summary correctly
+    sums multiple rows."""
+    _seed_usage_jsonl(tmp_path, 1, [
+        {"phase": "plan", "model": "opus",
+         "input": 100, "output": 50,
+         "cache_read": 30, "cache_create": 5,
+         "duration_seconds": 10.0},
+        {"phase": "implement", "model": "opus",
+         "input": 200, "output": 80,
+         "cache_read": 100, "cache_create": 10,
+         "duration_seconds": 50.0},
+        {"phase": "gate:tests", "model": None,
+         "input": 0, "output": 0,
+         "cache_read": 0, "cache_create": 0,
+         "duration_seconds": 5.5},
+    ])
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    s = state.get(1)["usage_summary"]
+    assert s["total_input_tokens"] == 300
+    assert s["total_output_tokens"] == 130
+    assert s["total_cache_read"] == 130
+    assert s["total_cache_create"] == 15
+    assert s["total_runs"] == 3
+    assert s["duration_seconds"] == 65.5
+
+
+def test_re_run_done_task_summary_reflects_cumulative_jsonl(
+    monkeypatch, tmp_path,
+):
+    """Pin §D8: re-running a task replaces `usage_summary` with a
+    fresh roll-up of the WHOLE `usage.jsonl` file (which is
+    append-only across runs). The new summary is cumulative, NOT
+    just-this-run."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    # First run with one seeded row.
+    _seed_usage_jsonl(tmp_path, 1, [
+        {"phase": "plan", "model": "opus",
+         "input": 100, "output": 50,
+         "cache_read": 0, "cache_create": 0,
+         "duration_seconds": 1.0},
+    ])
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["usage_summary"]["total_runs"] == 1
+    # Append a second row to JSONL (simulating the second run's writes).
+    p = tmp_path / "task-1" / "usage.jsonl"
+    with open(p, "a") as f:
+        f.write(json.dumps({
+            "phase": "implement", "model": "opus",
+            "input": 200, "output": 80,
+            "cache_read": 0, "cache_create": 0,
+            "duration_seconds": 2.0,
+        }) + "\n")
+    # Re-run.
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    s = state.get(1)["usage_summary"]
+    assert s["total_runs"] == 2  # cumulative
+    assert s["total_input_tokens"] == 300
+
+
+def test_usage_summary_robust_to_corrupt_jsonl_line(monkeypatch, tmp_path):
+    """Pin §D9: corrupt lines are skipped; valid rows still sum."""
+    task_dir = tmp_path / "task-1"
+    task_dir.mkdir()
+    p = task_dir / "usage.jsonl"
+    p.write_text(
+        json.dumps({"phase": "plan", "input": 100, "output": 50,
+                    "cache_read": 0, "cache_create": 0,
+                    "duration_seconds": 1.0}) + "\n"
+        + "this is not json\n"
+        + json.dumps({"phase": "implement", "input": 50, "output": 30,
+                      "cache_read": 0, "cache_create": 0,
+                      "duration_seconds": 2.0}) + "\n"
+    )
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    s = state.get(1)["usage_summary"]
+    # Two valid rows summed; one corrupt skipped.
+    assert s["total_runs"] == 2
+    assert s["total_input_tokens"] == 150
+
+
+def test_usage_summary_persists_to_state_json(monkeypatch, tmp_path):
+    """Pin: usage_summary survives a state.save() round-trip."""
+    _seed_usage_jsonl(tmp_path, 1, [
+        {"phase": "plan", "model": "opus",
+         "input": 100, "output": 50,
+         "cache_read": 0, "cache_create": 0,
+         "duration_seconds": 5.0},
+    ])
+    _patch_run_claude_simulating_success(monkeypatch)
+    state_path = tmp_path / "state.json"
+    state = State(state_path)
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    on_disk = json.loads(state_path.read_text())
+    assert "usage_summary" in on_disk["tasks"]["1"]
+    assert on_disk["tasks"]["1"]["usage_summary"]["total_input_tokens"] == 100
+
+
+def test_execute_task_done_status_set_when_no_summary(
+    monkeypatch, tmp_path,
+):
+    """Pin: even when no JSONL exists, status still transitions to
+    done (the empty-extras branch)."""
+    _patch_run_claude_simulating_success(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={"plans_dir": str(tmp_path)},
+        cli={}, skip_to="implement",
+    )
+    assert state.get(1)["status"] == "done"

@@ -4,15 +4,29 @@ Owns the module-level `_active_child` reference so that the SIGINT handler
 (in runner.py) can kill the in-flight child via `_kill_child()`.
 
 Side-channel telemetry flags read by the runner immediately after each
-`run_claude` call: `_last_run_timed_out`, `_last_run_subtype`, and
+`run_claude` call: `_last_run_timed_out`, `_last_run_subtype`,
 `_last_run_rate_limited` (set when retries exhaust on a rate-limit
-signal).
+signal), and the five usage flags
+`_last_run_input_tokens` / `_last_run_output_tokens` /
+`_last_run_cache_read_tokens` / `_last_run_cache_creation_tokens` /
+`_last_run_duration_seconds` (T2, v0.3 §2.7).
+
+Token-usage capture also writes one JSONL row per `run_claude` call
+to a path supplied by the runner (`usage_jsonl_path` kwarg). Writes
+are guarded by `_usage_lock` (a module-level `threading.Lock`) for
+correctness under `run_gates`'s ThreadPoolExecutor (up to 4 parallel
+agent gates). The side-channel flags are best-effort under parallel
+use; the JSONL append predicate uses the `_run_claude_once` 5-tuple
+return value (race-free per-thread local).
 """
 from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 from claude_plan_execute.colors import dim, red, yellow
 
@@ -28,6 +42,19 @@ _active_child: subprocess.Popen | None = None
 _last_run_timed_out: bool = False
 _last_run_subtype: str | None = None
 _last_run_rate_limited: bool = False
+
+# T2 §D1: token-usage side-channel flags. None means "no `usage`
+# event in the parsed result." Reset at `_run_claude_once` entry
+# alongside the other per-attempt flags.
+_last_run_input_tokens: int | None = None
+_last_run_output_tokens: int | None = None
+_last_run_cache_read_tokens: int | None = None
+_last_run_cache_creation_tokens: int | None = None
+_last_run_duration_seconds: float | None = None
+
+# T2 §D4: serializes JSONL appends across run_gates' parallel
+# agent-gate ThreadPoolExecutor (up to 4 concurrent writers).
+_usage_lock: threading.Lock = threading.Lock()
 
 
 # Substring patterns matched (lower-case) against subprocess stderr to
@@ -52,6 +79,74 @@ def _is_rate_limited(stderr: str) -> bool:
         return False
     s = stderr.lower()
     return any(p in s for p in _RATE_LIMIT_PATTERNS)
+
+
+def _append_usage_row(
+    path: str | Path,
+    *,
+    phase: str,
+    model: str | None,
+    input: int = 0,
+    output: int = 0,
+    cache_read: int = 0,
+    cache_create: int = 0,
+    duration_seconds: float,
+) -> None:
+    """Append one JSONL row to `path` describing a single LLM/shell
+    invocation. Schema: see plan task-2 §D10.
+
+    Thread-safe via the module-level `_usage_lock` — required because
+    `run_gates`' ThreadPoolExecutor runs up to 4 agent gates in
+    parallel, each calling `run_claude` and (transitively) this
+    helper.
+
+    I/O errors are swallowed with a yellow warning; observability
+    failure must not cascade into runner failure.
+    """
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "phase": phase,
+        "model": model,
+        "input": int(input),
+        "output": int(output),
+        "cache_read": int(cache_read),
+        "cache_create": int(cache_create),
+        "duration_seconds": float(duration_seconds),
+    }
+    line = json.dumps(row, sort_keys=False) + "\n"
+    try:
+        with _usage_lock:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except OSError as exc:
+        print(yellow(f"  [usage] Failed to append row: {exc}"))
+
+
+def _maybe_append_usage(
+    usage_jsonl_path: str | Path | None,
+    phase: str | None,
+    model: str,
+    usage: dict | None,
+    elapsed: float,
+) -> None:
+    """Append a usage row when path + phase + usage are all non-None.
+
+    Centralizes the predicate so all `run_claude` return-site call
+    sites share it. (T2 §D3.)
+    """
+    if usage is None or usage_jsonl_path is None or phase is None:
+        return
+    _append_usage_row(
+        usage_jsonl_path,
+        phase=phase,
+        model=model,
+        input=usage.get("input_tokens", 0),
+        output=usage.get("output_tokens", 0),
+        cache_read=usage.get("cache_read_input_tokens", 0),
+        cache_create=usage.get("cache_creation_input_tokens", 0),
+        duration_seconds=elapsed,
+    )
 
 
 def _kill_child():
@@ -92,15 +187,25 @@ def _run_claude_once(
     timeout_minutes: int,
     skip_permissions: bool,
     verbose: bool,
-) -> tuple[int, str, str]:
-    """Single subprocess attempt. Returns (returncode, result_text, stderr_text).
+) -> tuple[int, str, str, dict | None, float]:
+    """Single subprocess attempt. Returns
+    (returncode, result_text, stderr_text, usage_or_None, elapsed_seconds).
 
-    Resets `_last_run_timed_out` and `_last_run_subtype` at entry —
-    each call's side-channel flags reflect this attempt only.
+    Resets `_last_run_timed_out`, `_last_run_subtype`, and the five
+    usage side-channel flags at entry — each call's flags reflect
+    this attempt only.
     """
     global _active_child, _last_run_timed_out, _last_run_subtype
+    global _last_run_input_tokens, _last_run_output_tokens
+    global _last_run_cache_read_tokens, _last_run_cache_creation_tokens
+    global _last_run_duration_seconds
     _last_run_timed_out = False
     _last_run_subtype = None
+    _last_run_input_tokens = None
+    _last_run_output_tokens = None
+    _last_run_cache_read_tokens = None
+    _last_run_cache_creation_tokens = None
+    _last_run_duration_seconds = None
 
     cmd = [
         "claude",
@@ -135,7 +240,8 @@ def _run_claude_once(
         print(red(f"  TIMEOUT after {timeout_minutes} minutes"))
         _last_run_timed_out = True
         _kill_child()
-        return 1, "", ""
+        _last_run_duration_seconds = 0.0
+        return 1, "", "", None, 0.0
     finally:
         _active_child = None
 
@@ -157,6 +263,7 @@ def _run_claude_once(
     # subtype-conditioned branches must guard the dict path with
     # `evt.get("type") == "result"` if they consume other subtypes.
     result_text = stdout
+    usage: dict | None = None
     try:
         parsed = json.loads(stdout)
         result_event: dict | None = None
@@ -171,9 +278,23 @@ def _run_claude_once(
             _last_run_subtype = result_event.get("subtype")
             if "result" in result_event:
                 result_text = result_event["result"]
+            usage_field = result_event.get("usage")
+            if isinstance(usage_field, dict):
+                usage = usage_field
+                _last_run_input_tokens = int(usage.get("input_tokens", 0))
+                _last_run_output_tokens = int(usage.get("output_tokens", 0))
+                _last_run_cache_read_tokens = int(
+                    usage.get("cache_read_input_tokens", 0)
+                )
+                _last_run_cache_creation_tokens = int(
+                    usage.get("cache_creation_input_tokens", 0)
+                )
+            else:
+                usage = None
     except (json.JSONDecodeError, KeyError, TypeError):
         pass
-    return returncode, result_text, stderr
+    _last_run_duration_seconds = elapsed
+    return returncode, result_text, stderr, usage, elapsed
 
 
 def run_claude(
@@ -187,6 +308,8 @@ def run_claude(
     verbose: bool,
     max_rate_limit_retries: int = 3,
     rate_limit_base_backoff_seconds: int = 60,
+    usage_jsonl_path: str | Path | None = None,
+    phase: str | None = None,
 ) -> tuple[int, str]:
     """Invoke claude CLI with rate-limit retry. Returns (return_code, stdout_text).
 
@@ -207,40 +330,62 @@ def run_claude(
 
     Per-attempt side-channel flags (`_last_run_timed_out`,
     `_last_run_subtype`) reflect the most recent attempt.
+
+    `usage_jsonl_path` and `phase` (T2, v0.3 §2.7): when both are
+    non-None and the FINAL attempt's CLI output included a `usage`
+    event, append one JSONL row to `usage_jsonl_path` recording the
+    final attempt's token counts and elapsed seconds. ONE row per
+    `run_claude` call (per-call contract). Either kwarg unset
+    disables the append.
     """
     global _last_run_rate_limited
     _last_run_rate_limited = False
 
     # Opt-out: 0 retries → skip rate-limit awareness entirely.
     if max_rate_limit_retries == 0:
-        code, result_text, _stderr = _run_claude_once(
+        code, result_text, _stderr, usage, elapsed = _run_claude_once(
             prompt,
             model=model, effort=effort, max_turns=max_turns,
             timeout_minutes=timeout_minutes,
             skip_permissions=skip_permissions, verbose=verbose,
         )
+        _maybe_append_usage(
+            usage_jsonl_path, phase, model, usage, elapsed,
+        )
         return code, result_text
 
     last_code, last_text = 1, ""
+    last_usage: dict | None = None
+    last_elapsed: float = 0.0
     total_attempts = max_rate_limit_retries + 1
     for attempt in range(1, total_attempts + 1):
-        code, result_text, stderr = _run_claude_once(
+        code, result_text, stderr, usage, elapsed = _run_claude_once(
             prompt,
             model=model, effort=effort, max_turns=max_turns,
             timeout_minutes=timeout_minutes,
             skip_permissions=skip_permissions, verbose=verbose,
         )
         last_code, last_text = code, result_text
+        last_usage, last_elapsed = usage, elapsed
 
         if code == 0:
+            _maybe_append_usage(
+                usage_jsonl_path, phase, model, last_usage, last_elapsed,
+            )
             return code, result_text
 
         # Timeout: do NOT retry; do NOT consume rate-limit budget.
         if _last_run_timed_out:
+            _maybe_append_usage(
+                usage_jsonl_path, phase, model, last_usage, last_elapsed,
+            )
             return code, result_text
 
         # Non-rate-limit non-zero exit: pass through unchanged.
         if not _is_rate_limited(stderr):
+            _maybe_append_usage(
+                usage_jsonl_path, phase, model, last_usage, last_elapsed,
+            )
             return code, result_text
 
         # Rate-limited; sleep before next attempt unless this was the last.
@@ -252,6 +397,9 @@ def run_claude(
             ))
             time.sleep(wait)
 
+    _maybe_append_usage(
+        usage_jsonl_path, phase, model, last_usage, last_elapsed,
+    )
     _last_run_rate_limited = True
     print(red(
         f"  Rate-limit retries exhausted after {total_attempts} attempts."

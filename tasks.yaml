@@ -38,6 +38,9 @@ phases:
   - id: parallelism
     title: "Parallel task execution"
     defaults: { task_class: feature }
+  - id: cross-task-memory
+    title: "Cross-task learning via Claude Code memory"
+    defaults: { task_class: feature }
   - id: documentation
     title: "v0.3 release docs + recipes"
     defaults: { task_class: docs }
@@ -883,6 +886,270 @@ tasks:
     commit_message: "feat: parallel task execution with key_files contention guard"
     depends_on: [8, 9]
 
+  # ── Phase: cross-task-memory ─────────────────────────────────────────────
+  - id: 15
+    phase: cross-task-memory
+    title: "feat: prompt agents to read/write Claude Code memory + lifecycle + citations"
+    description: |
+      Cross-task learning via the Claude Code agent's existing
+      auto-memory system. Plus two pruning hooks that prevent
+      MEMORY.md from ballooning indefinitely:
+        - Tier 1: type-aware lifecycle metadata on each memory.
+        - Tier 3: citation tracking — planner marks which memories
+          drove decisions; runner increments per-memory counters.
+      The heavy curation work (Tier 2: AI-driven prune of stale
+      entries) ships separately as a gate in T16.
+
+      WHY THE MECHANISM (do not duplicate it):
+        Each `claude -p ...` subprocess the runner spawns is a fresh
+        Claude Code session in the project directory. Claude Code
+        auto-loads `<project>/.claude/projects/<encoded-path>/memory/
+        MEMORY.md` at session start. Task N's implementer can write
+        memory entries; Task N+1's planner inherits them via the
+        auto-load. No new YAML key, no new loader, no new prompt
+        overlay, no new file in the project root.
+
+      WHAT TO ADD (prompt instructions):
+        Modify three prompt builders in
+        src/claude_plan_execute/prompts.py:
+
+        1. build_plan_prompt — add a "## Memory" section after the
+           decisions block and before the body, instructing the
+           planner to:
+            (a) consult its loaded MEMORY.md (especially memory
+                types `feedback` and `project`) BEFORE planning;
+            (b) incorporate any learnings that bear on this task;
+            (c) when a memory drives a step in the plan, ANNOTATE
+                that step with `[MEM: <memory_name>]` so the
+                runner can later count citations (Tier 3).
+
+        2. build_review_prompt — same memory section. Reviewer
+           flags plans that contradict accepted learnings ("the
+           plan does X, but memory entry feedback_pydantic_v2
+           says Y") and verifies that any [MEM: ...] citations
+           in the plan reference real, currently-live memory
+           entries (no hallucinated names).
+
+        3. build_implement_prompt — same memory section, PLUS:
+            (a) "If during this implementation you discover a
+                non-obvious pitfall, gotcha, or trick worth saving
+                for future tasks — save it as a memory using the
+                standard Claude Code pattern."
+            (b) FRONTMATTER REQUIRED on every new memory. Schema:
+                  ---
+                  name: <slug>
+                  description: <one-line — used to decide relevance>
+                  type: user|feedback|project|reference
+                  lifecycle: evergreen | slate:<slate-id> | task:<id>
+                  citation_count: 0
+                  ---
+            (c) DEFAULT LIFECYCLE BY TYPE (Tier 1):
+                  - type=project   → lifecycle: slate:<current-slate-id>
+                                     (auto-pruned when slate ends)
+                  - type=feedback  → lifecycle: evergreen
+                  - type=reference → lifecycle: evergreen
+                  - type=user      → lifecycle: evergreen
+                The implementer can override default → explicit value
+                if it knows better (e.g., a feedback memory about a
+                bug that's being fixed in a later task → set
+                lifecycle: task:<id> so it's pruned once that task
+                lands).
+            (d) HOW TO FIND THE SLATE ID: the runner exposes it via
+                env var CLAUDE_PLAN_EXECUTE_SLATE_ID set on every
+                claude subprocess (passed through ServiceManager-
+                style; for now, derive from
+                `git rev-parse --abbrev-ref HEAD` for branch-based
+                slates, or fall back to the file mtime of
+                tasks.yaml if no branch context).
+            (e) TERSENESS BUDGET: title ≤ 60 chars, body ≤ 5 lines.
+            (f) DO NOT SAVE: trivia, restated persona.md content,
+                project-state recap of what just changed in code
+                (that belongs in commit messages, not memory).
+
+      WHAT TO ADD (runner: lifecycle pruning + citation tracking):
+        In src/claude_plan_execute/runner.py, after a successful
+        gate phase, add two passes (both small, ~50 lines total):
+
+        1. Lifecycle prune. Walk the project's memory directory
+           (path computed from cwd via the same scheme Claude Code
+           uses: ~/.claude/projects/<encoded-cwd>/memory/). For each
+           per-memory file, parse frontmatter. If
+           `lifecycle: task:<N>` and task N is now `done`, delete
+           the file and remove its line from MEMORY.md. Same for
+           `lifecycle: slate:<id>` once the slate is `ALL TASKS
+           COMPLETE`. Idempotent: safe to re-run; no-op if nothing
+           expired.
+
+        2. Citation count. After each task's implementer commits,
+           grep its plan.md for `[MEM: <name>]` patterns. For each
+           cited name, increment `citation_count` in that memory's
+           frontmatter. Citations across plans accrete; this is
+           the signal Tier 2's curation gate (T16) will use to
+           decide which memories to drop.
+
+      THE FOUR PROMPT-OVERLAY LAYERS (document in the prompt body
+      so the agent picks the right one):
+        - persona.md (you, hand-curated): stable conventions.
+        - docs/decisions/ (you, hand-curated): ADR-style
+          architectural choices.
+        - MEMORY.md + per-memory files (agent, auto-curated):
+          tactical pitfalls discovered in flight.
+        - failure_context (runner-injected): per-attempt prior
+          failure verbatim.
+
+      COMPOSITION ORDER unchanged: failure_context + persona +
+      decisions + body. The "## Memory" section we ADD per phase
+      lives INSIDE the body — it's instructions, not an injected
+      fragment. The Claude CLI auto-loads MEMORY.md itself.
+
+      OUT OF SCOPE for T15 (lands in T16):
+        - The actual AI curation gate that drops zero-citation /
+          stale memories beyond the type-aware defaults. T16
+          implements this as a registered agent gate.
+
+      Tests in tests/test_prompts.py + tests/test_runner.py:
+        (a) build_plan_prompt body contains the "## Memory" section
+            with the [MEM: ...] citation directive.
+        (b) build_review_prompt body contains the same section
+            plus the "verify cited names exist" directive.
+        (c) build_implement_prompt body contains the four-layer
+            taxonomy, the frontmatter schema, the type-aware
+            default lifecycles, and the don't-save list.
+        (d) Composition order unchanged.
+        (e) Runner lifecycle prune: a memory with
+            lifecycle: task:5 is deleted when task 5 transitions
+            to done. lifecycle: slate:foo is deleted when slate
+            ends. evergreen entries are never auto-deleted.
+        (f) Runner citation count: a plan.md containing
+            [MEM: foo_lesson] increments foo_lesson's
+            citation_count by 1. Multiple references in the same
+            plan count multiple times. References to nonexistent
+            memories are silently ignored (the reviewer caught
+            them; the runner doesn't double-fault).
+    key_files:
+      - src/claude_plan_execute/prompts.py
+      - src/claude_plan_execute/runner.py
+      - tests/test_prompts.py
+      - tests/test_runner.py
+    commit_message: "feat: prompt agents to read/write Claude Code memory + lifecycle + citations"
+    depends_on: []
+
+  - id: 16
+    phase: cross-task-memory
+    title: "feat: memory-curate agent gate for AI-driven pruning"
+    description: |
+      The pruning policy completion. T15 ships type-aware lifecycle
+      auto-deletion and citation tracking; T16 ships the gate that
+      uses those signals plus codebase verification to drop stale
+      memories the lifecycle rules wouldn't catch.
+
+      WHEN IT RUNS:
+        Triggered automatically when MEMORY.md crosses
+        defaults.memory_curation_threshold entries (default 30,
+        configurable). The runner detects the threshold at the end
+        of each task's gate phase and APPENDS `memory-curate` to
+        the next task's resolved gate list. Single-shot trigger —
+        once it runs, the threshold is re-evaluated against the
+        post-curation count.
+
+      Schema additions:
+        Defaults.memory_curation_threshold: int = 30
+        Add to KEYS_TO_AUDIT in config.py.
+
+      THE GATE:
+        Built-in agent gate registered on default_registry() at
+        module import time (alongside test-critique and
+        security-auditor). Sonnet/medium, parallel_safe=False
+        (mutates the filesystem). Block-on-fail=False — a
+        curation failure shouldn't block the implementing task;
+        it just leaves MEMORY.md as-is and surfaces a warning.
+
+      Template at gates/templates/memory-curate.md instructs:
+        1. Read MEMORY.md and every per-memory file.
+        2. For each memory, verify against the current codebase:
+           - Is the premise still true? (Read referenced files.)
+           - Is the lesson actionable now, or did a refactor
+             obviate it?
+           - Is it non-obvious? (Or has it become trivially
+             true / standard practice?)
+           - Is its citation_count meaningful given how many tasks
+             have run since it was written? Zero citations after
+             K tasks is a drop signal but not a guarantee — some
+             evergreen lessons never need citing because they're
+             baked into how subsequent plans are written.
+        3. Output a JSON appendix (T11's structured-findings format,
+           reuse the marker convention):
+             <!-- BEGIN_FINDINGS_JSON -->
+             [
+               {"memory": "name1", "verdict": "keep",
+                "reason": "still relevant; cited in 3 plans"},
+               {"memory": "name2", "verdict": "drop",
+                "reason": "premise was 'pydantic v2 silently...';
+                          fixed in T8; lesson no longer applies"},
+               {"memory": "name3", "verdict": "merge_into:name1",
+                "reason": "duplicate of name1's lesson"}
+             ]
+             <!-- END_FINDINGS_JSON -->
+
+      RUNNER POST-PROCESSING:
+        - keep: no action.
+        - drop: delete the per-memory file, remove the line from
+          MEMORY.md.
+        - merge_into:<other>: NEVER auto-applied. The runner
+          surfaces these in the dashboard for one-click human
+          review (or via a CLI subcommand
+          `claude-plan-execute memory merge-suggestions`). Merges
+          are content-aware; an automated merge could lose nuance.
+          Until human-applied, both memories remain.
+
+      DASHBOARD:
+        New surface in the existing gates panel — when memory-curate
+        runs, show the keep/drop/merge counts and the merge
+        suggestions with Accept/Decline buttons (POST endpoint
+        applies the merge). Out of scope: rich-diff view of merge
+        results — display the two memories' bodies side by side
+        and let the operator decide.
+
+      INTERACTION WITH T15:
+        T15's lifecycle prune runs at every task boundary (cheap,
+        deterministic). T16's curation gate runs only when the
+        threshold is hit (expensive — agent invocation). The two
+        compose: lifecycle handles the cases the prompt could
+        predict at write time; curation handles the cases that
+        only become visible later.
+
+      OUT OF SCOPE (defer to v0.4):
+        - Manual `claude-plan-execute memory prune --interactive`
+          subcommand. Tier-4 escape hatch; not load-bearing while
+          T15+T16 cover the common cases.
+        - Cross-PROJECT memory merging.
+
+      Tests in tests/test_gates.py + tests/test_runner.py:
+        (a) Gate registers on default_registry() at import time.
+        (b) Threshold-detection logic: when MEMORY.md has 31 entries,
+            the next task's gate list gains 'memory-curate'; when it
+            has 29, it does not.
+        (c) Runner applies keep/drop verdicts correctly; merge
+            suggestions are NOT applied automatically.
+        (d) Malformed JSON output: log warning, leave memories
+            as-is (same fail-soft pattern as T11).
+        (e) The threshold setting is resolver-aware (per-task and
+            per-phase override possible).
+    key_files:
+      - src/claude_plan_execute/gates/__init__.py
+      - src/claude_plan_execute/gates/builtin.py
+      - src/claude_plan_execute/gates/templates/memory-curate.md
+      - src/claude_plan_execute/runner.py
+      - src/claude_plan_execute/schema.py
+      - src/claude_plan_execute/config.py
+      - src/claude_plan_execute/server.py
+      - src/claude_plan_execute/dashboard/index.html
+      - tests/test_gates.py
+      - tests/test_runner.py
+      - tests/test_schema.py
+    commit_message: "feat: memory-curate agent gate for AI-driven memory pruning"
+    depends_on: [11, 15]
+
   # ── Phase: documentation ─────────────────────────────────────────────────
   - id: 14
     phase: documentation
@@ -890,7 +1157,7 @@ tasks:
     description: |
       Closes v0.3-scope §§2.1, 2.8, 2.9, 2.10 (already-handled
       patterns made discoverable via recipes) plus complete
-      documentation for everything T1–T13 shipped.
+      documentation for everything T1–T13 + T15 + T16 shipped.
 
       Updates:
         - README.md: new sections for services, branch_per_task,
@@ -960,6 +1227,15 @@ tasks:
         - rate-limit-and-tokens.md (T1, T2): rate-limit retry
           tuning; reading usage.jsonl; sum logic; what hard caps
           would look like in v0.4.
+        - cross-task-memory.md (T15 + T16): the four-layer prompt-
+          overlay taxonomy (persona / decisions / MEMORY.md /
+          failure-context); when the agent should save vs not;
+          memory frontmatter schema (name, type, lifecycle,
+          citation_count); type-aware default lifecycles; the
+          [MEM: <name>] citation pattern; how runner lifecycle
+          prune + memory-curate gate compose to keep MEMORY.md
+          honest; the threshold knob; merge-suggestion review
+          flow in the dashboard.
 
       No source tests changed in this task. The slate's existing
       test gate runs; this task's only gate change is "tests +
@@ -981,5 +1257,6 @@ tasks:
       - docs/recipes/structured-findings.md
       - docs/recipes/resume-on-context-fill.md
       - docs/recipes/rate-limit-and-tokens.md
+      - docs/recipes/cross-task-memory.md
     commit_message: "docs: v0.3 release notes, migration, recipes"
-    depends_on: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    depends_on: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16]
