@@ -42,12 +42,22 @@ def test_v1_fixture_validates_clean(capsys):
 
 
 def test_repo_dogfood_tasks_yaml_validates(capsys):
-    """The repo's own tasks.yaml is the strongest end-to-end test of the schema."""
+    """The repo's own tasks.yaml is the strongest end-to-end test of the schema.
+
+    Schema-level assertions only — no structural pin to a specific task ID
+    or phase, since the dogfood file rotates with each enhancement slate.
+    """
     repo_root = Path(__file__).resolve().parents[1]
     tf = loader.load_tasks_file(repo_root / "tasks.yaml")
     assert tf.version == 2
     assert len(tf.tasks) >= 4
-    assert any(t.phase == "config" and t.id == 4 for t in tf.tasks)
+    # If phases are declared, every task that references one resolves to a
+    # known phase id. (Cross-reference checks live in the model_validator;
+    # this is a smoke check that the validator ran.)
+    if tf.phases:
+        phase_ids = {p.id for p in tf.phases}
+        for t in tf.tasks:
+            assert t.phase is None or t.phase in phase_ids
 
 
 # --- B. Deprecation warnings ------------------------------------------------
