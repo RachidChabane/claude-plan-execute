@@ -137,6 +137,11 @@ class Defaults(BaseModel):
     # T16 (v0.3) — AI-driven memory pruning trigger.
     memory_curation_threshold: int | None = None
 
+    # T17 (v0.3) — auto-split on terminal failures.
+    auto_split_on_max_rounds: bool | None = None
+    auto_split_failure_classes: list[str] | None = None
+    max_split_depth: int | None = None
+
     # Legacy v1 fields (still accepted; deprecation warning fires for v2 files)
     plan_timeout_minutes: int | None = None
     review_timeout_minutes: int | None = None
@@ -185,6 +190,15 @@ class Task(BaseModel):
 
     # T16 (v0.3) — per-task override of the curation threshold.
     memory_curation_threshold: int | None = None
+
+    # T17 (v0.3) — auto-split on terminal failures (per-task overrides).
+    auto_split_on_max_rounds: bool | None = None
+    auto_split_failure_classes: list[str] | None = None
+    max_split_depth: int | None = None
+    # T17 — splitter-written provenance (set by the splitter when
+    # creating children; users may also pre-author for manual splits).
+    parent_task: int | str | None = None
+    split_depth: int | None = None
 
 
 class TasksFile(BaseModel):
@@ -246,6 +260,20 @@ class TasksFile(BaseModel):
             dupes = sorted({n for n in service_names_list
                             if service_names_list.count(n) > 1})
             raise ValueError(f"Duplicate service names: {dupes}")
+
+        # T17 (v0.3) — task-id uniqueness. The downstream
+        # `deps.validate_dependencies` silently coalesces duplicate ids
+        # via `{t["id"] for t in tasks}` — the LAST entry wins the slot,
+        # the prior duplicate vanishes. Catching duplicates here surfaces
+        # them as a load-time ValidationError before that silent loss.
+        # (Pydantic does not auto-detect duplicates inside `list[Task]`.)
+        task_ids_list = [t.id for t in self.tasks]
+        if len(task_ids_list) != len(set(task_ids_list)):
+            dupes = sorted(
+                {i for i in task_ids_list if task_ids_list.count(i) > 1},
+                key=str,
+            )
+            raise ValueError(f"Duplicate task ids: {dupes}")
 
         # 5. service.depends_on names exist.
         for s in self.services:

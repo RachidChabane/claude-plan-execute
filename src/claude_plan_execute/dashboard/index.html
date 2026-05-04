@@ -459,6 +459,9 @@ body::before {
   opacity: 0.8;
 }
 
+/* T17 — split-link click-scroll flash. */
+.task-card.flash { box-shadow: 0 0 0 2px var(--accent); }
+
 .task-header {
   display: flex;
   align-items: center;
@@ -589,6 +592,8 @@ body::before {
 .task-status-label.approved { color: var(--accent-blue); background: var(--accent-blue-dim); }
 .task-status-label.implementing { color: var(--accent-violet); background: var(--accent-violet-dim); }
 .task-status-label.done { color: var(--accent-green); background: var(--accent-green-dim); }
+/* T17 — split parent: muted, not-active, not-done. */
+.task-status-label.split { color: var(--text-tertiary); background: transparent; }
 
 .task-expand-icon {
   color: var(--text-tertiary);
@@ -1625,7 +1630,7 @@ function renderTasks() {
     card.dataset.id = task.id;
 
     card.innerHTML = `
-      <div class="task-header" onclick="toggleTask(${task.id})">
+      <div class="task-header" onclick="toggleTask(${JSON.stringify(task.id)})">
         <span class="task-id">#${task.id}</span>
         <div class="task-status-dot ${status}"></div>
         <span class="task-title">${esc(task.title)}</span>
@@ -1647,11 +1652,30 @@ function renderTasks() {
             ${ts.plan_path ? `<span class="task-meta-item"><strong>plan:</strong> ${esc(ts.plan_path)}</span>` : ''}
             ${ts.branch ? `<span class="task-meta-item"><strong>branch:</strong> ${esc(ts.branch)}</span>` : ''}
             ${ts.pr_url ? `<span class="task-meta-item"><strong>PR:</strong> <a href="${esc(ts.pr_url)}" target="_blank" rel="noopener">${esc(ts.pr_url)}</a></span>` : ''}
+            ${ts.split_children?.length ? `
+              <span class="task-meta-item">
+                <strong>split &rarr; </strong>
+                ${ts.split_children.map(cid =>
+                  `<a href="#task-${esc(cid)}"
+                      onclick="scrollToTask('${esc(cid)}'); return false;">
+                    #${esc(cid)}
+                   </a>`).join(', ')}
+              </span>
+            ` : ''}
+            ${task.parent_task ? `
+              <span class="task-meta-item">
+                <strong>split from </strong>
+                <a href="#task-${esc(task.parent_task)}"
+                   onclick="scrollToTask('${esc(task.parent_task)}'); return false;">
+                  #${esc(task.parent_task)}
+                </a>
+              </span>
+            ` : ''}
           </div>
           <div class="task-tabs">
-            <button class="task-tab active" onclick="switchTab(${task.id}, 'config', this)">Config</button>
-            <button class="task-tab" onclick="switchTab(${task.id}, 'gates', this)">Gates</button>
-            <button class="task-tab" onclick="switchTab(${task.id}, 'failures', this)">Failures</button>
+            <button class="task-tab active" onclick="switchTab(${JSON.stringify(task.id)}, 'config', this)">Config</button>
+            <button class="task-tab" onclick="switchTab(${JSON.stringify(task.id)}, 'gates', this)">Gates</button>
+            <button class="task-tab" onclick="switchTab(${JSON.stringify(task.id)}, 'failures', this)">Failures</button>
           </div>
           <div class="task-tab-panel active" data-tab="config" data-task-id="${task.id}">
             <div class="resolved-config-content"><em>Expand to load…</em></div>
@@ -1664,15 +1688,15 @@ function renderTasks() {
           </div>
           <div class="task-actions">
             ${status !== 'done' ? `
-              <button class="btn btn-sm btn-primary" onclick="runTask(${task.id})">
+              <button class="btn btn-sm btn-primary" onclick="runTask(${JSON.stringify(task.id)})">
                 <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M3 1.5L10.5 6L3 10.5V1.5Z" fill="currentColor"/></svg>
                 Run
               </button>
-              <button class="btn btn-sm" onclick="runTask(${task.id}, 'plan')">Plan only</button>
-              <button class="btn btn-sm" onclick="runTask(${task.id}, 'review')">Review</button>
-              <button class="btn btn-sm" onclick="runTask(${task.id}, 'implement')">Implement</button>
+              <button class="btn btn-sm" onclick="runTask(${JSON.stringify(task.id)}, 'plan')">Plan only</button>
+              <button class="btn btn-sm" onclick="runTask(${JSON.stringify(task.id)}, 'review')">Review</button>
+              <button class="btn btn-sm" onclick="runTask(${JSON.stringify(task.id)}, 'implement')">Implement</button>
             ` : ''}
-            <button class="btn btn-sm" onclick="resetTask(${task.id})">Reset</button>
+            <button class="btn btn-sm" onclick="resetTask(${JSON.stringify(task.id)})">Reset</button>
           </div>
         </div>
       </div>
@@ -1693,6 +1717,7 @@ function getPhases(status) {
     implementing:   { plan: 'complete', review: 'complete', impl: 'active' },
     awaiting_human: { plan: 'complete', review: 'complete', impl: 'active' },
     done:           { plan: 'complete', review: 'complete', impl: 'complete' },
+    split:          { plan: 'complete', review: 'complete', impl: '' },
   };
   return map[status] || map.pending;
 }
@@ -2144,6 +2169,15 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+function scrollToTask(id) {
+  const el = document.querySelector(`.task-card[data-id="${id}"]`);
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('flash');
+    setTimeout(() => el.classList.remove('flash'), 1500);
+  }
 }
 
 // ── WebSocket ──

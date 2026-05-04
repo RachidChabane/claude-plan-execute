@@ -145,6 +145,12 @@ def test_statuses_constant_includes_known_values():
     assert "awaiting_human" in STATUSES
 
 
+def test_statuses_constant_includes_split_t17():
+    """T17: 'split' is a terminal status set by the splitter on a
+    successful split."""
+    assert "split" in STATUSES
+
+
 def test_use_color_propagates_to_loader_and_deps_via_module_global(monkeypatch, capsys):
     """colors.set_use_color toggles a single module-level global; downstream
     modules (loader, deps) honor it because they import red/yellow as references

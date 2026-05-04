@@ -26,6 +26,10 @@ STATUSES = (
     "pending", "planning", "reviewing", "revising",
     "approved", "implementing", "done", "blocked",
     "awaiting_human",
+    # T17 (v0.3) — terminal status set by the splitter on a successful
+    # split. The parent stays in tasks.yaml for audit; children land in
+    # tasks.yaml on the next slate launch.
+    "split",
 )
 
 # Documented set of failure_class strings used across the project. Not

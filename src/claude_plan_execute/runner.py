@@ -50,6 +50,7 @@ from claude_plan_execute.services import (
     ServiceUnavailableError,
     ServiceUnstableError,
 )
+from claude_plan_execute.splitter import run_splitter
 from claude_plan_execute.state import (
     State, make_failure_record, summarize_usage,
 )
@@ -231,6 +232,7 @@ def execute_task(
     service_manager: "ServiceManager | None" = None,
     all_task_ids: list[int | str] | None = None,
     worker_id: int | str | None = None,
+    tasks_yaml_path: "Path | None" = None,
 ):
     """Run a single task through plan/review/implement/gates phases.
 
@@ -257,6 +259,7 @@ def execute_task(
             dry_run=dry_run,
             service_manager=service_manager,
             all_task_ids=all_task_ids,
+            tasks_yaml_path=tasks_yaml_path,
         )
     finally:
         _clear_current_task()
@@ -275,6 +278,7 @@ def _execute_task_body(
     dry_run: bool = False,
     service_manager: "ServiceManager | None" = None,
     all_task_ids: list[int | str] | None = None,
+    tasks_yaml_path: "Path | None" = None,
 ):
     # Build per-task layer dicts. Empty when None (v1 path) or unmatched.
     phase_dict: dict = {}
@@ -671,6 +675,13 @@ def _execute_task_body(
                         verbatim=last_review_text,
                         artifacts=artifacts,
                     ))
+                    _maybe_run_splitter(
+                        task=task, state=state,
+                        file_defaults=file_defaults, cli=cli,
+                        resolved=resolved, plans_dir=plans_dir,
+                        tasks_yaml_path=tasks_yaml_path,
+                        failure_class="review_rejected_after_max_rounds",
+                    )
                     return
                 # auto_approve (legacy v1 default)
                 _wprint(yellow(
@@ -752,6 +763,13 @@ def _execute_task_body(
                     artifacts={"plan": str(plan_path)},
                 ))
                 _wprint(red(f"\n  Task {tid} blocked: implementer max-turns."))
+                _maybe_run_splitter(
+                    task=task, state=state,
+                    file_defaults=file_defaults, cli=cli,
+                    resolved=resolved, plans_dir=plans_dir,
+                    tasks_yaml_path=tasks_yaml_path,
+                    failure_class="implementer_max_turns",
+                )
                 return
     
         # --- POST-IMPLEMENT: precompute diff for agent gates (task 7 v0.3) ---
@@ -1219,6 +1237,38 @@ def _record_rate_limited_and_block(
         artifacts=artifacts,
     ))
     _wprint(red(f"\n  Task {tid} blocked: rate-limit retries exhausted."))
+
+
+def _maybe_run_splitter(
+    *,
+    task: dict,
+    state: State,
+    file_defaults: dict,
+    cli: dict,
+    resolved: dict,
+    plans_dir: Path,
+    tasks_yaml_path: "Path | None",
+    failure_class: str,
+) -> None:
+    """Invoke the splitter agent if the resolved config opts in.
+
+    Pure forwarder: reads two resolver keys and short-circuits on
+    any missing precondition. The actual subprocess + YAML mutation
+    lives in `splitter.run_splitter`. Failure-soft contract: never
+    re-raises (the inner module wraps in try/except per its
+    docstring).
+    """
+    if not bool(resolved["auto_split_on_max_rounds"]["value"]):
+        return
+    classes = resolved["auto_split_failure_classes"]["value"] or []
+    if failure_class not in classes:
+        return
+    run_splitter(
+        task=task, state=state,
+        file_defaults=file_defaults, cli=cli,
+        resolved=resolved, plans_dir=plans_dir,
+        tasks_yaml_path=tasks_yaml_path,
+    )
 
 
 def _read_progress_text(progress_path: Path) -> str:
@@ -1793,6 +1843,7 @@ class _SlateScheduler:
         dry_run: bool,
         parallelism: int,
         skip_to: str | None = None,
+        tasks_yaml_path: "Path | None" = None,
     ) -> None:
         self.ordered_tasks = ordered_tasks
         self.all_task_ids = all_task_ids
@@ -1805,6 +1856,7 @@ class _SlateScheduler:
         self.dry_run = dry_run
         self.parallelism = parallelism
         self.skip_to = skip_to
+        self.tasks_yaml_path = tasks_yaml_path
         self._lock = threading.Lock()
         self._in_flight: set = set()
         # Per-run "already attempted" set: prevents re-claim loops when
@@ -1838,6 +1890,13 @@ class _SlateScheduler:
         # same worker (or another) would re-claim and re-fail in a
         # tight loop. See plan §B4.
         if s == "blocked":
+            return False
+        # T17: parent of a successful split — children appear only on
+        # the next slate launch (mid-run reload of tasks.yaml is a v0.4
+        # non-goal). Defense-in-depth: even with `_attempted` guarding
+        # re-claim, we explicitly future-proof against eligibility
+        # relaxations.
+        if s == "split":
             return False
         if tid in self._in_flight:
             return False
@@ -1923,6 +1982,7 @@ class _SlateScheduler:
                     service_manager=self.service_manager,
                     all_task_ids=self.all_task_ids,
                     worker_id=None,
+                    tasks_yaml_path=self.tasks_yaml_path,
                 )
             finally:
                 with self._lock:
@@ -1964,6 +2024,7 @@ class _SlateScheduler:
                     service_manager=self.service_manager,
                     all_task_ids=self.all_task_ids,
                     worker_id=tid,
+                    tasks_yaml_path=self.tasks_yaml_path,
                 )
             except Exception as exc:
                 # Defensive: any uncaught exception → mark blocked +
@@ -1999,6 +2060,7 @@ def run_slate(
     service_manager: "ServiceManager",
     dry_run: bool,
     skip_to: str | None = None,
+    tasks_yaml_path: "Path | None" = None,
 ) -> None:
     """Run a slate of tasks through the worker pool.
 
@@ -2031,6 +2093,7 @@ def run_slate(
         dry_run=dry_run,
         parallelism=parallelism,
         skip_to=skip_to,
+        tasks_yaml_path=tasks_yaml_path,
     )
     if parallelism == 1:
         sched.run_serial_with_phase_tracking()

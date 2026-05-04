@@ -650,6 +650,7 @@ def main():
                 dry_run=args.dry_run,
                 service_manager=service_manager,
                 all_task_ids=all_task_ids,
+                tasks_yaml_path=tasks_path,
             )
         else:
             # T13 (v0.3 §2.5): replace the inline serial loop +
@@ -671,6 +672,7 @@ def main():
                 service_manager=service_manager,
                 dry_run=args.dry_run,
                 skip_to=args.skip_to,
+                tasks_yaml_path=tasks_path,
             )
     finally:
         # Unconditional cleanup: idempotent on stopped services, so a

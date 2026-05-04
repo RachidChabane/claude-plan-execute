@@ -10474,3 +10474,160 @@ def test_handle_sigint_records_manual_stop_when_awaiting_human(
     assert len(attempts) == 1
     assert attempts[0]["failure_class"] == "manual_stop"
     assert attempts[0]["phase"] == "implement"
+
+
+# ---------------------------------------------------------------------------
+# EE. T17 auto-split trigger integration
+# ---------------------------------------------------------------------------
+
+# NB: tests below construct `file_defaults=` inline. A shared
+# `_auto_split_defaults` fixture was considered (and proposed in an
+# earlier draft) but dropped: the inline form makes each test's
+# precondition self-contained without an injected fixture's
+# action-at-a-distance, and matches the surrounding test style in
+# this file.
+
+
+def _stub_run_splitter(monkeypatch):
+    called = []
+
+    def stub(**kwargs):
+        called.append(kwargs)
+
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.run_splitter", stub,
+    )
+    return called
+
+
+def test_review_rejected_max_rounds_invokes_splitter_when_opted_in(
+    monkeypatch, tmp_path,
+):
+    called = _stub_run_splitter(monkeypatch)
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+            "auto_split_on_max_rounds": True,
+        },
+        cli={}, skip_to="review",
+        tasks_yaml_path=tmp_path / "tasks.yaml",
+    )
+    assert len(called) == 1
+
+
+def test_implementer_max_turns_invokes_splitter_when_opted_in(
+    monkeypatch, tmp_path,
+):
+    called = _stub_run_splitter(monkeypatch)
+    _patch_run_claude_simulating_max_turns(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "auto_split_on_max_rounds": True,
+        },
+        cli={}, skip_to="implement",
+        tasks_yaml_path=tmp_path / "tasks.yaml",
+    )
+    assert len(called) == 1
+
+
+def test_review_rejected_max_rounds_does_NOT_invoke_splitter_by_default(
+    monkeypatch, tmp_path,
+):
+    called = _stub_run_splitter(monkeypatch)
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+        },
+        cli={}, skip_to="review",
+    )
+    assert called == []
+
+
+def test_failure_class_outside_match_list_skips_splitter(
+    monkeypatch, tmp_path,
+):
+    """A failure_class not in auto_split_failure_classes
+    short-circuits the helper before invoking run_splitter."""
+    called = _stub_run_splitter(monkeypatch)
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    execute_task(
+        _make_task(id=1), state,
+        file_defaults={
+            "plans_dir": str(tmp_path),
+            "max_review_rounds": 1,
+            "on_max_review_rounds": "fail",
+            "auto_split_on_max_rounds": True,
+            "auto_split_failure_classes": ["implementer_max_turns"],
+        },
+        cli={}, skip_to="review",
+        tasks_yaml_path=tmp_path / "tasks.yaml",
+    )
+    assert called == []
+
+
+def test_maybe_run_splitter_does_not_wrap_in_try_except(
+    monkeypatch, tmp_path,
+):
+    """Pin: `_maybe_run_splitter` is a thin forwarder — it does NOT
+    catch exceptions. Fail-soft is `splitter.run_splitter`'s
+    responsibility (the inner module wraps in try/except per its
+    docstring). Belt-and-suspenders fail-soft at the runner site
+    would mask logic bugs in the splitter; we want exceptions there
+    to surface, then be caught one frame higher inside the splitter
+    itself.
+
+    A future refactor that adds a try/except inside
+    `_maybe_run_splitter` would silently swallow the boom below; this
+    test is the canary for that.
+    """
+    def boom(**kwargs):
+        raise RuntimeError("splitter exploded")
+    monkeypatch.setattr(
+        "claude_plan_execute.runner.run_splitter", boom,
+    )
+    _no_run_claude_called(monkeypatch)
+    state = State(tmp_path / "state.json")
+    with pytest.raises(RuntimeError):
+        execute_task(
+            _make_task(id=1), state,
+            file_defaults={
+                "plans_dir": str(tmp_path),
+                "max_review_rounds": 1,
+                "on_max_review_rounds": "fail",
+                "auto_split_on_max_rounds": True,
+            },
+            cli={}, skip_to="review",
+            tasks_yaml_path=tmp_path / "tasks.yaml",
+        )
+
+
+def test_split_status_short_circuits_scheduler_eligibility(tmp_path):
+    """T17 §7.3 — _SlateScheduler._is_eligible returns False when the
+    state status is 'split'."""
+    from claude_plan_execute.runner import _SlateScheduler
+    state = State(tmp_path / "state.json")
+    state.set_status(1, "split", split_children=["1a", "1b"])
+    sched = _SlateScheduler(
+        ordered_tasks=[{"id": 1}],
+        all_task_ids=[1],
+        state=state,
+        file_defaults={}, cli_overrides={},
+        phases_by_id={}, task_class_models={},
+        service_manager=None, dry_run=False,
+        parallelism=1,
+    )
+    assert sched._is_eligible({"id": 1}) is False

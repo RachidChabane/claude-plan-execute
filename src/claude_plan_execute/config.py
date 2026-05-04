@@ -35,6 +35,25 @@ HARDCODED_DEFAULTS: dict = {
     "auto_merge": False,
     # T16 (v0.3) — threshold for memory-curate gate auto-trigger.
     "memory_curation_threshold": 30,
+    # T17 (v0.3) — auto-split. Master switch is OFF by default; the
+    # feature is opt-in. The hardcoded match list documents the two
+    # failure classes the runner currently routes through this path
+    # (review-rounds exhaustion, implementer max-turns). Adding a
+    # class here without a runner-side trigger does NOT activate
+    # split for that class — the runner only invokes the helper at
+    # the two pinned sites.
+    "auto_split_on_max_rounds": False,
+    # NB: shared mutable list. _resolve_with_source returns this
+    # reference verbatim; callers MUST treat it as read-only (the
+    # splitter helper does `failure_class not in classes`, fine).
+    # Mutating this list would leak across all callers. First
+    # mutable entry in HARDCODED_DEFAULTS — flagged for future
+    # additions.
+    "auto_split_failure_classes": [
+        "review_rejected_after_max_rounds",
+        "implementer_max_turns",
+    ],
+    "max_split_depth": 1,
 }
 
 
@@ -45,6 +64,8 @@ HARDCODED_DEFAULTS: dict = {
 # invariants_file. Task 17 added untranslated_strings_command.
 # Task 20 added dev_server_url. Task 1 of v0.3 added
 # max_rate_limit_retries and rate_limit_base_backoff_seconds.
+# Task 17 added auto_split_on_max_rounds, auto_split_failure_classes,
+# max_split_depth.
 # Future tasks extend this tuple as new keys become
 # resolver-consumable.
 KEYS_TO_AUDIT: tuple[str, ...] = (
@@ -76,6 +97,10 @@ KEYS_TO_AUDIT: tuple[str, ...] = (
     "pr_body_template",
     # T16 (v0.3).
     "memory_curation_threshold",
+    # T17 (v0.3) — auto-split.
+    "auto_split_on_max_rounds",
+    "auto_split_failure_classes",
+    "max_split_depth",
 )
 
 

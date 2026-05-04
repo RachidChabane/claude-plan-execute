@@ -1592,3 +1592,83 @@ def test_parallelism_eq_0_treated_as_unset(tmp_path):
     )
     tf = loader.load_tasks_file(p)
     assert tf.defaults.parallelism == 0
+
+
+# --- R. T17 auto-split fields ----------------------------------------------
+
+def test_defaults_accepts_auto_split_on_max_rounds():
+    d = Defaults.model_validate({"auto_split_on_max_rounds": True})
+    assert d.auto_split_on_max_rounds is True
+
+
+def test_defaults_accepts_auto_split_failure_classes_list():
+    d = Defaults.model_validate({
+        "auto_split_failure_classes": ["review_rejected_after_max_rounds"],
+    })
+    assert d.auto_split_failure_classes == ["review_rejected_after_max_rounds"]
+
+
+def test_defaults_accepts_max_split_depth_int():
+    d = Defaults.model_validate({"max_split_depth": 2})
+    assert d.max_split_depth == 2
+
+
+def test_task_accepts_parent_task_str_id():
+    t = Task.model_validate({
+        "id": "1a", "title": "X", "description": "Y",
+        "parent_task": 1, "split_depth": 1,
+    })
+    assert t.parent_task == 1
+    assert t.split_depth == 1
+
+
+def test_task_accepts_per_task_auto_split_overrides():
+    t = Task.model_validate({
+        "id": 1, "title": "X", "description": "Y",
+        "auto_split_on_max_rounds": False,
+        "max_split_depth": 0,
+    })
+    assert t.auto_split_on_max_rounds is False
+    assert t.max_split_depth == 0
+
+
+def test_task_typo_in_split_field_emits_did_you_mean(tmp_path):
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - { id: 1, title: T, description: D, splitDepth: 1 }\n"
+    )
+    with pytest.raises(SystemExit):
+        from claude_plan_execute import loader
+        loader.load_tasks_file(p)
+
+
+def test_duplicate_task_ids_rejected(tmp_path):
+    """Plan §5.3: TasksFile._check_cross_references rejects duplicate
+    task ids at load time.
+
+    Mirrors the existing test_duplicate_service_names_rejected. Pre-T17
+    behavior was silent coalescence: Pydantic does not auto-detect
+    duplicates inside `list[Task]`, and downstream
+    `deps.validate_dependencies` does `{t["id"] for t in tasks}` which
+    dedupes (the LAST entry wins the slot, the prior duplicate
+    vanishes from the slate without any warning). T17 adds a
+    list-uniqueness check inside the existing
+    @model_validator(mode='after') so the load fails loudly.
+
+    This is also the failure path that test_splitter.py's (d8)
+    `test_run_splitter_duplicate_within_children_lands_in_yaml_caught_by_next_load`
+    relies on for its `with pytest.raises(SystemExit)` clause to fire.
+    """
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "version: 2\n"
+        "tasks:\n"
+        "  - { id: 1, title: T1, description: D }\n"
+        "  - { id: '1a', title: A, description: D }\n"
+        "  - { id: '1a', title: A2, description: D }\n"
+    )
+    with pytest.raises(SystemExit):
+        from claude_plan_execute import loader
+        loader.load_tasks_file(p)
