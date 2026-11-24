@@ -6,6 +6,10 @@ Automated plan-review-implement workflow for Claude Code. Reads a task file, the
 2. **Review** — A second Claude reviews it. If rejected, a third revises it. Loop until approved.
 3. **Implement** — Claude implements the approved plan, runs tests, and commits.
 
+> This runner follows [Claude Autopilot](https://github.com/RachidChabane/cc-mvp-scaffold).
+> The idea reached its final form in
+> [Agent Factory](https://github.com/RachidChabane/agent-factory).
+
 ## Install
 
 ```bash
@@ -197,3 +201,10 @@ Progress is tracked in `{plans_dir}/state.json`. If interrupted (Ctrl+C), the sc
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 - Runtime deps installed via `pip install -e .` (PyYAML, Pydantic ≥ 2.0)
 - Dashboard deps: `pip install -e '.[dashboard]'` (FastAPI, uvicorn)
+
+## License
+
+Copyright (C) 2026 Rachid Chabane.
+
+[AGPL-3.0](LICENSE): use it, fork it and change it; a version you distribute or offer
+to others over a network stays open under the same license, with its notices.

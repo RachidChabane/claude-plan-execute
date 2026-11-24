@@ -9,6 +9,7 @@ description = "Automated plan-review-implement workflow for Claude Code."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Rachid Chabane" }]
+license = { text = "AGPL-3.0-only" }
 dependencies = [
     "pyyaml>=6.0",
     "pydantic>=2.0,<3.0",
